@@ -64,7 +64,7 @@ art() {
     python3 "$dir/steam-shortcut.py" "$dir/art" "$@" ||
         echo "Warning: couldn't install the Steam library art." >&2
 }
-if [ "$(openvr check x)" = 1 ] && python3 "$dir/steam-shortcut.py" "$dir/art" --icon-ok; then
+if [ "$(openvr check x | sort -u)" = 1 ] && python3 "$dir/steam-shortcut.py" "$dir/art" --icon-ok; then
     :
 elif [ "$RESTART_STEAM" = 1 ]; then
     echo "Restarting Steam to mark Just Video as a VR app and set its icon…"
@@ -73,7 +73,7 @@ elif [ "$RESTART_STEAM" = 1 ]; then
     openvr set x >/dev/null
     pgrep -x steam >/dev/null || art --set-icon >/dev/null
     echo "Done. Steam restarts on its own; if it doesn't, restart the headset."
-elif [ "$(openvr check x)" != 1 ]; then
+elif [ "$(openvr check x | sort -u)" != 1 ]; then
     echo "Note: Just Video isn't marked as a VR app yet, so it starts in the background."
     echo "      Run again with FRAME_RESTART_STEAM=1 to fix (restarts Steam once)."
 fi
