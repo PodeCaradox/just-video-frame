@@ -656,10 +656,10 @@ pub fn run(
     let mut dialog_drawn: Option<(controls::State, controls::Hit)> = None;
     // Subtitle size and position (the same for every video).
     let mut caption_settings = crate::config::caption_settings();
-    // Jump lengths, volume etc.; reloaded when the Settings screen changes them.
+    // Jump lengths, volume step etc.; reloaded when the Settings screen changes them.
     let mut prefs = crate::config::preferences();
-    // Volume changed with the D-pad and not yet saved (saved once it settles).
-    let mut volume_changed_at: Option<Instant> = None;
+    // The headset's volume, set with the D-pad while playing.
+    let system_volume = crate::system_volume::SystemVolume::new();
     let mut list_page = 0usize;
     let mut control_press: Option<ControlPress> = None;
     // Formats the format button steps through.
@@ -757,9 +757,6 @@ pub fn run(
         }
         if stop_playback {
             set_phase(3);
-            if volume_changed_at.take().is_some() {
-                save_volume(prefs.volume);
-            }
             if let Mode::Playing(playback) = std::mem::replace(&mut mode, Mode::Browser) {
                 save_resume(playing_key.as_ref(), &playback);
                 stats.displayed_frames += playback.stats.displayed_frames;
@@ -816,17 +813,14 @@ pub fn run(
                         opened.decoder,
                         opened.layout,
                         start,
-                        // 100 % by default: the headset's buttons set loudness.
-                        prefs.volume as f32 / 100.0,
+                        // As decoded: the headset's volume sets loudness.
+                        1.0,
                     );
                     if start > 0.0 {
                         playback.notice(
                             format!("Continuing from {}", controls::format_time(start)),
                             Duration::from_secs(4),
                         );
-                    } else if prefs.volume != 100 {
-                        // A level set earlier (perhaps 0 %) shouldn't look like a fault.
-                        playback.notice(format!("Volume {} %", prefs.volume), NOTICE * 2);
                     }
                     resume_saved_at = Instant::now();
                     playback.add_external_subtitles(opened.external_subtitles);
@@ -1199,7 +1193,7 @@ pub fn run(
                 let dragging = press.as_ref().is_some_and(|p| p.dragging);
                 // Thumbstick click: back to the default size and place.
                 // D-pad left/right (or a sideways stick flick): jump back/forward,
-                // further with the grip held. Up/down: volume.
+                // further with the grip held. Up/down: the headset's volume.
                 if buttons.seek != 0 {
                     let jump = prefs.jump(buttons.seek, buttons.grip);
                     playback.seek(playback.position() + jump);
@@ -1208,19 +1202,14 @@ pub fn run(
                     controls_drawn = None;
                 }
                 if buttons.volume != 0 {
-                    prefs.volume = prefs.stepped_volume(buttons.volume);
-                    playback.set_volume(prefs.volume as f32 / 100.0);
-                    let text = if playback.has_audio() {
-                        format!("Volume {} %", prefs.volume)
-                    } else {
-                        format!("Volume {} % (this video has no sound)", prefs.volume)
-                    };
-                    playback.notice(text, NOTICE);
-                    volume_changed_at = Some(Instant::now());
+                    system_volume.step(buttons.volume * prefs.volume_step.clamp(1, 50) as i32);
                 }
-                if volume_changed_at.is_some_and(|at| at.elapsed() > VOLUME_SAVE_DELAY) {
-                    volume_changed_at = None;
-                    save_volume(prefs.volume);
+                if let Some(level) = system_volume.take_changed() {
+                    let mut text = level.notice();
+                    if !playback.has_audio() {
+                        text += " (this video has no sound)";
+                    }
+                    playback.notice(text, NOTICE);
                 }
                 if buttons.reset {
                     placement = Placement {
@@ -1474,9 +1463,6 @@ pub fn run(
             .end(state.predicted_display_time, ctx.blend_mode, &layers)?;
     }
     options.quit.store(true, Ordering::Relaxed);
-    if volume_changed_at.is_some() {
-        save_volume(prefs.volume);
-    }
     if let Mode::Playing(playback) = mode {
         // Written here, not in the background: the app is about to exit.
         let point = crate::config::resume_point(playback.position(), playback.duration);
@@ -1496,20 +1482,12 @@ pub fn run(
 
 /// How long a jump or volume notice stays up.
 const NOTICE: Duration = Duration::from_millis(1500);
-/// Volume is saved once the D-pad has left it alone this long.
-const VOLUME_SAVE_DELAY: Duration = Duration::from_secs(1);
 
 /// "+5 s · 12:34" after a jump of `jump` seconds to `position`.
 fn jump_notice(jump: f64, position: f64) -> String {
     let sign = if jump < 0.0 { '−' } else { '+' };
     let length = crate::ui::settings::format_jump(jump.abs().round() as u32);
     format!("{sign}{length}  ·  {}", controls::format_time(position))
-}
-
-fn save_volume(volume: u32) {
-    if let Err(e) = crate::config::update_preferences(|p| p.volume = volume) {
-        eprintln!("Can't save the volume: {e:#}");
-    }
 }
 
 #[cfg(test)]

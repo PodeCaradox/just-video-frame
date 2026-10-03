@@ -16,6 +16,7 @@ pub mod readahead;
 pub mod smb;
 pub mod srvsvc;
 pub mod subtitles;
+pub mod system_volume;
 #[cfg(feature = "decode")]
 pub mod ui;
 #[cfg(feature = "decode")]

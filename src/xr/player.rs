@@ -140,7 +140,7 @@ struct AudioChunk {
 }
 
 /// Highest volume level (1 = as decoded).
-const MAX_LEVEL: f32 = crate::config::MAX_VOLUME as f32 / 100.0;
+const MAX_LEVEL: f32 = 1.5;
 
 /// State shared with the audio thread.
 struct AudioShared {

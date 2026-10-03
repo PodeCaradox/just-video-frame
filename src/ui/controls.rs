@@ -13,7 +13,7 @@
 //! click steps through the favourite formats, a long press opens the screen
 //! dialog (every format, stars, curved screen, swap eyes). The image button
 //! opens the image dialog (brightness, contrast, saturation, rotation).
-//! Volume: D-pad up/down (and the headset's buttons); the thumbstick click resets the
+//! Volume: D-pad up/down sets the headset's own volume (as its buttons do); the thumbstick click resets the
 //! screen.
 
 use super::canvas::{Canvas, Fonts, Rgb};

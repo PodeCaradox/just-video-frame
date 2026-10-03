@@ -9,22 +9,19 @@ pub enum Setting {
     ShortJump,
     LongJump,
     VolumeStep,
-    Volume,
     Resume,
 }
 
-pub const ALL: [Setting; 5] = [
+pub const ALL: [Setting; 4] = [
     Setting::ShortJump,
     Setting::LongJump,
     Setting::VolumeStep,
-    Setting::Volume,
     Setting::Resume,
 ];
 
 const SHORT_JUMPS: &[u32] = &[5, 10, 15, 30];
 const LONG_JUMPS: &[u32] = &[30, 60, 120, 300, 600];
 const VOLUME_STEPS: &[u32] = &[5, 10, 20];
-const VOLUMES: &[u32] = &[50, 75, 100, 125, 150];
 
 /// "5 s", "1 min", "1 min 30 s".
 pub fn format_jump(seconds: u32) -> String {
@@ -60,13 +57,8 @@ impl Setting {
             ),
             Setting::VolumeStep => (
                 "Volume step",
-                "D-pad up/down while playing; hold to repeat",
+                "D-pad up/down while playing sets the headset volume; hold to repeat",
                 format!("{} %", p.volume_step),
-            ),
-            Setting::Volume => (
-                "Volume",
-                "Above 100 % boosts quiet videos. The headset's buttons set the overall level",
-                format!("{} %", p.volume),
             ),
             Setting::Resume => (
                 "Continue where I left off",
@@ -87,7 +79,6 @@ impl Setting {
             Setting::ShortJump => p.short_jump = next(SHORT_JUMPS, p.short_jump),
             Setting::LongJump => p.long_jump = next(LONG_JUMPS, p.long_jump),
             Setting::VolumeStep => p.volume_step = next(VOLUME_STEPS, p.volume_step),
-            Setting::Volume => p.volume = next(VOLUMES, p.volume),
             Setting::Resume => p.resume = !p.resume,
         }
     }

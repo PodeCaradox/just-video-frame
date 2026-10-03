@@ -253,7 +253,7 @@ struct Settings {
     player: Option<Preferences>,
 }
 
-/// Choices made on the Settings screen, plus the volume (set with the D-pad).
+/// Choices made on the Settings screen.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Preferences {
@@ -261,23 +261,17 @@ pub struct Preferences {
     pub short_jump: u32,
     /// The same with the grip held, seconds.
     pub long_jump: u32,
-    /// Volume, percent: 100 = as decoded, above that boosted (limited).
-    pub volume: u32,
     /// D-pad up/down step, percent.
     pub volume_step: u32,
     /// Continue videos where they were left.
     pub resume: bool,
 }
 
-/// Highest volume, percent (a boost for quiet videos).
-pub const MAX_VOLUME: u32 = 150;
-
 impl Default for Preferences {
     fn default() -> Self {
         Self {
             short_jump: 5,
             long_jump: 60,
-            volume: 100,
             volume_step: 10,
             resume: true,
         }
@@ -293,19 +287,6 @@ impl Preferences {
             self.short_jump
         };
         seconds.max(1) as f64 * direction.signum() as f64
-    }
-
-    /// The volume one D-pad step up (+1) or down (-1), on the step grid.
-    pub fn stepped_volume(&self, direction: i32) -> u32 {
-        let step = self.volume_step.clamp(1, 50) as i64;
-        let v = self.volume.min(MAX_VOLUME) as i64;
-        // Off-grid values (after changing the step) go to the neighbouring step.
-        let next = if direction > 0 {
-            (v / step + 1) * step
-        } else {
-            ((v + step - 1) / step - 1) * step
-        };
-        next.clamp(0, MAX_VOLUME as i64) as u32
     }
 }
 
@@ -397,9 +378,11 @@ mod tests {
         let s: Settings = serde_json::from_str("{}").unwrap();
         assert_eq!(s.player.unwrap_or_default(), Preferences::default());
         // A partial object (fields added later) fills in defaults.
-        let s: Settings = serde_json::from_str(r#"{"player":{"volume":70}}"#).unwrap();
+        // Fields no longer used ("volume") are ignored.
+        let s: Settings =
+            serde_json::from_str(r#"{"player":{"volume":70,"volume_step":5}}"#).unwrap();
         let p = s.player.unwrap();
-        assert_eq!(p.volume, 70);
+        assert_eq!(p.volume_step, 5);
         assert_eq!(p.short_jump, 5);
         assert!(p.resume);
     }
@@ -414,31 +397,18 @@ mod tests {
         })
         .unwrap();
         update_preferences(|p| p.long_jump = 600).unwrap();
-        update_preferences(|p| p.volume = 80).unwrap();
+        update_preferences(|p| p.volume_step = 20).unwrap();
         let p = preferences();
-        assert_eq!((p.long_jump, p.volume), (600, 80));
+        assert_eq!((p.long_jump, p.volume_step), (600, 20));
         assert_eq!(caption_settings().scale, 1.5);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
-    fn jumps_and_volume_steps() {
-        let mut p = Preferences::default();
+    fn jump_lengths() {
+        let p = Preferences::default();
         assert_eq!(p.jump(-1, false), -5.0);
         assert_eq!(p.jump(1, true), 60.0);
-        assert_eq!(p.stepped_volume(1), 110);
-        assert_eq!(p.stepped_volume(-1), 90);
-        p.volume = MAX_VOLUME;
-        assert_eq!(p.stepped_volume(1), MAX_VOLUME, "at most");
-        p.volume = 0;
-        assert_eq!(p.stepped_volume(-1), 0);
-        // Off the grid: to the neighbouring step.
-        p.volume = 75;
-        assert_eq!(p.stepped_volume(1), 80);
-        assert_eq!(p.stepped_volume(-1), 70);
-        p.volume_step = 5;
-        p.volume = 70;
-        assert_eq!(p.stepped_volume(-1), 65);
     }
 
     #[test]
