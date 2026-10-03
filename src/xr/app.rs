@@ -874,10 +874,11 @@ pub fn run(
                 // D-pad: move the focus (the first press shows it). Pointing
                 // somewhere else hands control back to the pointer.
                 let view = nav.view();
+                // A new place, or the same one done loading: focus starts over.
                 let place = (
                     view.crumbs.clone(),
                     view.dialog.is_some(),
-                    view.form.is_some(),
+                    view.form.is_some() || view.status.is_some(),
                 );
                 if let Some(dir) = focus::Dir::from_steps(buttons.seek, buttons.volume) {
                     focus = match focus {
@@ -890,10 +891,7 @@ pub fn run(
                     focus_pointer = point;
                     focus_place = place;
                 } else if focus.is_some() {
-                    let moved = match (point, focus_pointer) {
-                        (Some(a), Some(b)) => (a.0 - b.0).hypot(a.1 - b.1) > FOCUS_POINTER_MOVE,
-                        (a, b) => a.is_some() != b.is_some(),
-                    };
+                    let moved = pointer_moved(point, focus_pointer);
                     if moved {
                         focus = None;
                     } else if place != focus_place {
@@ -1072,14 +1070,9 @@ pub fn run(
                         dialog_focus_pointer = pointer;
                         buttons.seek = 0;
                         buttons.volume = 0;
-                    } else if dialog_focus.is_some() {
-                        let moved = match (pointer, dialog_focus_pointer) {
-                            (Some(a), Some(b)) => (a.0 - b.0).hypot(a.1 - b.1) > FOCUS_POINTER_MOVE,
-                            (a, b) => a.is_some() != b.is_some(),
-                        };
-                        if moved {
-                            dialog_focus = None;
-                        }
+                    } else if dialog_focus.is_some() && pointer_moved(pointer, dialog_focus_pointer)
+                    {
+                        dialog_focus = None;
                     }
                 } else {
                     dialog_focus = None;
@@ -1607,6 +1600,16 @@ pub fn run(
 /// Moving the pointer this far (panel pixels) ends D-pad focus.
 const FOCUS_POINTER_MOVE: f32 = 60.0;
 
+/// Whether the pointer (on the panel, or None) moved enough since `then` to
+/// take over from D-pad focus. Pointing away (a lowered arm) doesn't count.
+fn pointer_moved(now: Option<(f32, f32)>, then: Option<(f32, f32)>) -> bool {
+    match (now, then) {
+        (Some(a), Some(b)) => (a.0 - b.0).hypot(a.1 - b.1) > FOCUS_POINTER_MOVE,
+        (Some(_), None) => true,
+        (None, _) => false,
+    }
+}
+
 /// How long a jump notice stays up.
 const NOTICE: Duration = Duration::from_millis(1500);
 
@@ -1620,6 +1623,20 @@ fn jump_notice(jump: f64, position: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_pointing_at_the_panel_ends_focus() {
+        assert!(!pointer_moved(None, Some((10.0, 10.0))), "arm lowered");
+        assert!(
+            !pointer_moved(Some((30.0, 10.0)), Some((10.0, 10.0))),
+            "jitter"
+        );
+        assert!(pointer_moved(Some((200.0, 10.0)), Some((10.0, 10.0))));
+        assert!(
+            pointer_moved(Some((10.0, 10.0)), None),
+            "came onto the panel"
+        );
+    }
 
     #[test]
     fn jump_notices() {

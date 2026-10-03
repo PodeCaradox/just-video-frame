@@ -76,7 +76,7 @@ fn change(percent: i32) -> Level {
 
 /// The default sink's level now.
 pub fn current() -> Level {
-    match Command::new("wpctl").args(["get-volume", SINK]).output() {
+    match command().args(["get-volume", SINK]).output() {
         Ok(out) if out.status.success() => {
             parse(&String::from_utf8_lossy(&out.stdout)).unwrap_or(Level::Unavailable)
         }
@@ -95,7 +95,7 @@ pub fn current() -> Level {
 }
 
 fn wpctl(args: &[&str]) -> bool {
-    match Command::new("wpctl").args(args).output() {
+    match command().args(args).output() {
         Ok(out) if out.status.success() => true,
         Ok(out) => {
             eprintln!(
@@ -110,6 +110,13 @@ fn wpctl(args: &[&str]) -> bool {
             false
         }
     }
+}
+
+/// `wpctl`, without the libraries Steam points its games at.
+fn command() -> Command {
+    let mut c = Command::new("wpctl");
+    c.env_remove("LD_LIBRARY_PATH").env_remove("LD_PRELOAD");
+    c
 }
 
 /// `wpctl get-volume` output: "Volume: 0.45" or "Volume: 0.00 [MUTED]".
