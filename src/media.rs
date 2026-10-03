@@ -21,6 +21,65 @@ pub fn default_hw_backend() -> Option<&'static str> {
 pub trait Source: Read + Seek + Send {}
 impl<T: Read + Seek + Send> Source for T {}
 
+/// What the demuxer has read so far: bytes, and how often it read somewhere
+/// other than straight on (each one a new network round trip).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct IoCount {
+    pub bytes: u64,
+    pub jumps: u64,
+}
+
+impl IoCount {
+    /// Reads since `earlier`.
+    pub fn since(self, earlier: IoCount) -> IoCount {
+        IoCount {
+            bytes: self.bytes - earlier.bytes,
+            jumps: self.jumps - earlier.jumps,
+        }
+    }
+}
+
+impl std::fmt::Display for IoCount {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{:.1} MiB in {} jumps",
+            self.bytes as f64 / (1 << 20) as f64,
+            self.jumps
+        )
+    }
+}
+
+/// Counts what passes through to FFmpeg (for timing logs and benchmarks).
+struct Counted<S> {
+    inner: S,
+    count: std::sync::Arc<std::sync::Mutex<IoCount>>,
+    /// Where the next read continues straight on; a read elsewhere is a jump.
+    position: u64,
+    expected: Option<u64>,
+}
+
+impl<S: Read> Read for Counted<S> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        let mut count = self.count.lock().expect("io count");
+        if self.expected != Some(self.position) {
+            count.jumps += 1;
+        }
+        count.bytes += n as u64;
+        self.position += n as u64;
+        self.expected = Some(self.position);
+        Ok(n)
+    }
+}
+
+impl<S: Seek> Seek for Counted<S> {
+    fn seek(&mut self, from: SeekFrom) -> std::io::Result<u64> {
+        self.position = self.inner.seek(from)?;
+        Ok(self.position)
+    }
+}
+
 const AVSEEK_SIZE: c_int = 0x10000;
 const AVERROR_EIO: c_int = -5;
 
@@ -252,6 +311,7 @@ pub struct Media {
     // Boxed twice so the pointer handed to C stays valid while `Media` moves.
     _source: Box<BoxedSource>,
     info: MediaInfo,
+    io: std::sync::Arc<std::sync::Mutex<IoCount>>,
 }
 
 // SAFETY: the FFmpeg contexts are only touched through &mut self.
@@ -259,6 +319,13 @@ unsafe impl Send for Media {}
 
 impl Media {
     pub fn open(name: &str, source: impl Source + 'static) -> anyhow::Result<Self> {
+        let io = std::sync::Arc::new(std::sync::Mutex::new(IoCount::default()));
+        let source = Counted {
+            inner: source,
+            count: io.clone(),
+            position: 0,
+            expected: None,
+        };
         let mut source: Box<BoxedSource> = Box::new(Box::new(source));
         let name = CString::new(name.replace('\0', ""))?;
         let mut raw_info = std::mem::MaybeUninit::<RawInfo>::zeroed();
@@ -339,6 +406,7 @@ impl Media {
         Ok(Self {
             raw,
             _source: source,
+            io,
             info: MediaInfo {
                 container: text(&r.container),
                 duration_seconds: r.duration_seconds,
@@ -354,6 +422,11 @@ impl Media {
 
     pub fn info(&self) -> &MediaInfo {
         &self.info
+    }
+
+    /// Everything the demuxer has read so far.
+    pub fn io(&self) -> IoCount {
+        *self.io.lock().expect("io count")
     }
 
     /// Decodes up to `frames` video frames from the start. `hw_backend` is an
@@ -438,6 +511,8 @@ unsafe extern "C" {
     ) -> *mut RawDecoder;
     fn jv_decoder_next(decoder: *mut RawDecoder, frame: *mut RawFrame) -> c_int;
     fn jv_decoder_seek(decoder: *mut RawDecoder, seconds: f64) -> c_int;
+    fn jv_decoder_skip_nonref_until(decoder: *mut RawDecoder, seconds: f64);
+    fn jv_decoder_keyframe(decoder: *mut RawDecoder, seconds: f64, after: c_int) -> f64;
     fn jv_frame_release(handle: *mut c_void);
     fn jv_decoder_enable_audio(decoder: *mut RawDecoder, rate: c_int, channels: c_int) -> c_int;
     fn jv_decoder_audio_available(decoder: *const RawDecoder) -> c_int;
@@ -597,6 +672,8 @@ pub struct VideoDecoder {
     raw: *mut RawDecoder,
     media: Media,
     stats: DecodeStats,
+    /// When the viewer asked for this video (for the time-to-first-frame log).
+    pub requested_at: Option<std::time::Instant>,
 }
 
 // SAFETY: used from one thread at a time (the decode thread).
@@ -642,6 +719,7 @@ impl Media {
                 note: optional(&s.note),
                 error: None,
             },
+            requested_at: None,
         })
     }
 }
@@ -649,6 +727,26 @@ impl Media {
 impl VideoDecoder {
     pub fn info(&self) -> &MediaInfo {
         self.media.info()
+    }
+
+    /// Everything the demuxer has read so far.
+    pub fn io(&self) -> IoCount {
+        self.media.io()
+    }
+
+    /// The keyframe in the file's index at or before (or with `after`, at or
+    /// after) `seconds`. None when the index doesn't say (e.g. Matroska
+    /// before its first seek).
+    pub fn keyframe(&mut self, seconds: f64, after: bool) -> Option<f64> {
+        let t = unsafe { jv_decoder_keyframe(self.raw, seconds.max(0.0), after as c_int) };
+        (t >= 0.0).then_some(t)
+    }
+
+    /// Until a packet reaches `seconds`, skip decoding frames no other frame
+    /// refers to: after a seek they are only decoded to be thrown away.
+    /// Hardware (V4L2) decoders ignore this.
+    pub fn skip_nonref_until(&mut self, seconds: f64) {
+        unsafe { jv_decoder_skip_nonref_until(self.raw, seconds) }
     }
 
     /// Decoder name, backend and fallback note (counters are not updated).
@@ -689,8 +787,6 @@ impl VideoDecoder {
         Some((samples, (pts >= 0.0).then_some(pts)))
     }
 
-    /// Jumps to the keyframe at or before `seconds`; frames before the target
-    /// still arrive and should be skipped by the caller.
     /// Decodes subtitle track `track` (index into `info().subtitles`) alongside
     /// the video, or none. False if it can't be decoded.
     pub fn select_subtitle(&mut self, track: Option<usize>) -> bool {
@@ -743,6 +839,8 @@ impl VideoDecoder {
         cues
     }
 
+    /// Jumps to the keyframe at or before `seconds`; frames before the target
+    /// still arrive and should be skipped by the caller.
     pub fn seek(&mut self, seconds: f64) -> anyhow::Result<()> {
         match unsafe { jv_decoder_seek(self.raw, seconds.max(0.0)) } {
             0 => Ok(()),

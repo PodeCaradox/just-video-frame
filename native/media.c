@@ -1,4 +1,5 @@
 #include "media.h"
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 #include <libavcodec/avcodec.h>
@@ -223,6 +224,9 @@ struct JVDecoder {
     AVFrame *transfer;  // scratch for hwaccel -> CPU transfers
     FormatChoice choice;
     int flushing;
+    // While catching up to a seek target: video packets before this time (stream
+    // time base) skip non-reference frames, which nothing else needs.
+    int64_t skip_until;
     // Audio (optional): decoded and resampled to interleaved float.
     AVCodecContext *audio;
     SwrContext *swr;
@@ -477,6 +481,7 @@ JVDecoder *jv_decoder_open(JVMedia *media, const char *hw_backend, int allow_sof
     if (!d) goto fail;
     d->media = media;
     d->subtitle_stream = -1;
+    d->skip_until = AV_NOPTS_VALUE;
     d->packet = av_packet_alloc();
     d->transfer = av_frame_alloc();
     if (!d->packet || !d->transfer) goto fail;
@@ -721,6 +726,13 @@ int jv_decoder_next(JVDecoder *d, JVFrame *out) {
             continue;
         }
         if (d->packet->stream_index != d->media->video_stream) { av_packet_unref(d->packet); continue; }
+        if (d->skip_until != AV_NOPTS_VALUE) {
+            // Decode order: once a packet reaches the target, every later one
+            // decodes normally (a packet without a time ends skipping too).
+            int skip = d->packet->pts != AV_NOPTS_VALUE && d->packet->pts < d->skip_until;
+            d->ctx->skip_frame = skip ? AVDISCARD_NONREF : AVDISCARD_DEFAULT;
+            if (!skip) d->skip_until = AV_NOPTS_VALUE;
+        }
         ret = avcodec_send_packet(d->ctx, d->packet);
         av_packet_unref(d->packet);
         // A damaged packet costs a glitch, not the whole playback.
@@ -733,13 +745,19 @@ void jv_frame_release(void *handle) {
     av_frame_free(&frame);
 }
 
-int jv_decoder_seek(JVDecoder *d, double seconds) {
-    AVStream *video = d->media->format->streams[d->media->video_stream];
+static int64_t video_ts(const JVDecoder *d, double seconds) {
+    const AVStream *video = d->media->format->streams[d->media->video_stream];
     int64_t start = video->start_time != AV_NOPTS_VALUE ? video->start_time : 0;
-    int64_t ts = start + (int64_t)(seconds / av_q2d(video->time_base));
-    int ret = av_seek_frame(d->media->format, d->media->video_stream, ts, AVSEEK_FLAG_BACKWARD);
+    // Rounded, so a keyframe time from jv_decoder_keyframe maps back to that keyframe.
+    return start + llrint(seconds / av_q2d(video->time_base));
+}
+
+int jv_decoder_seek(JVDecoder *d, double seconds) {
+    int ret = av_seek_frame(d->media->format, d->media->video_stream, video_ts(d, seconds), AVSEEK_FLAG_BACKWARD);
     if (ret < 0) return ret;
     avcodec_flush_buffers(d->ctx);
+    d->ctx->skip_frame = AVDISCARD_DEFAULT;
+    d->skip_until = AV_NOPTS_VALUE;
     if (d->audio) {
         avcodec_flush_buffers(d->audio);
         swr_close(d->swr);
@@ -750,6 +768,21 @@ int jv_decoder_seek(JVDecoder *d, double seconds) {
     if (d->subtitle) avcodec_flush_buffers(d->subtitle);
     d->flushing = 0;
     return 0;
+}
+
+void jv_decoder_skip_nonref_until(JVDecoder *d, double seconds) {
+    d->skip_until = seconds > 0 ? video_ts(d, seconds) : AV_NOPTS_VALUE;
+    if (d->skip_until == AV_NOPTS_VALUE) d->ctx->skip_frame = AVDISCARD_DEFAULT;
+}
+
+double jv_decoder_keyframe(JVDecoder *d, double seconds, int after) {
+    AVStream *video = d->media->format->streams[d->media->video_stream];
+    const AVIndexEntry *e = avformat_index_get_entry_from_timestamp(
+        video, video_ts(d, seconds), after ? 0 : AVSEEK_FLAG_BACKWARD);
+    if (!e || !(e->flags & AVINDEX_KEYFRAME) || e->timestamp == AV_NOPTS_VALUE) return -1;
+    int64_t start = video->start_time != AV_NOPTS_VALUE ? video->start_time : 0;
+    double t = (e->timestamp - start) * av_q2d(video->time_base);
+    return t >= 0 ? t : 0;
 }
 
 int jv_media_decode(JVMedia *media, const char *hw_backend, int allow_software,

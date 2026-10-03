@@ -2,6 +2,8 @@
 
 #[cfg(feature = "decode")]
 pub mod audio;
+#[cfg(feature = "decode")]
+pub mod bench;
 pub mod config;
 #[cfg(feature = "decode")]
 pub mod decode;

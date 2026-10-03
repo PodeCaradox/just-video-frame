@@ -150,6 +150,34 @@ enum Command {
         #[command(flatten)]
         read_ahead: ReadAheadArgs,
     },
+    /// Time opening a video and jumping around in it (+10 s, +10 min, random),
+    /// through the player's own open and seek code, without the headset view.
+    BenchSeek {
+        /// `smb://user@host/share/path/video.mp4` or a local file.
+        input: String,
+        #[arg(long, value_enum, default_value_t = Hw::Auto)]
+        hw: Hw,
+        /// Open as if continuing from here (seconds) and only time that.
+        #[arg(long)]
+        resume: Option<f64>,
+        /// Start the jumps here (seconds).
+        #[arg(long, default_value_t = 120.0)]
+        from: f64,
+        /// Random jumps after the fixed ones.
+        #[arg(long, default_value_t = 4)]
+        random: usize,
+        /// Local files only: simulate a network link of this speed (Mbit/s)...
+        #[arg(long)]
+        link_mbps: Option<f64>,
+        /// ...and this round trip (ms).
+        #[arg(long, default_value_t = 3.0)]
+        rtt_ms: f64,
+        /// Print the full report as JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        read_ahead: ReadAheadArgs,
+    },
     /// Decode video frames from the input and report throughput vs. real time.
     Bench {
         input: String,
@@ -1191,6 +1219,52 @@ fn main() -> anyhow::Result<()> {
                 "mbit_per_second": total as f64 * 8.0 / seconds / 1e6,
                 "read_stats": reader.stats(),
             }))?;
+        }
+        Command::BenchSeek {
+            input,
+            hw,
+            resume,
+            from,
+            random,
+            link_mbps,
+            rtt_ms,
+            json,
+            read_ahead,
+        } => {
+            use just_video::bench;
+            let bench_input = if input.starts_with("smb://") {
+                let started = Instant::now();
+                let session = std::sync::Arc::new(connect(&input)?);
+                let connect_ms = started.elapsed().as_secs_f64() * 1e3;
+                eprintln!("Timing: connect {connect_ms:.0} ms");
+                let url = session.url().clone();
+                bench::Input::Smb {
+                    session,
+                    share: url.share.clone(),
+                    path: url.path.split('\\').map(str::to_string).collect(),
+                    connect_ms,
+                }
+            } else {
+                bench::Input::Local {
+                    path: input.clone().into(),
+                    link: link_mbps.map(|mbps| bench::Link::new(mbps, rtt_ms)),
+                }
+            };
+            let report = bench::run(
+                bench_input,
+                &bench::Options {
+                    hw: hw_backend(hw),
+                    read_ahead: read_ahead.get(),
+                    resume,
+                    from,
+                    random,
+                },
+            )?;
+            if json {
+                print(serde_json::to_value(&report)?)?;
+            } else {
+                print!("{}", bench::summary(&report));
+            }
         }
         Command::Bench {
             input,

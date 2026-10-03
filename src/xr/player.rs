@@ -222,9 +222,90 @@ fn spawn_audio(
         .expect("spawn audio thread");
 }
 
+/// A jump requested by the viewer.
+struct SeekRequest {
+    generation: u64,
+    target: f64,
+    requested: Instant,
+}
+
+/// How the last seek (or the start) went, for logs and `bench-seek`.
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct SeekReport {
+    #[serde(skip)]
+    pub generation: u64,
+    pub target: f64,
+    /// How the decoder got there ("start", "exact", ...).
+    pub how: &'static str,
+    /// Time of the first frame decoded after the jump (the keyframe).
+    pub first_decoded: Option<f64>,
+    /// Frames decoded before the target, thrown away.
+    pub discarded: u32,
+    /// Requests merged into this one while it waited.
+    pub coalesced: u32,
+    /// The demuxer's seek and decoder flush.
+    pub seek_ms: f64,
+    /// From the request to the target frame leaving the decoder.
+    pub ready_ms: f64,
+    pub read: crate::media::IoCount,
+}
+
+/// Per-jump bookkeeping in the decode thread.
+struct Catchup {
+    report: SeekReport,
+    requested: Instant,
+    io_before: crate::media::IoCount,
+}
+
+impl Catchup {
+    fn new(
+        generation: u64,
+        target: f64,
+        how: &'static str,
+        requested: Instant,
+        io: crate::media::IoCount,
+    ) -> Self {
+        Self {
+            report: SeekReport {
+                generation,
+                target,
+                how,
+                ..Default::default()
+            },
+            requested,
+            io_before: io,
+        }
+    }
+
+    /// The first frame at the target is on its way: log how it went.
+    fn finish(mut self, io: crate::media::IoCount, shared: &Mutex<Option<SeekReport>>) {
+        let r = &mut self.report;
+        r.ready_ms = self.requested.elapsed().as_secs_f64() * 1e3;
+        r.read = io.since(self.io_before);
+        eprintln!(
+            "Timing: seek to {:.1}s ({}): ready in {:.0} ms (seek {:.0} ms); keyframe {}, \
+             {} frames discarded, {} merged, read {}",
+            r.target,
+            r.how,
+            r.ready_ms,
+            r.seek_ms,
+            r.first_decoded.map_or("?".into(), |k| format!(
+                "{k:.2}s ({:.2}s before)",
+                r.target - k
+            )),
+            r.discarded,
+            r.coalesced,
+            r.read,
+        );
+        *shared.lock().expect("seek report") = Some(self.report);
+    }
+}
+
 struct DecodeThread {
     frames: mpsc::Receiver<Decoded>,
-    control: mpsc::Sender<(u64, f64)>,
+    control: mpsc::Sender<SeekRequest>,
+    /// The last finished seek (or start).
+    report: Arc<Mutex<Option<SeekReport>>>,
     requested: Arc<AtomicU64>,
     /// Which embedded subtitle track to decode (None: none).
     subtitle_track: mpsc::Sender<Option<usize>>,
@@ -243,13 +324,23 @@ fn spawn_decoder(
     let (audio_track, audio_changes) = mpsc::channel::<usize>();
     // A few frames of slack absorb decode jitter; more would only cost memory.
     let (tx, frames) = mpsc::sync_channel(4);
-    let (control, commands) = mpsc::channel::<(u64, f64)>();
+    let (control, commands) = mpsc::channel::<SeekRequest>();
     let requested = Arc::new(AtomicU64::new(0));
     let pending = requested.clone();
+    let report = Arc::new(Mutex::new(None));
+    let shared_report = report.clone();
     std::thread::Builder::new()
         .name("decode".into())
         .spawn(move || {
             let (mut generation, mut start) = (0u64, start);
+            let opened = decoder.requested_at;
+            let mut catchup = Some(Catchup::new(
+                0,
+                start,
+                "start",
+                Instant::now(),
+                decoder.io(),
+            ));
             'decode: loop {
                 // Before seeks: the seek that follows a switch restarts the new track.
                 while let Ok(track) = audio_changes.try_recv() {
@@ -257,11 +348,24 @@ fn spawn_decoder(
                         eprintln!("Audio: can't decode track {track}");
                     }
                 }
-                while let Ok((g, t)) = commands.try_recv() {
-                    if let Err(e) = decoder.seek(t) {
-                        eprintln!("Seek to {t:.1}s failed: {e:#}");
+                while let Ok(request) = commands.try_recv() {
+                    let mut next = Catchup::new(
+                        request.generation,
+                        request.target,
+                        "exact",
+                        request.requested,
+                        decoder.io(),
+                    );
+                    let began = Instant::now();
+                    if let Err(e) = decoder.seek(request.target) {
+                        eprintln!("Seek to {:.1}s failed: {e:#}", request.target);
                     }
-                    (generation, start) = (g, t);
+                    next.report.seek_ms = began.elapsed().as_secs_f64() * 1e3;
+                    if let Some(earlier) = catchup.take() {
+                        next.report.coalesced = earlier.report.coalesced + 1;
+                    }
+                    catchup = Some(next);
+                    (generation, start) = (request.generation, request.target);
                 }
                 while let Ok(track) = subtitle_changes.try_recv() {
                     embedded_cues.lock().expect("cues").clear();
@@ -303,10 +407,18 @@ fn spawn_decoder(
                         }
                     }
                 }
+                if let (Some(c), Decoded::Frame(_, frame)) = (&mut catchup, &message)
+                    && c.report.first_decoded.is_none()
+                {
+                    c.report.first_decoded = frame.pts();
+                }
                 // Seeking lands on the keyframe before `start`; decode through to it.
                 if let Decoded::Frame(_, frame) = &message
                     && frame.pts().is_some_and(|t| t < start)
                 {
+                    if let Some(c) = &mut catchup {
+                        c.report.discarded += 1;
+                    }
                     continue;
                 }
                 let finished = !matches!(message, Decoded::Frame(..));
@@ -327,6 +439,17 @@ fn spawn_decoder(
                         Err(mpsc::TrySendError::Disconnected(_)) => return,
                     }
                 }
+                if let Some(c) = catchup.take() {
+                    if c.report.how == "start"
+                        && let Some(at) = opened
+                    {
+                        eprintln!(
+                            "Timing: first frame ready {:.0} ms after the video was chosen",
+                            at.elapsed().as_secs_f64() * 1e3
+                        );
+                    }
+                    c.finish(decoder.io(), &shared_report);
+                }
                 if finished {
                     // Wait for a seek (e.g. back from the end) or shutdown.
                     while pending.load(Ordering::Relaxed) == generation {
@@ -342,6 +465,7 @@ fn spawn_decoder(
     DecodeThread {
         frames,
         control,
+        report,
         requested,
         subtitle_track,
         audio_track,
@@ -753,7 +877,11 @@ impl Playback {
             audio.generation.store(self.generation, Ordering::Relaxed);
             *audio.clock.lock().expect("audio clock") = None;
         }
-        let _ = self.decode.control.send((self.generation, target));
+        let _ = self.decode.control.send(SeekRequest {
+            generation: self.generation,
+            target,
+            requested: Instant::now(),
+        });
         self.next = None;
         self.ended = false;
         self.error = None;
@@ -841,6 +969,20 @@ impl Playback {
             error * 0.1
         };
         *start += (correction * 1e9) as i64;
+    }
+
+    /// How the last seek (or the start) went, once its frame was decoded.
+    pub fn seek_report(&self) -> Option<SeekReport> {
+        let report = self.decode.report.lock().expect("seek report");
+        report
+            .as_ref()
+            .filter(|r| r.generation == self.generation)
+            .cloned()
+    }
+
+    /// True once a frame from the latest seek (or the start) is on screen.
+    pub fn settled(&self) -> bool {
+        self.clock_start.is_some()
     }
 
     /// True once the stream ended and its last frame has been shown for a second.
