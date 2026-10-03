@@ -238,8 +238,8 @@ impl Input {
                 Ok(list.len())
             };
         let required = ["aim", "select", "back"];
-        // Steam Frame controllers: A/B on the right, a D-pad on the left
-        // (both hands are tried; paths a controller lacks are rejected).
+        // Steam Frame controllers: A/B on the right, a D-pad on the left (only
+        // the left: on the right, a runtime might map it onto A/B).
         let frame = [
             ("aim", "aim/pose"),
             ("select", "trigger/click"),
@@ -251,10 +251,10 @@ impl Input {
             ("grip", "squeeze/click"),
             ("grip", "squeeze/value"),
             ("grip", "grip/click"),
-            ("seek_back", "dpad_left/click"),
-            ("seek_forward", "dpad_right/click"),
-            ("volume_up", "dpad_up/click"),
-            ("volume_down", "dpad_down/click"),
+            ("seek_back", "left:dpad_left/click"),
+            ("seek_forward", "left:dpad_right/click"),
+            ("volume_up", "left:dpad_up/click"),
+            ("volume_down", "left:dpad_down/click"),
         ];
         for profile in [
             "/interaction_profiles/valve/frame_controller",
