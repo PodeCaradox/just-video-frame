@@ -1174,6 +1174,20 @@ impl Navigator {
                     },
                     url: url.server_url(),
                 };
+                // Saving would replace that other entry, and its password.
+                if let Some(old) = &editing
+                    && *old != server.url
+                    && let Some(other) = config::servers()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .find(|s| s.url == server.url)
+                {
+                    f.error = Some(format!(
+                        "{} is already saved with this address and user.",
+                        other.name
+                    ));
+                    return;
+                }
                 f.busy = Some(format!("Connecting to {}…", url.host));
                 let id = self.id();
                 self.pending_changes.insert(id);
@@ -1396,6 +1410,33 @@ mod tests {
         assert!(
             matches!(&nav.purpose, Some(Purpose::EditServer(url)) if url == "smb://WORK;bob@nas:4455")
         );
+    }
+
+    #[test]
+    fn editing_a_server_into_another_one_is_refused() {
+        let dir = config::temp_config("nav-edit-dup");
+        let pc = Server {
+            name: "PC".into(),
+            url: "smb://alice@pc".into(),
+        };
+        let nas = Server {
+            name: "NAS".into(),
+            url: "smb://bob@nas".into(),
+        };
+        config::save_server(pc.clone(), "a").unwrap();
+        config::save_server(nas.clone(), "b").unwrap();
+        let mut nav = Navigator::new(Library::start(None));
+        nav.click(Hit::RowAction(0, Action::Edit));
+        let form = nav.view.form.as_mut().expect("edit form");
+        form.fields[0].value = "nas".into();
+        form.fields[1].value = "bob".into();
+        nav.click(Hit::Form(form::Hit::Key(Key::Submit)));
+        let form = nav.view().form.as_ref().expect("still open");
+        assert_eq!(form.busy, None, "not saved");
+        assert!(form.error.as_deref().is_some_and(|e| e.starts_with("NAS ")));
+        assert_eq!(config::servers().unwrap(), vec![pc, nas.clone()]);
+        assert_eq!(config::password(&nas.url).unwrap().as_deref(), Some("b"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
