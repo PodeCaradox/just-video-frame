@@ -835,9 +835,9 @@ fn main() -> anyhow::Result<()> {
                         ..row(Icon::File, "notes.txt", "", "2 KB")
                     },
                     row(
-                        Icon::Video(Some(Verdict::Hardware)),
+                        Icon::VideoVr(Some(Verdict::Hardware)),
                         "旅行_180_LR.mp4",
-                        "Plays with hardware decoding (5.7K 30 fps 8-bit HEVC)",
+                        "VR180 3D  ·  Plays with hardware decoding (5.7K 30 fps 8-bit HEVC)",
                         "3.3 GB",
                     ),
                 ],
@@ -1004,6 +1004,26 @@ fn main() -> anyhow::Result<()> {
             just_video::ui::save_png(
                 &render(&adding, &mut fonts, Some((700.0, 700.0)), true),
                 &dir.join("form.png"),
+            )?;
+            // Editing a saved server: an empty password keeps the saved one.
+            let mut editing_server = servers.clone();
+            editing_server.form = Some(Form::new(
+                "Edit NAS",
+                ["Address", "User", "Password", "Name"]
+                    .iter()
+                    .zip(["192.168.1.10:445", "WORKGROUP;user", "", "NAS"])
+                    .map(|(label, value)| Field {
+                        label: label.to_string(),
+                        value: value.into(),
+                        secret: *label == "Password",
+                        placeholder: "leave empty to keep the saved one".into(),
+                    })
+                    .collect(),
+                "Save",
+            ));
+            just_video::ui::save_png(
+                &render(&editing_server, &mut fonts, None, false),
+                &dir.join("form-edit.png"),
             )?;
             just_video::ui::save_png(
                 &render(&servers, &mut fonts, None, false),

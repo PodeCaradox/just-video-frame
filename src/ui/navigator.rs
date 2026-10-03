@@ -807,7 +807,13 @@ impl Navigator {
             .playing
             .and_then(|i| self.items.get(i))
             .map(|item| item.trail_name().to_string());
-        // Its format may have been changed while it played.
+        self.reload_played_layout();
+        self.restore_scroll();
+        self.rebuild_rows();
+    }
+
+    /// The video that played may have had its format changed: mark it as saved.
+    fn reload_played_layout(&mut self) {
         if let (
             Some(i),
             Location::Folder {
@@ -827,8 +833,6 @@ impl Navigator {
                 saved.apply(layout);
             }
         }
-        self.restore_scroll();
-        self.rebuild_rows();
     }
 
     pub fn has_adjacent(&self, delta: isize) -> bool {
@@ -844,6 +848,7 @@ impl Navigator {
         self.selecting = None;
         self.view.dialog = None;
         self.view.form = None;
+        self.reload_played_layout();
         self.select(index);
         true
     }
@@ -968,7 +973,11 @@ impl Navigator {
             Some(domain) => format!("{domain};{}", u.user),
             None => u.user.clone(),
         });
-        let password_hint = if existing.is_some() { "unchanged" } else { "" };
+        let password_hint = if existing.is_some() {
+            "leave empty to keep the saved one"
+        } else {
+            ""
+        };
         let (title, submit) = match &existing {
             Some(s) => (format!("Edit {}", s.name), "Save"),
             None => ("Add server".to_string(), "Connect"),
