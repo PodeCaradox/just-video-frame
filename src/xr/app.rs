@@ -824,6 +824,9 @@ pub fn run(
                             format!("Continuing from {}", controls::format_time(start)),
                             Duration::from_secs(4),
                         );
+                    } else if prefs.volume != 100 {
+                        // A level set earlier (perhaps 0 %) shouldn't look like a fault.
+                        playback.notice(format!("Volume {} %", prefs.volume), NOTICE * 2);
                     }
                     resume_saved_at = Instant::now();
                     playback.add_external_subtitles(opened.external_subtitles);

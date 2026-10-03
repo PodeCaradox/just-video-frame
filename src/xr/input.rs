@@ -49,7 +49,7 @@ pub struct Input {
     hands: [xr::Path; 2],
     /// D-pad left, right, up, down: press-and-hold repeat.
     repeats: [Repeat; 4],
-    /// Interaction profile last logged per hand.
+    /// Interaction profile last logged per hand (None: not yet).
     profiles: [Option<xr::Path>; 2],
     spaces: [xr::Space; 2],
     /// Per hand: a sideways stick flick must return to centre before the next.
@@ -333,7 +333,12 @@ impl Input {
         time: xr::Time,
     ) -> anyhow::Result<InputState> {
         ctx.session.sync_actions(&[(&self.set).into()])?;
-        if self.profiles.contains(&None) {
+        // Until both hands have a profile (later changes arrive as events).
+        if self
+            .profiles
+            .iter()
+            .any(|p| p.is_none_or(|p| p == xr::Path::NULL))
+        {
             self.log_profiles(ctx);
         }
         let mut state = InputState::default();
@@ -410,31 +415,33 @@ impl Input {
         Ok(state)
     }
 
-    /// Logs the interaction profile the runtime chose for each hand (once
-    /// known, and again when it changes): it decides which buttons work.
+    /// Logs the interaction profile the runtime chose for each hand (at
+    /// first, then whenever it changes): it decides which buttons work.
     pub fn log_profiles(&mut self, ctx: &XrContext) {
         for (i, hand) in ["left", "right"].into_iter().enumerate() {
+            // NULL: none chosen yet (no controller seen).
             let profile = match ctx.session.current_interaction_profile(self.hands[i]) {
                 Ok(p) => p,
                 Err(e) => {
-                    eprintln!("Input: {hand} hand profile unknown: {e}");
+                    if self.profiles[i].is_none() {
+                        eprintln!("Input: {hand} hand profile unknown: {e}");
+                        self.profiles[i] = Some(xr::Path::NULL);
+                    }
                     continue;
                 }
             };
-            // NULL: none chosen yet (no controller seen); try again later.
-            let known = (profile != xr::Path::NULL).then_some(profile);
-            if self.profiles[i] == known {
+            if self.profiles[i] == Some(profile) {
                 continue;
             }
-            let name = match known {
-                Some(p) => ctx
-                    .xr
-                    .path_to_string(p)
-                    .unwrap_or_else(|e| format!("? ({e})")),
-                None => "none".into(),
+            let name = if profile == xr::Path::NULL {
+                "no profile yet".into()
+            } else {
+                ctx.xr
+                    .path_to_string(profile)
+                    .unwrap_or_else(|e| format!("? ({e})"))
             };
             eprintln!("Input: {hand} hand uses {name}");
-            self.profiles[i] = known;
+            self.profiles[i] = Some(profile);
         }
     }
 }
