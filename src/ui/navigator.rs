@@ -4,9 +4,12 @@
 //! Changing things is opt-in per server: its lock (on the server list)
 //! reveals Edit/Remove for the server and, inside it, Rename on every entry
 //! and a "Select" tool for deleting several entries at once.
+//!
+//! The server list also leads to the Settings screen ([`super::settings`]).
 
 use super::browser::{Action, Dialog, Hit, Icon, Row, Tool, ToolIcon, View, format_size};
 use super::form::{self, Field, Form, Key};
+use super::settings::{self, Setting};
 use crate::config::{self, Server};
 use crate::library::{Library, Opened, Path, Request, Response};
 use crate::playability::{Assessment, Verdict};
@@ -24,6 +27,7 @@ pub fn is_video(name: &str) -> bool {
 fn trail(location: &Location) -> Vec<String> {
     match location {
         Location::Servers => Vec::new(),
+        Location::Settings => vec!["Settings".into()],
         Location::Shares { server } => vec![server.url.clone()],
         Location::Folder {
             server,
@@ -39,6 +43,7 @@ fn trail(location: &Location) -> Vec<String> {
 #[derive(Clone, Debug, PartialEq)]
 enum Location {
     Servers,
+    Settings,
     Shares {
         server: Server,
     },
@@ -52,6 +57,9 @@ enum Location {
 enum Item {
     Server(Server),
     AddServer,
+    /// Opens the Settings screen.
+    Settings,
+    Setting(Setting),
     Share(String),
     Dir(String),
     Video {
@@ -71,7 +79,8 @@ impl Item {
     fn name(&self) -> &str {
         match self {
             Item::Server(s) => &s.name,
-            Item::AddServer => "",
+            Item::AddServer | Item::Setting(_) => "",
+            Item::Settings => "Settings",
             Item::Share(n)
             | Item::Dir(n)
             | Item::Video { name: n, .. }
@@ -142,6 +151,10 @@ pub struct Navigator {
     next_id: u64,
     generation: u64,
     dirty: bool,
+    /// As last read or saved, for the Settings screen.
+    prefs: config::Preferences,
+    /// A setting changed since [`Navigator::take_preferences`].
+    prefs_changed: bool,
 }
 
 impl Navigator {
@@ -166,6 +179,8 @@ impl Navigator {
             next_id: 1,
             generation: 0,
             dirty: true,
+            prefs: config::Preferences::default(),
+            prefs_changed: false,
         };
         nav.show_servers();
         nav
@@ -218,6 +233,7 @@ impl Navigator {
         let mut crumbs = vec!["Just Video".to_string()];
         match &self.location {
             Location::Servers => {}
+            Location::Settings => crumbs.push("Settings".into()),
             Location::Shares { server } => crumbs.push(server.name.clone()),
             Location::Folder {
                 server,
@@ -293,8 +309,38 @@ impl Navigator {
         });
         self.items = servers.into_iter().map(Item::Server).collect();
         self.items.push(Item::AddServer);
+        self.items.push(Item::Settings);
         self.restore_scroll();
         self.rebuild_rows();
+    }
+
+    fn show_settings(&mut self) {
+        self.leave(&Location::Settings);
+        self.location = Location::Settings;
+        self.pending = None;
+        self.reset_view();
+        self.prefs = config::preferences();
+        self.items = settings::ALL.into_iter().map(Item::Setting).collect();
+        self.rebuild_rows();
+    }
+
+    /// Steps a setting to its next value and saves it.
+    fn change_setting(&mut self, setting: Setting) {
+        match config::update_preferences(|p| setting.cycle(p)) {
+            Ok(prefs) => self.prefs = prefs,
+            Err(e) => {
+                // Still applies until Just Video quits.
+                setting.cycle(&mut self.prefs);
+                self.dialog("Couldn't save the setting", vec![format!("{e:#}")]);
+            }
+        }
+        self.prefs_changed = true;
+        self.rebuild_rows();
+    }
+
+    /// The preferences, once after the Settings screen changed them.
+    pub fn take_preferences(&mut self) -> Option<config::Preferences> {
+        std::mem::take(&mut self.prefs_changed).then_some(self.prefs)
     }
 
     fn navigate(&mut self, location: Location) {
@@ -308,6 +354,7 @@ impl Navigator {
         self.pending = Some(id);
         match location {
             Location::Servers => self.show_servers(),
+            Location::Settings => self.show_settings(),
             Location::Shares { server } => {
                 self.set_status("Connecting…");
                 self.library.send(Request::Shares { id, server });
@@ -361,6 +408,11 @@ impl Navigator {
                         detail: "A Windows PC, NAS or Samba server on your network".into(),
                         ..Row::new(Icon::Add, "Add server")
                     },
+                    Item::Settings => Row {
+                        detail: "Jump lengths, volume, continuing videos".into(),
+                        ..Row::new(Icon::Settings, "Settings")
+                    },
+                    Item::Setting(setting) => setting.row(&self.prefs),
                     Item::Share(name) => Row::new(Icon::Share, name),
                     Item::Dir(name) => Row::new(Icon::Folder, name),
                     Item::Video {
@@ -800,6 +852,8 @@ impl Navigator {
         match (item, self.location.clone()) {
             (Item::Server(s), _) => self.navigate(Location::Shares { server: s.clone() }),
             (Item::AddServer, _) => self.start_server_form(None),
+            (Item::Settings, _) => self.show_settings(),
+            (Item::Setting(setting), _) => self.change_setting(*setting),
             (Item::Share(name), Location::Shares { server }) => self.navigate(Location::Folder {
                 server,
                 share: name.clone(),
@@ -1148,7 +1202,7 @@ impl Navigator {
         }
         match self.location.clone() {
             Location::Servers => return false,
-            Location::Shares { .. } => self.show_servers(),
+            Location::Settings | Location::Shares { .. } => self.show_servers(),
             Location::Folder {
                 server,
                 share,
@@ -1196,9 +1250,33 @@ mod tests {
     #[test]
     fn server_list_offers_adding_one() {
         let nav = Navigator::new(Library::start(None));
-        let last = nav.view().rows.last().expect("rows");
-        assert_eq!(last.icon, Icon::Add);
+        let rows = &nav.view().rows;
+        assert_eq!(rows[rows.len() - 2].icon, Icon::Add);
+        assert_eq!(rows[rows.len() - 1].icon, Icon::Settings);
         assert_eq!(nav.view().crumbs, vec!["Just Video".to_string()]);
+    }
+
+    #[test]
+    fn settings_rows_cycle_and_save() {
+        let dir = config::temp_config("nav-settings");
+        let mut nav = Navigator::new(Library::start(None));
+        let gear = nav.view().rows.len() - 1;
+        nav.click(Hit::Row(gear));
+        assert_eq!(nav.view().crumbs, ["Just Video", "Settings"]);
+        assert_eq!(nav.view().rows.len(), settings::ALL.len());
+        assert_eq!(nav.view().rows[0].right, "5 s");
+        assert_eq!(nav.take_preferences(), None);
+
+        nav.click(Hit::Row(0));
+        assert_eq!(nav.view().rows[0].right, "10 s");
+        assert_eq!(nav.take_preferences().map(|p| p.short_jump), Some(10));
+        assert_eq!(nav.take_preferences(), None, "reported once");
+        assert_eq!(config::preferences().short_jump, 10, "saved");
+
+        assert!(nav.back());
+        assert_eq!(nav.view().crumbs, ["Just Video"]);
+        assert!(nav.view().rows[gear].outlined, "the way back in");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

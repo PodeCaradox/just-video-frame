@@ -6,6 +6,7 @@ pub mod captions;
 pub mod controls;
 pub mod form;
 pub mod navigator;
+pub mod settings;
 
 /// Saves a canvas as PNG (UI previews and tests).
 pub fn save_png(canvas: &canvas::Canvas, path: &std::path::Path) -> anyhow::Result<()> {

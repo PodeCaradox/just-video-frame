@@ -52,6 +52,10 @@ pub enum Icon {
     /// A file that isn't a video.
     File,
     Add,
+    /// A gear: the Settings screen.
+    Settings,
+    /// A slider: one setting.
+    Slider,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -416,6 +420,21 @@ fn draw_icon(canvas: &mut Canvas, icon: &Icon, cx: f32, cy: f32) {
         Icon::Add => {
             canvas.rect(cx - 3.0, cy - 18.0, 6.0, 36.0, 3.0, ACCENT);
             canvas.rect(cx - 18.0, cy - 3.0, 36.0, 6.0, 3.0, ACCENT);
+        }
+        Icon::Settings => {
+            // Eight teeth around a wheel with a hole.
+            for k in 0..8 {
+                let a = k as f32 * std::f32::consts::FRAC_PI_4;
+                let (x, y) = (cx + 16.0 * a.cos(), cy + 16.0 * a.sin());
+                canvas.rect(x - 5.0, y - 5.0, 10.0, 10.0, 2.0, SUBTLE);
+            }
+            canvas.circle(cx, cy, 15.0, SUBTLE);
+            canvas.circle(cx, cy, 6.0, BG);
+        }
+        Icon::Slider => {
+            canvas.rect(cx - 20.0, cy - 2.0, 40.0, 4.0, 2.0, FAINT);
+            canvas.rect(cx - 20.0, cy - 2.0, 22.0, 4.0, 2.0, ACCENT);
+            canvas.circle(cx + 2.0, cy, 8.0, ACCENT);
         }
     }
 }

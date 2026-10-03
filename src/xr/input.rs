@@ -1,7 +1,8 @@
 //! Controller input: an aim ray per hand (smoothed), select (trigger or A),
-//! back (B), scroll (thumbstick; grip held = faster), seek (left D-pad or a
-//! sideways stick flick). Bindings are suggested for the Steam
-//! Frame controller, Index controllers and the generic simple profile.
+//! back (B), scroll (thumbstick; grip held = faster), jump (D-pad left/right
+//! or a sideways stick flick), volume (D-pad up/down). Bindings are suggested
+//! for the Steam Frame controller, Index controllers and the generic simple
+//! profile; which one the runtime picked is logged.
 
 use super::context::XrContext;
 use openxr as xr;
@@ -24,9 +25,11 @@ pub struct InputState {
     pub reset: bool,
     /// Grip (lower trigger) held on either hand: a modifier, e.g. fast scroll.
     pub grip: bool,
-    /// Seek pressed this frame: -1 back, +1 forward (D-pad left/right, or a
-    /// sideways thumbstick flick where the D-pad isn't available).
+    /// Jump this frame: -1 back, +1 forward (D-pad left/right, repeating
+    /// while held, or a sideways thumbstick flick).
     pub seek: i32,
+    /// Volume step this frame: -1 down, +1 up (D-pad down/up, repeating).
+    pub volume: i32,
     /// Thumbstick vertical deflection (-1..1, up positive), strongest hand.
     pub scroll: f32,
 }
@@ -40,13 +43,50 @@ pub struct Input {
     grip: xr::Action<bool>,
     seek_back: xr::Action<bool>,
     seek_forward: xr::Action<bool>,
+    volume_up: xr::Action<bool>,
+    volume_down: xr::Action<bool>,
     scroll: xr::Action<xr::Vector2f>,
     hands: [xr::Path; 2],
+    /// D-pad left, right, up, down: press-and-hold repeat.
+    repeats: [Repeat; 4],
+    /// Interaction profile last logged per hand.
+    profiles: [Option<xr::Path>; 2],
     spaces: [xr::Space; 2],
     /// Per hand: a sideways stick flick must return to centre before the next.
     flick_ready: [bool; 2],
     /// Per hand: origin and direction filters.
     filters: [[OneEuro; 2]; 2],
+}
+
+/// Hold-to-repeat for a button: fires on press, then after [`REPEAT_DELAY`]
+/// every [`REPEAT_EVERY`] while still held.
+#[derive(Clone, Copy, Default)]
+struct Repeat {
+    /// Display time (ns) of the next repeat while held.
+    next: Option<i64>,
+}
+
+const REPEAT_DELAY: i64 = 500_000_000;
+const REPEAT_EVERY: i64 = 250_000_000;
+
+impl Repeat {
+    fn update(&mut self, held: bool, now: i64) -> bool {
+        match self.next {
+            _ if !held => {
+                self.next = None;
+                false
+            }
+            None => {
+                self.next = Some(now + REPEAT_DELAY);
+                true
+            }
+            Some(at) if now >= at => {
+                self.next = Some(now + REPEAT_EVERY);
+                true
+            }
+            Some(_) => false,
+        }
+    }
 }
 
 /// One Euro filter (Casiez et al.): heavy smoothing while still, little lag
@@ -129,9 +169,12 @@ impl Input {
         let back = set.create_action::<bool>("back", "Back", &hands)?;
         let reset = set.create_action::<bool>("reset", "Reset view", &hands)?;
         let grip = set.create_action::<bool>("grip", "Modifier", &hands)?;
-        let seek_back = set.create_action::<bool>("seek_back", "Back 5 seconds", &hands)?;
-        let seek_forward =
-            set.create_action::<bool>("seek_forward", "Forward 5 seconds", &hands)?;
+        // Names are kept (SteamVR stores rebindings by them); the jump
+        // length is a setting, so the labels don't give one.
+        let seek_back = set.create_action::<bool>("seek_back", "Jump back", &hands)?;
+        let seek_forward = set.create_action::<bool>("seek_forward", "Jump forward", &hands)?;
+        let volume_up = set.create_action::<bool>("volume_up", "Volume up", &hands)?;
+        let volume_down = set.create_action::<bool>("volume_down", "Volume down", &hands)?;
         let scroll = set.create_action::<xr::Vector2f>("scroll", "Scroll", &hands)?;
 
         let binding = |action: &str, path: xr::Path| match action {
@@ -142,6 +185,8 @@ impl Input {
             "grip" => xr::Binding::new(&grip, path),
             "seek_back" => xr::Binding::new(&seek_back, path),
             "seek_forward" => xr::Binding::new(&seek_forward, path),
+            "volume_up" => xr::Binding::new(&volume_up, path),
+            "volume_down" => xr::Binding::new(&volume_down, path),
             _ => xr::Binding::new(&scroll, path),
         };
         // Suggests every binding the runtime accepts for `profile` (each is
@@ -153,6 +198,7 @@ impl Input {
             |profile: &str, wanted: &[(&str, &str)], required: &[&str]| -> anyhow::Result<usize> {
                 let profile_path = xr_.string_to_path(profile)?;
                 let mut accepted = Vec::new();
+                let mut rejected = Vec::new();
                 for hand in ["left", "right"] {
                     for (action, input) in wanted {
                         let input = match input.split_once(':') {
@@ -170,6 +216,8 @@ impl Input {
                             .is_ok()
                         {
                             accepted.push((*action, path));
+                        } else {
+                            rejected.push(format!("{hand}:{input}"));
                         }
                     }
                 }
@@ -179,6 +227,10 @@ impl Input {
                 {
                     anyhow::bail!("no binding for {missing}");
                 }
+                // Which inputs a profile lacks tells us what to bind instead.
+                if !rejected.is_empty() {
+                    eprintln!("Input: {profile} rejected {}", rejected.join(", "));
+                }
                 let list: Vec<_> = accepted.iter().map(|(a, p)| binding(a, *p)).collect();
                 if !list.is_empty() {
                     xr_.suggest_interaction_profile_bindings(profile_path, &list)?;
@@ -186,7 +238,8 @@ impl Input {
                 Ok(list.len())
             };
         let required = ["aim", "select", "back"];
-        // Steam Frame controllers: A/B on the right, a D-pad on the left.
+        // Steam Frame controllers: A/B on the right, a D-pad on the left
+        // (both hands are tried; paths a controller lacks are rejected).
         let frame = [
             ("aim", "aim/pose"),
             ("select", "trigger/click"),
@@ -198,8 +251,10 @@ impl Input {
             ("grip", "squeeze/click"),
             ("grip", "squeeze/value"),
             ("grip", "grip/click"),
-            ("seek_back", "left:dpad_left/click"),
-            ("seek_forward", "left:dpad_right/click"),
+            ("seek_back", "dpad_left/click"),
+            ("seek_forward", "dpad_right/click"),
+            ("volume_up", "dpad_up/click"),
+            ("volume_down", "dpad_down/click"),
         ];
         for profile in [
             "/interaction_profiles/valve/frame_controller",
@@ -213,7 +268,9 @@ impl Input {
         // Index bindings, which SteamVR maps Frame controllers onto when the
         // native profile isn't available. The Frame's left D-pad arrives as
         // the left A (down) and B (left/right/up), so A and B count only on
-        // the right: the D-pad must not stop the video.
+        // the right: the D-pad must not stop the video. Left/right/up can't be
+        // told apart there, so this profile has no D-pad jumps or volume:
+        // only the stick flick jumps.
         let index = [
             ("aim", "aim/pose"),
             ("select", "trigger/click"),
@@ -256,8 +313,12 @@ impl Input {
             grip,
             seek_back,
             seek_forward,
+            volume_up,
+            volume_down,
             scroll,
             hands,
+            repeats: Default::default(),
+            profiles: [None; 2],
             spaces,
             flick_ready: [true; 2],
             // Direction: unit vector (rad/s-ish speeds); origin: metres.
@@ -272,7 +333,12 @@ impl Input {
         time: xr::Time,
     ) -> anyhow::Result<InputState> {
         ctx.session.sync_actions(&[(&self.set).into()])?;
+        if self.profiles.contains(&None) {
+            self.log_profiles(ctx);
+        }
         let mut state = InputState::default();
+        let now = time.as_nanos();
+        let mut dpad = [false; 4];
         let pressed = |action: &xr::Action<bool>, hand: xr::Path| -> anyhow::Result<bool> {
             let s = action.state(&ctx.session, hand)?;
             Ok(s.is_active && s.current_state && s.changed_since_last_sync)
@@ -285,11 +351,15 @@ impl Input {
             state.reset |= pressed(&self.reset, hand)?;
             let grip = self.grip.state(&ctx.session, hand)?;
             state.grip |= grip.is_active && grip.current_state;
-            if pressed(&self.seek_back, hand)? {
-                state.seek = -1;
-            }
-            if pressed(&self.seek_forward, hand)? {
-                state.seek = 1;
+            let dpad_actions = [
+                &self.seek_back,
+                &self.seek_forward,
+                &self.volume_up,
+                &self.volume_down,
+            ];
+            for (held, action) in dpad.iter_mut().zip(dpad_actions) {
+                let s = action.state(&ctx.session, hand)?;
+                *held |= s.is_active && s.current_state;
             }
             let stick = self.scroll.state(&ctx.session, hand)?;
             if stick.is_active {
@@ -327,7 +397,45 @@ impl Input {
                 }
             }
         }
+        let fired: Vec<bool> = (self.repeats.iter_mut().zip(dpad))
+            .map(|(r, held)| r.update(held, now))
+            .collect();
+        if fired[0] {
+            state.seek = -1;
+        }
+        if fired[1] {
+            state.seek = 1;
+        }
+        state.volume = fired[2] as i32 - fired[3] as i32;
         Ok(state)
+    }
+
+    /// Logs the interaction profile the runtime chose for each hand (once
+    /// known, and again when it changes): it decides which buttons work.
+    pub fn log_profiles(&mut self, ctx: &XrContext) {
+        for (i, hand) in ["left", "right"].into_iter().enumerate() {
+            let profile = match ctx.session.current_interaction_profile(self.hands[i]) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("Input: {hand} hand profile unknown: {e}");
+                    continue;
+                }
+            };
+            // NULL: none chosen yet (no controller seen); try again later.
+            let known = (profile != xr::Path::NULL).then_some(profile);
+            if self.profiles[i] == known {
+                continue;
+            }
+            let name = match known {
+                Some(p) => ctx
+                    .xr
+                    .path_to_string(p)
+                    .unwrap_or_else(|e| format!("? ({e})")),
+                None => "none".into(),
+            };
+            eprintln!("Input: {hand} hand uses {name}");
+            self.profiles[i] = known;
+        }
     }
 }
 
@@ -355,6 +463,23 @@ mod tests {
             out = f.filter([0.5, 0.0, -0.8], i * step);
         }
         assert!((out[0] - 0.5).abs() < 0.05, "lagging: {out:?}");
+    }
+
+    #[test]
+    fn held_buttons_repeat_after_a_delay() {
+        let ms = 1_000_000;
+        let mut r = Repeat::default();
+        let fired: Vec<i64> = (0..100)
+            .map(|i| i * 11 * ms)
+            .filter(|&t| r.update(t < 1000 * ms, t))
+            .collect();
+        // Press, then from 0.5 s every ~0.25 s until released at 1 s.
+        assert_eq!(fired.len(), 3, "{fired:?}");
+        assert_eq!(fired[0], 0);
+        assert!((500 * ms..520 * ms).contains(&fired[1]));
+        assert!((750 * ms..780 * ms).contains(&fired[2]));
+        assert!(!r.update(false, 1100 * ms));
+        assert!(r.update(true, 1200 * ms), "a new press fires at once");
     }
 
     #[test]

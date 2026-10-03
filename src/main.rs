@@ -868,9 +868,25 @@ fn main() -> anyhow::Result<()> {
                         detail: "A Windows PC, NAS or Samba server on your network".into(),
                         ..Row::new(Icon::Add, "Add server")
                     },
+                    Row {
+                        detail: "Jump lengths, volume, continuing videos".into(),
+                        ..Row::new(Icon::Settings, "Settings")
+                    },
                 ],
                 ..Default::default()
             };
+            let settings = View {
+                crumbs: crumbs(&["Just Video", "Settings"]),
+                rows: just_video::ui::settings::rows(&just_video::config::Preferences {
+                    long_jump: 600,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            just_video::ui::save_png(
+                &render(&settings, &mut fonts, Some((700.0, 400.0)), true),
+                &dir.join("settings.png"),
+            )?;
             // Edit mode: rename/delete on each row.
             let mut editing = folder.clone();
             editing.tools = vec![
