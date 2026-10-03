@@ -172,6 +172,13 @@ enum Command {
         /// ...and this round trip (ms).
         #[arg(long, default_value_t = 3.0)]
         rtt_ms: f64,
+        /// Instead of jumping, play this many seconds from `--from` like the
+        /// headset's frame loop and report dropped frames and copy times.
+        #[arg(long)]
+        play: Option<f64>,
+        /// Frame loop rate for `--play`.
+        #[arg(long, default_value_t = 90.0)]
+        hz: f64,
         /// Print the full report as JSON instead of a table.
         #[arg(long)]
         json: bool,
@@ -1225,6 +1232,8 @@ fn main() -> anyhow::Result<()> {
             random,
             link_mbps,
             rtt_ms,
+            play,
+            hz,
             json,
             read_ahead,
         } => {
@@ -1255,6 +1264,8 @@ fn main() -> anyhow::Result<()> {
                     resume,
                     from,
                     random,
+                    play,
+                    hz,
                 },
             )?;
             if json {

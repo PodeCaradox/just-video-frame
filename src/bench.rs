@@ -86,6 +86,37 @@ pub struct Options {
     pub from: f64,
     /// Random jumps after the fixed ones.
     pub random: usize,
+    /// Instead of jumping: play this many seconds from `from`, ticking like
+    /// the headset's frame loop at `hz`, and copy each new picture as the
+    /// renderer's upload does.
+    pub play: Option<f64>,
+    pub hz: f64,
+}
+
+/// Steady playback, as the headset's frame loop sees it.
+#[derive(Serialize, Default)]
+pub struct PlayReport {
+    pub seconds: f64,
+    pub hz: f64,
+    pub fps: f64,
+    /// Video frames due in that time.
+    pub due: u64,
+    /// New pictures shown (uploaded).
+    pub shown: u64,
+    /// Decoded frames passed over because a later one was already due.
+    pub skipped: u64,
+    /// Ticks showing a picture more than 1.5 frames older than the clock.
+    pub behind_ticks: u64,
+    pub ticks: u64,
+    /// Ticks that took longer than a refresh period (loop work only).
+    pub over_budget_ticks: u64,
+    /// Copying a picture out of the decoder's buffer, as the upload does.
+    pub copy_ms_mean: f64,
+    pub copy_ms_max: f64,
+    pub copy_mb_per_s: f64,
+    /// `advance` (frame selection), excluding the copy.
+    pub advance_ms_mean: f64,
+    pub advance_ms_max: f64,
 }
 
 #[derive(Serialize)]
@@ -111,16 +142,103 @@ pub struct Report {
     pub first_frame_ms: Option<f64>,
     pub start: Option<SeekReport>,
     pub jumps: Vec<Jump>,
+    pub play: Option<PlayReport>,
+}
+
+/// Copies every row of `frame` into `staging`, like `Renderer::record_upload`.
+fn copy_frame(frame: &crate::media::Frame, staging: &mut Vec<u8>) -> usize {
+    let mut offset = 0;
+    for plane in 0..frame.plane_count() {
+        for row in frame.rows(plane) {
+            if staging.len() < offset + row.len() {
+                staging.resize(offset + row.len(), 0);
+            }
+            staging[offset..offset + row.len()].copy_from_slice(row);
+            offset += row.len();
+        }
+    }
+    offset
+}
+
+/// Plays for `seconds` in real time, ticking at `hz` like the frame loop.
+fn play_steady(playback: &mut Playback, seconds: f64, hz: f64) -> PlayReport {
+    let period = Duration::from_secs_f64(1.0 / hz);
+    let clock = Instant::now();
+    let mut staging = Vec::new();
+    let mut r = PlayReport {
+        hz,
+        fps: playback.fps(),
+        ..Default::default()
+    };
+    let (mut copy_total, mut advance_total, mut bytes) = (0.0, 0.0, 0usize);
+    let skipped_before = playback.stats.skipped_frames;
+    let first_time = playback.media_time(now_ns());
+    let mut next_tick = Instant::now();
+    while clock.elapsed().as_secs_f64() < seconds {
+        let now = now_ns();
+        let tick = Instant::now();
+        let changed = playback.advance(now);
+        let advanced = tick.elapsed().as_secs_f64() * 1e3;
+        advance_total += advanced;
+        r.advance_ms_max = r.advance_ms_max.max(advanced);
+        if changed && let Some(frame) = playback.current() {
+            let copy = Instant::now();
+            bytes += copy_frame(frame, &mut staging);
+            let ms = copy.elapsed().as_secs_f64() * 1e3;
+            copy_total += ms;
+            r.copy_ms_max = r.copy_ms_max.max(ms);
+            r.shown += 1;
+        }
+        if let (Some(t), Some(pts)) = (
+            playback.media_time(now),
+            playback.current().and_then(|f| f.pts()),
+        ) && t - pts > 1.5 / r.fps
+        {
+            r.behind_ticks += 1;
+        }
+        r.ticks += 1;
+        if tick.elapsed() > period {
+            r.over_budget_ticks += 1;
+        }
+        if playback.error.is_some() {
+            break;
+        }
+        next_tick += period;
+        match next_tick.checked_duration_since(Instant::now()) {
+            Some(wait) => std::thread::sleep(wait),
+            None => next_tick = Instant::now(),
+        }
+    }
+    let end = playback.media_time(now_ns());
+    r.seconds = match (first_time, end) {
+        (Some(a), Some(b)) => b - a,
+        _ => clock.elapsed().as_secs_f64(),
+    };
+    r.due = (r.seconds * r.fps).round() as u64;
+    r.skipped = playback.stats.skipped_frames - skipped_before;
+    if r.shown > 0 {
+        r.copy_ms_mean = copy_total / r.shown as f64;
+        r.copy_mb_per_s = bytes as f64 / 1e6 / (copy_total / 1e3);
+    }
+    if r.ticks > 0 {
+        r.advance_ms_mean = advance_total / r.ticks as f64;
+    }
+    r
+}
+
+/// One clock for every `advance`, as the headset's predicted display times are.
+fn now_ns() -> i64 {
+    static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    EPOCH.get_or_init(Instant::now).elapsed().as_nanos() as i64 + 1_000_000_000
 }
 
 /// Plays until the picture from the latest jump is on screen (None after
 /// 60 s); also when a preview (its keyframe) showed before that.
 fn wait_shown(playback: &mut Playback, since: Instant) -> (Option<f64>, Option<f64>) {
-    let clock = Instant::now();
     let mut preview = None;
     let ms = || since.elapsed().as_secs_f64() * 1e3;
     while since.elapsed() < Duration::from_secs(60) {
-        let changed = playback.advance(clock.elapsed().as_nanos() as i64);
+        let changed = playback.advance(now_ns());
         if playback.settled() {
             return (Some(ms()), preview);
         }
@@ -151,7 +269,7 @@ fn report_of(playback: &Playback) -> Option<SeekReport> {
 fn play_for(playback: &mut Playback, time: Duration) {
     let clock = Instant::now();
     while clock.elapsed() < time {
-        playback.advance(clock.elapsed().as_nanos() as i64 + 1_000_000_000);
+        playback.advance(now_ns());
         std::thread::sleep(Duration::from_millis(5));
     }
 }
@@ -221,7 +339,16 @@ pub fn run(input: Input, options: &Options) -> anyhow::Result<Report> {
     let start = report_of(&playback);
     let duration = playback.duration;
     let mut jumps = Vec::new();
-    if first_frame_ms.is_some() && options.resume.is_none() {
+    let mut play = None;
+    if let Some(seconds) = options.play.filter(|_| first_frame_ms.is_some()) {
+        if options.resume.is_none() && options.from > 0.0 {
+            playback.seek(options.from.min(duration * 0.5));
+            wait_shown(&mut playback, Instant::now());
+        }
+        // Settle in before measuring.
+        play_for(&mut playback, Duration::from_secs(2));
+        play = Some(play_steady(&mut playback, seconds, options.hz));
+    } else if first_frame_ms.is_some() && options.resume.is_none() {
         let from = options.from.min(duration * 0.5);
         let mut jump = |playback: &mut Playback, label: &str, target: f64| {
             let from = playback.position();
@@ -278,6 +405,7 @@ pub fn run(input: Input, options: &Options) -> anyhow::Result<Report> {
         first_frame_ms,
         start,
         jumps,
+        play,
     };
     crate::xr::app::drop_in_background(playback);
     Ok(report)
@@ -293,6 +421,26 @@ pub fn summary(r: &Report) -> String {
         r.first_frame_ms
             .map_or("never".into(), |ms| format!("{ms:.0} ms"))
     );
+    if let Some(p) = &r.play {
+        out += &format!(
+            "played {:.1} s at {:.0} Hz: {} of {} frames shown, {} skipped, {} of {} ticks behind, {} over budget\n\
+             copy {:.1} ms mean / {:.1} max ({:.0} MB/s), advance {:.2} ms mean / {:.1} max\n",
+            p.seconds,
+            p.hz,
+            p.shown,
+            p.due,
+            p.skipped,
+            p.behind_ticks,
+            p.ticks,
+            p.over_budget_ticks,
+            p.copy_ms_mean,
+            p.copy_ms_max,
+            p.copy_mb_per_s,
+            p.advance_ms_mean,
+            p.advance_ms_max,
+        );
+        return out;
+    }
     out += "jump                         target   shown preview  how       keyframe gap  discarded  read\n";
     for j in &r.jumps {
         let d = j.decoder.as_ref();

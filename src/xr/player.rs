@@ -1337,6 +1337,11 @@ impl Playback {
         self.clock_start.map(|start| (now - start) as f64 / 1e9)
     }
 
+    /// Frames per second of the video.
+    pub fn fps(&self) -> f64 {
+        self.fps
+    }
+
     /// Current position for the UI: the shown frame's time.
     pub fn position(&self) -> f64 {
         self.last_pts.max(0.0)
