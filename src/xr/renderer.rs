@@ -766,16 +766,19 @@ impl Renderer {
             if let Some(old) = self.slots[self.slot].staging.take() {
                 self.destroy_buffer(old);
             }
+            let first = self.slots.iter().all(|s| s.staging.is_none());
             let buffer = self.create_buffer(total, vk::BufferUsageFlags::TRANSFER_SRC)?;
-            eprintln!(
-                "Renderer: video {}x{} ({} MB per picture), staging memory {:?}, eyes {}x{}",
-                frame.width(),
-                frame.height(),
-                total / 1_000_000,
-                buffer.flags,
-                self.eyes[0].width,
-                self.eyes[0].height,
-            );
+            if first {
+                eprintln!(
+                    "Renderer: video {}x{} ({} MB per picture), staging memory {:?}, eyes {}x{}",
+                    frame.width(),
+                    frame.height(),
+                    total / 1_000_000,
+                    buffer.flags,
+                    self.eyes[0].width,
+                    self.eyes[0].height,
+                );
+            }
             self.slots[self.slot].staging = Some(buffer);
         }
         let copy_started = std::time::Instant::now();
