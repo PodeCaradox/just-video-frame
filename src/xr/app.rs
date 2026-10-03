@@ -880,7 +880,20 @@ pub fn run(
                     view.dialog.is_some(),
                     view.form.is_some() || view.status.is_some(),
                 );
-                if let Some(dir) = focus::Dir::from_steps(buttons.seek, buttons.volume) {
+                let dir = focus::Dir::from_steps(buttons.seek, buttons.volume);
+                // Right on a folder opens it (the new place then gets focus).
+                let opened = focus
+                    .filter(|f| {
+                        dir == Some(focus::Dir::Right)
+                            && place == focus_place
+                            && focus::valid(view, &mut fonts, f)
+                    })
+                    .and_then(|f| focus::opens_on_right(view, &f));
+                if let Some(hit) = opened {
+                    nav.click(hit);
+                    // Holding right must not keep going down into subfolders.
+                    input.wait_for_dpad_release();
+                } else if let Some(dir) = dir {
                     focus = match focus {
                         Some(f) if place == focus_place && focus::valid(view, &mut fonts, &f) => {
                             Some(focus::step(view, &mut fonts, f, dir))

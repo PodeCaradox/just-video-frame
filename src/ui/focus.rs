@@ -4,7 +4,7 @@
 //! buttons; elsewhere (header, dialogs, the keyboard) focus moves to the
 //! nearest item in that direction.
 
-use super::browser::{self, Hit, Rect, View};
+use super::browser::{self, Hit, Icon, Rect, View};
 use super::canvas::Fonts;
 use super::form;
 
@@ -123,6 +123,18 @@ pub fn valid(view: &View, fonts: &mut Fonts, focus: &Focus) -> bool {
     }
 }
 
+/// Right on a folder (or share) row opens it, as clicking would. Rows with
+/// buttons (edit mode, servers) or checkboxes move to the buttons instead.
+pub fn opens_on_right(view: &View, focus: &Focus) -> Option<Hit> {
+    let Hit::Row(i) = focus.hit else {
+        return None;
+    };
+    let row = view.rows.get(i).filter(|_| list_shown(view))?;
+    let container = matches!(row.icon, Icon::Folder | Icon::Share | Icon::Server);
+    let plain = row.actions.is_empty() && row.lock.is_none() && row.checked.is_none();
+    (container && plain && !row.dimmed).then_some(focus.hit)
+}
+
 /// After the view changed under the focus (e.g. Shift relabels the keys, a
 /// row went away): the item now nearest to where it was.
 pub fn refind(view: &View, fonts: &mut Fonts, old: &Focus) -> Option<Focus> {
@@ -226,7 +238,7 @@ pub fn scroll_to_show(view: &View, focus: &Focus) -> Option<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::browser::{Action, Dialog, Icon, Row, Tool};
+    use crate::ui::browser::{Action, Dialog, Row, Tool};
 
     fn view(rows: usize) -> View {
         let mut v = View {
@@ -278,6 +290,19 @@ mod tests {
         assert!(matches!(left.hit, Hit::Crumb(_)), "{left:?}");
         round_trips(&v, &mut fonts, &left);
         assert_eq!(step(&v, &mut fonts, top, Dir::Down).hit, Hit::Row(0));
+    }
+
+    #[test]
+    fn right_opens_folders_but_reaches_buttons_in_edit_mode() {
+        let mut fonts = Fonts::load().expect("fonts");
+        let mut v = view(5);
+        let first = initial(&v, &mut fonts).unwrap();
+        assert_eq!(opens_on_right(&v, &first), Some(Hit::Row(0)));
+        // Row 1 has Rename and Delete: right goes to them.
+        let second = step(&v, &mut fonts, first, Dir::Down);
+        assert_eq!(opens_on_right(&v, &second), None);
+        v.rows[0].icon = Icon::Video(None);
+        assert_eq!(opens_on_right(&v, &first), None, "videos open with A");
     }
 
     #[test]
