@@ -110,7 +110,7 @@ mod tests {
         s.key_after = Some(112.0);
         assert_eq!(plan_seek(&s), SeekPlan::Exact);
         s.target = 90.0;
-        s.key_before = Some(89.0);
+        s.key_before = Some(88.0);
         assert_eq!(plan_seek(&s), SeekPlan::Exact);
         // Nothing known about keyframes.
         assert_eq!(plan_seek(&situation(110.0, 100.0)), SeekPlan::Exact);
@@ -179,10 +179,12 @@ mod tests {
         s.key_after = Some(110.0);
         // A keyframe past the decoder: jumping there is cheaper.
         s.key_before = Some(103.0);
+        assert_eq!(plan_seek(&s), SeekPlan::Keyframe(103.0));
+        s.key_before = Some(101.5);
         assert_eq!(plan_seek(&s), SeekPlan::Exact);
         // Backwards always jumps.
         s.target = 99.0;
-        s.key_before = Some(98.0);
+        s.key_before = Some(97.0);
         assert_eq!(plan_seek(&s), SeekPlan::Exact);
         // Without an index, nothing is known: jump.
         s.target = 105.0;
@@ -194,6 +196,49 @@ mod tests {
         s.key_before = Some(98.0);
         s.key_after = Some(140.0);
         assert_eq!(plan_seek(&s), SeekPlan::Keyframe(140.0));
+    }
+
+    #[test]
+    fn a_keyframe_just_before_the_target_is_close_enough() {
+        let mut s = situation(110.0, 100.0);
+        s.key_before = Some(109.6);
+        s.key_after = Some(110.1);
+        assert_eq!(plan_seek(&s), SeekPlan::Keyframe(109.6));
+        // Backwards too, but never behind the way it was asked to go.
+        let mut s = situation(99.8, 100.0);
+        s.key_before = Some(99.5);
+        s.key_after = Some(100.1);
+        assert_eq!(plan_seek(&s), SeekPlan::Keyframe(99.5));
+        let mut s = situation(100.3, 100.0);
+        s.key_before = Some(99.9);
+        s.key_after = Some(100.5);
+        assert_ne!(plan_seek(&s), SeekPlan::Keyframe(99.9));
+        // Continuing a video still goes through `resume`.
+        let mut s = situation(600.0, 0.0);
+        s.resume = true;
+        s.key_before = Some(599.5);
+        s.key_after = Some(600.5);
+        assert_eq!(plan_seek(&s), SeekPlan::Keyframe(599.5));
+    }
+
+    #[test]
+    fn frames_from_before_a_jump_are_stale() {
+        // Back from 144.5 s to the keyframe at 133.1 s.
+        let s = StaleFrames {
+            old: 144.5,
+            key: Some(133.1),
+        };
+        assert!(s.is_stale(Some(144.6)));
+        assert!(s.is_stale(Some(144.2)));
+        assert!(!s.is_stale(Some(133.1)), "the keyframe");
+        assert!(!s.is_stale(Some(150.0)), "far from the old place");
+        assert!(!s.is_stale(None));
+        // A keyframe right where we were is still taken.
+        let s = StaleFrames {
+            old: 144.5,
+            key: Some(144.6),
+        };
+        assert!(!s.is_stale(Some(144.6)));
     }
 
     #[test]
@@ -408,6 +453,9 @@ pub const KEYFRAME_SEEK_FROM: f64 = 60.0;
 /// non-reference frames). The hardware decoder runs 40-75x real time.
 const EXACT_GAP: f64 = 3.0;
 
+/// A keyframe at most this far before the target is where a jump lands.
+const KEYFRAME_NEAR: f64 = 1.0;
+
 pub fn plan_seek(s: &SeekSituation) -> SeekPlan {
     // An index still being built while reading (Matroska before its first
     // seek) knows no keyframe after the target, and may miss some before it.
@@ -425,6 +473,19 @@ pub fn plan_seek(s: &SeekSituation) -> SeekPlan {
         return SeekPlan::Continue;
     }
     let jump = s.target - s.from;
+    // A keyframe just before the target is as good as the target itself, and
+    // saves decoding up to it (~25 frames of 6K, 0.3 s even on the hardware).
+    if let (Some(key), Some(_)) = (s.key_before, s.key_after)
+        && !s.resume
+        && s.target - key <= KEYFRAME_NEAR
+        && (if jump >= 0.0 {
+            key > s.from
+        } else {
+            key < s.from
+        })
+    {
+        return SeekPlan::Keyframe(key);
+    }
     let exact_is_quick = s.hardware || s.key_before.is_none_or(|key| s.target - key <= EXACT_GAP);
     if !s.resume && jump.abs() < KEYFRAME_SEEK_FROM && exact_is_quick {
         return SeekPlan::Exact;
@@ -476,6 +537,10 @@ pub struct SeekReport {
     pub first_decoded: Option<f64>,
     /// Frames decoded before the target, thrown away.
     pub discarded: u32,
+    /// Frames from before the jump still in the hardware decoder, thrown away.
+    pub stale: u32,
+    /// From the request to the first frame decoded after the jump.
+    pub first_ms: Option<f64>,
     /// Requests merged into this one while it waited.
     pub coalesced: u32,
     /// The demuxer's seek and decoder flush.
@@ -483,6 +548,29 @@ pub struct SeekReport {
     /// From the request to the target frame leaving the decoder.
     pub ready_ms: f64,
     pub read: crate::media::IoCount,
+}
+
+/// FFmpeg's V4L2 decoder has no flush: after a jump, the frames it already
+/// had queued (up to its buffer counts) still come out first. Shown, the
+/// picture would jump back and the clock start at the old place.
+#[derive(Clone, Copy, Debug)]
+struct StaleFrames {
+    /// Time of the last frame decoded before the jump.
+    old: f64,
+    /// The keyframe decoding restarts from, when the index knows it.
+    key: Option<f64>,
+}
+
+/// Never drop more than this many frames as stale (the decoder holds ~20).
+const MAX_STALE: u32 = 64;
+
+impl StaleFrames {
+    /// A frame just after the old place, and not the keyframe expected.
+    fn is_stale(&self, pts: Option<f64>) -> bool {
+        let Some(pts) = pts else { return false };
+        let near_key = self.key.is_some_and(|k| (pts - k).abs() <= 0.5);
+        !near_key && (self.old - 1.0..=self.old + 3.0).contains(&pts)
+    }
 }
 
 /// Per-jump bookkeeping in the decode thread.
@@ -518,17 +606,19 @@ impl Catchup {
         r.ready_ms = self.requested.elapsed().as_secs_f64() * 1e3;
         r.read = io.since(self.io_before);
         eprintln!(
-            "Timing: seek to {:.1}s ({}): ready in {:.0} ms (seek {:.0} ms); keyframe {}, \
-             {} frames discarded, {} merged, read {}",
+            "Timing: seek to {:.1}s ({}): ready in {:.0} ms (seek {:.0} ms, first frame {}); \
+             keyframe {}, {} frames discarded, {} stale, {} merged, read {}",
             r.target,
             r.how,
             r.ready_ms,
             r.seek_ms,
+            r.first_ms.map_or("?".into(), |ms| format!("{ms:.0} ms")),
             r.first_decoded.map_or("?".into(), |k| format!(
                 "{k:.2}s ({:.2}s before)",
                 r.target - k
             )),
             r.discarded,
+            r.stale,
             r.coalesced,
             r.read,
         );
@@ -588,6 +678,8 @@ fn spawn_decoder(
             // Time of the last frame decoded since the last jump.
             let mut decoded: Option<f64> = None;
             let mut preview_pending = false;
+            // After a jump on the hardware decoder: frames from before it.
+            let mut stale: Option<StaleFrames> = None;
             // Where the last jump went (the start, until the first frame, of a keyframe jump).
             let mut aim = start;
             'decode: loop {
@@ -644,6 +736,16 @@ fn spawn_decoder(
                         _ => request.target,
                     };
                     if plan != SeekPlan::Continue {
+                        stale = hardware
+                            .then_some(decoded)
+                            .flatten()
+                            .map(|old| StaleFrames {
+                                old,
+                                key: match plan {
+                                    SeekPlan::Keyframe(key) => Some(key),
+                                    _ => decoder.keyframe(to, false),
+                                },
+                            });
                         let began = Instant::now();
                         if let Err(e) = decoder.seek(to) {
                             eprintln!("Seek to {to:.1}s failed: {e:#}");
@@ -677,6 +779,21 @@ fn spawn_decoder(
                     Err(e) => Decoded::Failed(generation, format!("{e:#}")),
                 };
                 if let Decoded::Frame(_, frame) = &message {
+                    if let Some(s) = &stale {
+                        let dropped = catchup.as_ref().map_or(0, |c| c.report.stale);
+                        if s.is_stale(frame.pts()) && dropped < MAX_STALE {
+                            if let Some(c) = &mut catchup {
+                                c.report.stale += 1;
+                            }
+                            continue;
+                        }
+                        stale = None;
+                    }
+                    if let Some(c) = &mut catchup
+                        && c.report.first_ms.is_none()
+                    {
+                        c.report.first_ms = Some(c.requested.elapsed().as_secs_f64() * 1e3);
+                    }
                     decoded = frame.pts().or(decoded);
                     if let Some(c) = &mut catchup
                         && c.report.first_decoded.is_none()

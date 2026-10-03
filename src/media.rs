@@ -27,6 +27,8 @@ impl<T: Read + Seek + Send> Source for T {}
 pub struct IoCount {
     pub bytes: u64,
     pub jumps: u64,
+    /// Time spent waiting for reads (microseconds).
+    pub wait_us: u64,
 }
 
 impl IoCount {
@@ -35,6 +37,7 @@ impl IoCount {
         IoCount {
             bytes: self.bytes - earlier.bytes,
             jumps: self.jumps - earlier.jumps,
+            wait_us: self.wait_us - earlier.wait_us,
         }
     }
 }
@@ -43,9 +46,10 @@ impl std::fmt::Display for IoCount {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{:.1} MiB in {} jumps",
+            "{:.1} MiB in {} jumps, waited {} ms",
             self.bytes as f64 / (1 << 20) as f64,
-            self.jumps
+            self.jumps,
+            self.wait_us / 1000
         )
     }
 }
@@ -61,8 +65,10 @@ struct Counted<S> {
 
 impl<S: Read> Read for Counted<S> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let began = std::time::Instant::now();
         let n = self.inner.read(buf)?;
         let mut count = self.count.lock().expect("io count");
+        count.wait_us += began.elapsed().as_micros() as u64;
         if self.expected != Some(self.position) {
             count.jumps += 1;
         }
