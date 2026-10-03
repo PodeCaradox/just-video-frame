@@ -87,8 +87,9 @@ def legacy_id(exe, appname):
     Steam derived it from the Exe string exactly as stored (with its quotes)
     followed by the name: top = crc32(exe + appname) | 0x80000000. The 64-bit
     game id is (top << 32) | 0x02000000; grid files use the 32-bit `top`.
-    This is the convention Steam ROM Manager and similar tools use; Steam
-    versions that store `appid` (all current ones) don't need it.
+    Matches Steam ROM Manager's generate-app-id.ts (its "short id" is the
+    same `top` as a signed int32, which is how the appid field stores it).
+    Steam versions that store `appid` (all current ones) don't need this.
     """
     return zlib.crc32(exe + appname) | 0x80000000
 
