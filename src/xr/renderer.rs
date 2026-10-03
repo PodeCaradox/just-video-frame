@@ -90,30 +90,44 @@ pub struct Renderer {
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
     descriptor_pool: vk::DescriptorPool,
-    set: vk::DescriptorSet,
     sampler: vk::Sampler,
-    color: Buffer,
     adjust: [f32; 4],
-    staging: Option<Buffer>,
+    /// Colour conversion for the current picture (without `adjust`).
+    color_params: ColorParams,
     ui_staging: Option<Buffer>,
     readback: Option<Buffer>,
     dummy: Texture,
     video: Option<VideoTextures>,
     command_pool: vk::CommandPool,
-    command: vk::CommandBuffer,
-    fence: vk::Fence,
+    /// Two frames' resources, used in turn: the CPU records one frame while
+    /// the GPU may still run the previous one.
+    slots: Vec<Slot>,
+    /// The slot being recorded.
+    slot: usize,
     pub eyes: Vec<EyeTarget>,
     /// Time the last upload spent copying the picture into the staging buffer.
     pub copy_ms: f64,
-    /// GPU timestamps: frame start, after the upload, after each eye.
-    queries: vk::QueryPool,
     timestamp_ns: f64,
     gpu_ms: Cell<[f64; 3]>,
+}
+
+/// What one frame in flight needs to itself.
+struct Slot {
+    command: vk::CommandBuffer,
+    fence: vk::Fence,
+    /// GPU timestamps: frame start, after the upload, after each eye.
+    queries: vk::QueryPool,
     /// A submission may still be running (its fence not yet waited for)…
     in_flight: Cell<bool>,
     /// …and it is a frame (with timestamps).
     frame_in_flight: Cell<bool>,
+    staging: Option<Buffer>,
+    /// Colour conversion uniform, and the descriptor set using it.
+    color: Buffer,
+    set: vk::DescriptorSet,
 }
+
+const SLOTS: usize = 2;
 
 const TIMESTAMPS: u32 = 4;
 
@@ -139,6 +153,18 @@ fn plane_format(layout: PlaneLayout, bits: u32, plane: usize) -> vk::Format {
         (_, 0, true) | (PlaneLayout::Planar, _, true) => vk::Format::R16_UNORM,
         (_, _, false) => vk::Format::R8G8_UNORM,
         (_, _, true) => vk::Format::R16G16_UNORM,
+    }
+}
+
+impl Buffer {
+    fn null() -> Self {
+        Self {
+            buffer: vk::Buffer::null(),
+            memory: vk::DeviceMemory::null(),
+            mapped: std::ptr::null_mut(),
+            size: 0,
+            flags: vk::MemoryPropertyFlags::empty(),
+        }
     }
 }
 
@@ -251,25 +277,20 @@ impl Renderer {
             let pool_sizes = [
                 vk::DescriptorPoolSize::default()
                     .ty(vk::DescriptorType::SAMPLER)
-                    .descriptor_count(1),
+                    .descriptor_count(SLOTS as u32),
                 vk::DescriptorPoolSize::default()
                     .ty(vk::DescriptorType::SAMPLED_IMAGE)
-                    .descriptor_count(3),
+                    .descriptor_count(3 * SLOTS as u32),
                 vk::DescriptorPoolSize::default()
                     .ty(vk::DescriptorType::UNIFORM_BUFFER)
-                    .descriptor_count(1),
+                    .descriptor_count(SLOTS as u32),
             ];
             let descriptor_pool = device.create_descriptor_pool(
                 &vk::DescriptorPoolCreateInfo::default()
-                    .max_sets(1)
+                    .max_sets(SLOTS as u32)
                     .pool_sizes(&pool_sizes),
                 None,
             )?;
-            let set = device.allocate_descriptor_sets(
-                &vk::DescriptorSetAllocateInfo::default()
-                    .descriptor_pool(descriptor_pool)
-                    .set_layouts(&set_layouts),
-            )?[0];
             let sampler = device.create_sampler(
                 &vk::SamplerCreateInfo::default()
                     .mag_filter(vk::Filter::LINEAR)
@@ -288,22 +309,38 @@ impl Renderer {
                     .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
                 None,
             )?;
-            let command = device.allocate_command_buffers(
+            let commands = device.allocate_command_buffers(
                 &vk::CommandBufferAllocateInfo::default()
                     .command_pool(command_pool)
-                    .command_buffer_count(1),
-            )?[0];
-            let fence = device.create_fence(&vk::FenceCreateInfo::default(), None)?;
+                    .command_buffer_count(SLOTS as u32),
+            )?;
+            let sets = device.allocate_descriptor_sets(
+                &vk::DescriptorSetAllocateInfo::default()
+                    .descriptor_pool(descriptor_pool)
+                    .set_layouts(&[set_layout; SLOTS]),
+            )?;
+            let mut slots = Vec::new();
+            for (command, set) in commands.into_iter().zip(sets) {
+                slots.push(Slot {
+                    command,
+                    fence: device.create_fence(&vk::FenceCreateInfo::default(), None)?,
+                    queries: device.create_query_pool(
+                        &vk::QueryPoolCreateInfo::default()
+                            .query_type(vk::QueryType::TIMESTAMP)
+                            .query_count(TIMESTAMPS),
+                        None,
+                    )?,
+                    in_flight: Cell::new(false),
+                    frame_in_flight: Cell::new(false),
+                    staging: None,
+                    color: Buffer::null(),
+                    set,
+                });
+            }
             let limits = ctx
                 .vk
                 .get_physical_device_properties(ctx.physical_device)
                 .limits;
-            let queries = device.create_query_pool(
-                &vk::QueryPoolCreateInfo::default()
-                    .query_type(vk::QueryType::TIMESTAMP)
-                    .query_count(TIMESTAMPS),
-                None,
-            )?;
 
             let mut renderer = Self {
                 device,
@@ -315,17 +352,9 @@ impl Renderer {
                 pipeline_layout,
                 pipeline,
                 descriptor_pool,
-                set,
                 sampler,
-                color: Buffer {
-                    buffer: vk::Buffer::null(),
-                    memory: vk::DeviceMemory::null(),
-                    mapped: std::ptr::null_mut(),
-                    size: 0,
-                    flags: vk::MemoryPropertyFlags::empty(),
-                },
                 adjust: [0.0, 1.0, 1.0, 0.0],
-                staging: None,
+                color_params: ColorParams::default(),
                 ui_staging: None,
                 readback: None,
                 dummy: Texture {
@@ -335,20 +364,19 @@ impl Renderer {
                 },
                 video: None,
                 command_pool,
-                command,
-                fence,
+                slots,
+                slot: 0,
                 eyes: Vec::new(),
                 copy_ms: 0.0,
-                queries,
                 timestamp_ns: limits.timestamp_period as f64,
                 gpu_ms: Cell::new([0.0; 3]),
-                in_flight: Cell::new(false),
-                frame_in_flight: Cell::new(false),
             };
-            renderer.color = renderer.create_buffer(
-                size_of::<ColorParams>() as u64,
-                vk::BufferUsageFlags::UNIFORM_BUFFER,
-            )?;
+            for i in 0..SLOTS {
+                renderer.slots[i].color = renderer.create_buffer(
+                    size_of::<ColorParams>() as u64,
+                    vk::BufferUsageFlags::UNIFORM_BUFFER,
+                )?;
+            }
             renderer.dummy = renderer.create_texture(vk::Format::R8_UNORM, 1, 1)?;
             // Bring the placeholder texture into a sampleable layout once.
             renderer.begin_commands()?;
@@ -531,13 +559,18 @@ impl Renderer {
         }
     }
 
+    /// The command buffer being recorded.
+    fn cmd(&self) -> vk::CommandBuffer {
+        self.slots[self.slot].command
+    }
+
     fn begin_commands(&self) -> anyhow::Result<()> {
-        self.wait_gpu()?;
+        self.wait_slot(self.slot)?;
         unsafe {
             self.device
-                .reset_command_buffer(self.command, vk::CommandBufferResetFlags::empty())?;
+                .reset_command_buffer(self.cmd(), vk::CommandBufferResetFlags::empty())?;
             self.device.begin_command_buffer(
-                self.command,
+                self.cmd(),
                 &vk::CommandBufferBeginInfo::default()
                     .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
             )?;
@@ -546,36 +579,42 @@ impl Renderer {
     }
 
     fn submit_and_wait(&self) -> anyhow::Result<()> {
+        let slot = &self.slots[self.slot];
         unsafe {
-            self.device.end_command_buffer(self.command)?;
-            let commands = [self.command];
+            self.device.end_command_buffer(slot.command)?;
             self.device.queue_submit(
                 self.queue,
-                &[vk::SubmitInfo::default().command_buffers(&commands)],
-                self.fence,
+                &[vk::SubmitInfo::default().command_buffers(&[slot.command])],
+                slot.fence,
             )?;
-            self.in_flight.set(true);
         }
-        self.wait_gpu()
+        slot.in_flight.set(true);
+        self.wait_slot(self.slot)
     }
 
-    /// Waits for the last submission (if any) to finish; after a frame, reads
-    /// its GPU times.
-    fn wait_gpu(&self) -> anyhow::Result<()> {
-        if !self.in_flight.get() {
+    /// Waits for every submission to finish.
+    fn wait_all(&self) -> anyhow::Result<()> {
+        (0..SLOTS).try_for_each(|i| self.wait_slot(i))
+    }
+
+    /// Waits for slot `i`'s last submission (if any) to finish; after a
+    /// frame, reads its GPU times.
+    fn wait_slot(&self, i: usize) -> anyhow::Result<()> {
+        let slot = &self.slots[i];
+        if !slot.in_flight.get() {
             return Ok(());
         }
         unsafe {
-            self.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
-            self.device.reset_fences(&[self.fence])?;
+            self.device.wait_for_fences(&[slot.fence], true, u64::MAX)?;
+            self.device.reset_fences(&[slot.fence])?;
         }
-        self.in_flight.set(false);
-        if self.frame_in_flight.replace(false) {
+        slot.in_flight.set(false);
+        if slot.frame_in_flight.replace(false) {
             let mut stamps = [0u64; TIMESTAMPS as usize];
             // Every query was written in that submission, which has finished.
             let read = unsafe {
                 self.device.get_query_pool_results(
-                    self.queries,
+                    slot.queries,
                     0,
                     &mut stamps,
                     vk::QueryResultFlags::TYPE_64,
@@ -640,7 +679,7 @@ impl Renderer {
             .subresource_range(color_range());
         unsafe {
             self.device.cmd_pipeline_barrier(
-                self.command,
+                self.cmd(),
                 src_stage,
                 dst_stage,
                 vk::DependencyFlags::empty(),
@@ -662,6 +701,8 @@ impl Renderer {
         if self.video.as_ref().is_some_and(|v| v.key == key) {
             return Ok(());
         }
+        // The textures (and descriptor sets) may be in use by the frame in flight.
+        self.wait_all()?;
         if let Some(old) = self.video.take() {
             for (texture, ..) in &old.planes {
                 self.destroy_texture(texture);
@@ -683,37 +724,25 @@ impl Renderer {
         let y = image_info(video.planes[0].0.view);
         let u = image_info(video.planes[1].0.view);
         let v = image_info(video.planes.get(2).map_or(self.dummy.view, |p| p.0.view));
-        let color_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.color.buffer)
-            .range(size_of::<ColorParams>() as u64)];
-        let writes = [
-            vk::WriteDescriptorSet::default()
-                .dst_set(self.set)
-                .dst_binding(0)
-                .descriptor_type(vk::DescriptorType::SAMPLER)
-                .image_info(&sampler_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(self.set)
-                .dst_binding(1)
-                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-                .image_info(&y),
-            vk::WriteDescriptorSet::default()
-                .dst_set(self.set)
-                .dst_binding(2)
-                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-                .image_info(&u),
-            vk::WriteDescriptorSet::default()
-                .dst_set(self.set)
-                .dst_binding(3)
-                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-                .image_info(&v),
-            vk::WriteDescriptorSet::default()
-                .dst_set(self.set)
-                .dst_binding(4)
-                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-                .buffer_info(&color_info),
-        ];
-        unsafe { self.device.update_descriptor_sets(&writes, &[]) };
+        for slot in &self.slots {
+            let color_info = [vk::DescriptorBufferInfo::default()
+                .buffer(slot.color.buffer)
+                .range(size_of::<ColorParams>() as u64)];
+            let write = |binding: u32, ty: vk::DescriptorType| {
+                vk::WriteDescriptorSet::default()
+                    .dst_set(slot.set)
+                    .dst_binding(binding)
+                    .descriptor_type(ty)
+            };
+            let writes = [
+                write(0, vk::DescriptorType::SAMPLER).image_info(&sampler_info),
+                write(1, vk::DescriptorType::SAMPLED_IMAGE).image_info(&y),
+                write(2, vk::DescriptorType::SAMPLED_IMAGE).image_info(&u),
+                write(3, vk::DescriptorType::SAMPLED_IMAGE).image_info(&v),
+                write(4, vk::DescriptorType::UNIFORM_BUFFER).buffer_info(&color_info),
+            ];
+            unsafe { self.device.update_descriptor_sets(&writes, &[]) };
+        }
         self.video = Some(video);
         Ok(())
     }
@@ -729,8 +758,12 @@ impl Renderer {
                 (w * h * c) as u64 * bytes as u64
             })
             .sum();
-        if self.staging.as_ref().is_none_or(|s| s.size < total) {
-            if let Some(old) = self.staging.take() {
+        if self.slots[self.slot]
+            .staging
+            .as_ref()
+            .is_none_or(|s| s.size < total)
+        {
+            if let Some(old) = self.slots[self.slot].staging.take() {
                 self.destroy_buffer(old);
             }
             let buffer = self.create_buffer(total, vk::BufferUsageFlags::TRANSFER_SRC)?;
@@ -743,10 +776,13 @@ impl Renderer {
                 self.eyes[0].width,
                 self.eyes[0].height,
             );
-            self.staging = Some(buffer);
+            self.slots[self.slot].staging = Some(buffer);
         }
         let copy_started = std::time::Instant::now();
-        let staging = self.staging.as_ref().expect("staging buffer");
+        let staging = self.slots[self.slot]
+            .staging
+            .as_ref()
+            .expect("staging buffer");
         let mut offset = 0usize;
         let mut regions = Vec::new();
         for plane in 0..frame.plane_count() {
@@ -765,11 +801,8 @@ impl Renderer {
             regions.push(start as u64);
         }
         self.copy_ms = copy_started.elapsed().as_secs_f64() * 1e3;
-        let color = ColorParams {
-            adjust: self.adjust,
-            ..color_params(frame)
-        };
-        unsafe { std::ptr::copy_nonoverlapping(&color, self.color.mapped as *mut ColorParams, 1) };
+        self.color_params = color_params(frame);
+        self.write_color();
         let video = self.video.as_ref().expect("video textures");
         for (plane, (texture, _, w, h)) in video.planes.iter().enumerate() {
             self.transition(
@@ -791,7 +824,7 @@ impl Renderer {
                 });
             unsafe {
                 self.device.cmd_copy_buffer_to_image(
-                    self.command,
+                    self.cmd(),
                     staging.buffer,
                     texture.image,
                     vk::ImageLayout::TRANSFER_DST_OPTIMAL,
@@ -880,7 +913,7 @@ impl Renderer {
             });
         unsafe {
             self.device.cmd_copy_buffer_to_image(
-                self.command,
+                self.cmd(),
                 self.ui_staging.as_ref().expect("ui staging").buffer,
                 image,
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
@@ -899,6 +932,23 @@ impl Renderer {
         Ok(())
     }
 
+    /// This slot's colour uniform: the current picture's conversion and corrections.
+    fn write_color(&self) {
+        let color = ColorParams {
+            adjust: self.adjust,
+            ..self.color_params
+        };
+        // SAFETY: the mapped uniform holds a whole ColorParams, and the slot's
+        // last frame has finished (`begin_commands` waited for it).
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                &color,
+                self.slots[self.slot].color.mapped as *mut ColorParams,
+                1,
+            )
+        };
+    }
+
     pub fn has_video(&self) -> bool {
         self.video.is_some()
     }
@@ -906,24 +956,20 @@ impl Renderer {
     /// Starts recording a frame; uploads `frame` first when it changed.
     pub fn begin_frame(&mut self, upload: Option<&Frame>) -> anyhow::Result<()> {
         self.begin_commands()?;
+        let queries = self.slots[self.slot].queries;
         unsafe {
             self.device
-                .cmd_reset_query_pool(self.command, self.queries, 0, TIMESTAMPS);
+                .cmd_reset_query_pool(self.cmd(), queries, 0, TIMESTAMPS);
             self.device.cmd_write_timestamp(
-                self.command,
+                self.cmd(),
                 vk::PipelineStageFlags::TOP_OF_PIPE,
-                self.queries,
+                queries,
                 0,
             );
         }
-        // Corrections change without a new frame (e.g. while paused).
-        // SAFETY: the mapped uniform holds a whole ColorParams.
-        if !self.color.mapped.is_null() {
-            unsafe {
-                let color = self.color.mapped as *mut ColorParams;
-                (*color).adjust = self.adjust;
-            }
-        }
+        // Each slot has its own copy; corrections change without a new
+        // frame (e.g. while paused).
+        self.write_color();
         if let Some(frame) = upload {
             self.record_upload(frame)?;
         }
@@ -957,7 +1003,7 @@ impl Renderer {
         };
         unsafe {
             self.device.cmd_begin_render_pass(
-                self.command,
+                self.cmd(),
                 &vk::RenderPassBeginInfo::default()
                     .render_pass(self.render_pass)
                     .framebuffer(target.framebuffers[image_index as usize])
@@ -968,7 +1014,7 @@ impl Renderer {
                 vk::SubpassContents::INLINE,
             );
             self.device.cmd_set_viewport(
-                self.command,
+                self.cmd(),
                 0,
                 &[vk::Viewport {
                     x: 0.0,
@@ -980,7 +1026,7 @@ impl Renderer {
                 }],
             );
             self.device.cmd_set_scissor(
-                self.command,
+                self.cmd(),
                 0,
                 &[vk::Rect2D {
                     offset: vk::Offset2D::default(),
@@ -988,17 +1034,17 @@ impl Renderer {
                 }],
             );
             self.device.cmd_bind_pipeline(
-                self.command,
+                self.cmd(),
                 vk::PipelineBindPoint::GRAPHICS,
                 self.pipeline,
             );
             if show_video && self.video.is_some() {
                 self.device.cmd_bind_descriptor_sets(
-                    self.command,
+                    self.cmd(),
                     vk::PipelineBindPoint::GRAPHICS,
                     self.pipeline_layout,
                     0,
-                    &[self.set],
+                    &[self.slots[self.slot].set],
                     &[],
                 );
                 let bytes = std::slice::from_raw_parts(
@@ -1006,17 +1052,17 @@ impl Renderer {
                     size_of::<EyeParams>(),
                 );
                 self.device.cmd_push_constants(
-                    self.command,
+                    self.cmd(),
                     self.pipeline_layout,
                     vk::ShaderStageFlags::FRAGMENT,
                     0,
                     bytes,
                 );
-                self.device.cmd_draw(self.command, 3, 1, 0, 0);
+                self.device.cmd_draw(self.cmd(), 3, 1, 0, 0);
             } else {
                 // Nothing decoded yet: clear to black.
                 self.device.cmd_clear_attachments(
-                    self.command,
+                    self.cmd(),
                     &[vk::ClearAttachment {
                         aspect_mask: vk::ImageAspectFlags::COLOR,
                         color_attachment: 0,
@@ -1032,7 +1078,7 @@ impl Renderer {
                     }],
                 );
             }
-            self.device.cmd_end_render_pass(self.command);
+            self.device.cmd_end_render_pass(self.cmd());
         }
         self.timestamp(2 + eye as u32);
     }
@@ -1066,7 +1112,7 @@ impl Renderer {
             });
         unsafe {
             self.device.cmd_copy_image_to_buffer(
-                self.command,
+                self.cmd(),
                 image,
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                 self.readback.as_ref().expect("readback").buffer,
@@ -1086,7 +1132,7 @@ impl Renderer {
         let Some(buffer) = &self.readback else {
             bail!("No readback recorded");
         };
-        self.wait_gpu()?;
+        self.wait_all()?;
         let (width, height) = (self.eyes[eye].width, self.eyes[eye].height);
         let mut pixels =
             unsafe { std::slice::from_raw_parts(buffer.mapped, (width * height * 4) as usize) }
@@ -1110,17 +1156,20 @@ impl Renderer {
     /// waits before reusing the command buffer and staging memory. (Waiting
     /// here cost most of a display period: the GPU runs our 2–3 ms of work
     /// only after the compositor's.)
-    pub fn end_frame(&self) -> anyhow::Result<()> {
+    pub fn end_frame(&mut self) -> anyhow::Result<()> {
+        let slot = &self.slots[self.slot];
         unsafe {
-            self.device.end_command_buffer(self.command)?;
+            self.device.end_command_buffer(slot.command)?;
             self.device.queue_submit(
                 self.queue,
-                &[vk::SubmitInfo::default().command_buffers(&[self.command])],
-                self.fence,
+                &[vk::SubmitInfo::default().command_buffers(&[slot.command])],
+                slot.fence,
             )?;
         }
-        self.in_flight.set(true);
-        self.frame_in_flight.set(true);
+        slot.in_flight.set(true);
+        slot.frame_in_flight.set(true);
+        // The next frame records into the other slot, while this one runs.
+        self.slot = (self.slot + 1) % SLOTS;
         Ok(())
     }
 
@@ -1133,9 +1182,9 @@ impl Renderer {
     fn timestamp(&self, index: u32) {
         unsafe {
             self.device.cmd_write_timestamp(
-                self.command,
+                self.cmd(),
                 vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                self.queries,
+                self.slots[self.slot].queries,
                 index,
             );
         }
@@ -1152,23 +1201,14 @@ impl Drop for Renderer {
                 }
             }
             self.destroy_texture(&self.dummy);
-            for buffer in [self.staging.take(), self.readback.take()]
-                .into_iter()
-                .flatten()
-            {
+            let mut buffers = vec![self.readback.take(), self.ui_staging.take()];
+            for slot in &mut self.slots {
+                buffers.push(slot.staging.take());
+                buffers.push(Some(std::mem::replace(&mut slot.color, Buffer::null())));
+            }
+            for buffer in buffers.into_iter().flatten() {
                 self.destroy_buffer(buffer);
             }
-            let color = std::mem::replace(
-                &mut self.color,
-                Buffer {
-                    buffer: vk::Buffer::null(),
-                    memory: vk::DeviceMemory::null(),
-                    mapped: std::ptr::null_mut(),
-                    size: 0,
-                    flags: vk::MemoryPropertyFlags::empty(),
-                },
-            );
-            self.destroy_buffer(color);
             for eye in &self.eyes {
                 for &fb in &eye.framebuffers {
                     self.device.destroy_framebuffer(fb, None);
@@ -1177,8 +1217,10 @@ impl Drop for Renderer {
                     self.device.destroy_image_view(view, None);
                 }
             }
-            self.device.destroy_fence(self.fence, None);
-            self.device.destroy_query_pool(self.queries, None);
+            for slot in &self.slots {
+                self.device.destroy_fence(slot.fence, None);
+                self.device.destroy_query_pool(slot.queries, None);
+            }
             self.device.destroy_command_pool(self.command_pool, None);
             self.device.destroy_sampler(self.sampler, None);
             self.device
