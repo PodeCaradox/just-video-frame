@@ -862,6 +862,10 @@ fn main() -> anyhow::Result<()> {
                     Row {
                         detail: "smb://user@10.0.0.2".into(),
                         lock: Some(false),
+                        actions: vec![
+                            just_video::ui::browser::Action::Edit,
+                            just_video::ui::browser::Action::Remove,
+                        ],
                         ..Row::new(Icon::Server, "PC")
                     },
                     Row {

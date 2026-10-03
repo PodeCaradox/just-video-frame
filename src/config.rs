@@ -85,16 +85,64 @@ pub fn password(url: &str) -> anyhow::Result<Option<String>> {
     Ok(credentials.get(url).cloned())
 }
 
-/// Adds or replaces a server (matched by URL) and stores its password.
+/// Adds or replaces a server (matched by URL, keeping its place in the list)
+/// and stores its password.
 pub fn save_server(server: Server, password: &str) -> anyhow::Result<()> {
     let mut list = servers()?;
-    list.retain(|s| s.url != server.url);
     let url = server.url.clone();
-    list.push(server);
+    match list.iter_mut().find(|s| s.url == url) {
+        Some(saved) => *saved = server,
+        None => list.push(server),
+    }
     write_json("servers.json", &list, false)?;
     let mut credentials: BTreeMap<String, String> = read_json("credentials.json")?;
     credentials.insert(url, password.to_string());
     write_json("credentials.json", &credentials, true)
+}
+
+/// After an edit changed a server's address (saved under `to` by
+/// [`save_server`]): the new entry takes the old one's place, the old one and
+/// its password go, and remembered layouts and resume points follow the files.
+pub fn move_server(from: &str, to: &str) -> anyhow::Result<()> {
+    let mut list = servers()?;
+    if list.iter().any(|s| s.url == from)
+        && let Some(new) = list.iter().position(|s| s.url == to)
+    {
+        let entry = list.remove(new);
+        let old = list.iter().position(|s| s.url == from).expect("checked");
+        list[old] = entry;
+        write_json("servers.json", &list, false)?;
+    }
+    let mut credentials: BTreeMap<String, String> = read_json("credentials.json")?;
+    if credentials.remove(from).is_some() {
+        write_json("credentials.json", &credentials, true)?;
+    }
+    // A trailing slash so `smb://u@nas` doesn't also match `smb://u@nas2`.
+    let (from, to) = (format!("{from}/"), format!("{to}/"));
+    move_keys::<LayoutOverride>("layouts.json", &from, &to)?;
+    let _guard = RESUME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    move_keys::<Resume>("resume.json", &from, &to)
+}
+
+/// Renames every key of a JSON map that starts with `from` to start with `to`.
+fn move_keys<T>(file: &str, from: &str, to: &str) -> anyhow::Result<()>
+where
+    T: Serialize + for<'de> Deserialize<'de>,
+{
+    let mut all: BTreeMap<String, T> = read_json(file)?;
+    let keys: Vec<String> = all
+        .keys()
+        .filter(|k| k.starts_with(from))
+        .cloned()
+        .collect();
+    if keys.is_empty() {
+        return Ok(());
+    }
+    for key in keys {
+        let value = all.remove(&key).expect("listed");
+        all.insert(format!("{to}{}", &key[from.len()..]), value);
+    }
+    write_json(file, &all, false)
 }
 
 /// Removes a server by name or URL, with its password. Returns whether it existed.
@@ -459,7 +507,40 @@ mod tests {
             resume_position("smb://alice@192.168.1.10/media/VR/renamed.mp4"),
             Some(754.0)
         );
-        assert!(remove_server("PC").unwrap());
+        // Editing keeps the list order; a new address takes the old one's place,
+        // and what was remembered about its files moves with it.
+        let nas = Server {
+            name: "NAS".into(),
+            url: "smb://bob@nas".into(),
+        };
+        save_server(nas.clone(), "pw").unwrap();
+        let renamed = Server {
+            name: "Office PC".into(),
+            ..server.clone()
+        };
+        save_server(renamed.clone(), "secret").unwrap();
+        assert_eq!(servers().unwrap(), vec![renamed.clone(), nas.clone()]);
+        let moved = Server {
+            name: "Office PC".into(),
+            url: "smb://alice@192.168.1.20".into(),
+        };
+        save_server(moved.clone(), "secret").unwrap();
+        save_resume_position("smb://alice@192.168.1.100/x.mp4", Some(60.0)).unwrap();
+        move_server(&server.url, &moved.url).unwrap();
+        assert_eq!(servers().unwrap(), vec![moved.clone(), nas.clone()]);
+        assert_eq!(password(&server.url).unwrap(), None);
+        assert_eq!(password(&moved.url).unwrap().as_deref(), Some("secret"));
+        let renamed_key = "smb://alice@192.168.1.20/media/VR/renamed.mp4";
+        assert_eq!(layout_override(renamed_key).unwrap(), Some(l));
+        assert_eq!(resume_position(renamed_key), Some(754.0));
+        assert_eq!(
+            resume_position("smb://alice@192.168.1.100/x.mp4"),
+            Some(60.0),
+            "another server whose address starts the same"
+        );
+        assert!(remove_server("NAS").unwrap());
+        let server = moved;
+        assert!(remove_server("Office PC").unwrap());
         assert!(servers().unwrap().is_empty());
         assert_eq!(password(&server.url).unwrap(), None);
         std::fs::remove_dir_all(&dir).unwrap();

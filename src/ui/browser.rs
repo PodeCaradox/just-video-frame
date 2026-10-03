@@ -596,15 +596,14 @@ pub fn render(
                 } else {
                     let label = action.label();
                     let lw = fonts.measure(label, 30.0);
-                    fonts.draw(
-                        &mut canvas,
-                        label,
-                        ax + (aw - lw) / 2.0,
-                        ay + ah / 2.0 + 11.0,
-                        30.0,
-                        TEXT,
-                        aw,
-                    );
+                    // Edit: a pencil before the word, like Rename's.
+                    let pencil_w = if *action == Action::Edit { 50.0 } else { 0.0 };
+                    let lx = ax + (aw - lw - pencil_w) / 2.0 + pencil_w;
+                    if pencil_w > 0.0 {
+                        let pencil_x = lx - pencil_w / 2.0 - 6.0;
+                        draw_pencil(&mut canvas, pencil_x, ay + ah / 2.0, TEXT);
+                    }
+                    fonts.draw(&mut canvas, label, lx, ay + ah / 2.0 + 11.0, 30.0, TEXT, aw);
                 }
                 if k == 0 {
                     right_edge = ax - 16.0;
@@ -907,7 +906,8 @@ mod tests {
     fn locks_actions_and_tools() {
         let mut view = view();
         let mut fonts = Fonts::load().expect("fonts");
-        view.rows[2].lock = Some(true);
+        // A server row: Edit and Remove beside its lock, locked or not.
+        view.rows[2].lock = Some(false);
         view.rows[2].actions = vec![Action::Edit, Action::Remove];
         let (x, y, w, h) = lock_rect(&view, 2);
         assert_eq!(

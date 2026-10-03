@@ -1,9 +1,10 @@
 //! Browser state: servers → shares → folders → videos. Talks to the
 //! [`Library`] workers and turns their results into a [`View`].
 //!
-//! Changing things is opt-in per server: its lock (on the server list)
-//! reveals Edit/Remove for the server and, inside it, Rename on every entry
-//! and a "Select" tool for deleting several entries at once.
+//! Each saved server can always be edited or removed from the server list.
+//! Changing files is opt-in per server: its lock (on the server list) allows,
+//! inside it, Rename on every entry and a "Select" tool for deleting several
+//! entries at once.
 //!
 //! The server list also leads to the Settings screen ([`super::settings`]).
 
@@ -391,19 +392,14 @@ impl Navigator {
             .enumerate()
             .map(|(i, item)| {
                 let mut row = match item {
-                    Item::Server(s) => {
-                        let open = self.unlocked.contains(&s.url);
-                        Row {
-                            detail: s.url.clone(),
-                            lock: Some(open),
-                            actions: if open {
-                                vec![Action::Edit, Action::Remove]
-                            } else {
-                                Vec::new()
-                            },
-                            ..Row::new(Icon::Server, &s.name)
-                        }
-                    }
+                    Item::Server(s) => Row {
+                        detail: s.url.clone(),
+                        lock: Some(self.unlocked.contains(&s.url)),
+                        // Always offered: nothing on the server changes, and
+                        // Remove asks first.
+                        actions: vec![Action::Edit, Action::Remove],
+                        ..Row::new(Icon::Server, &s.name)
+                    },
                     Item::AddServer => Row {
                         detail: "A Windows PC, NAS or Samba server on your network".into(),
                         ..Row::new(Icon::Add, "Add server")
@@ -619,7 +615,9 @@ impl Navigator {
                             if let Some(Purpose::EditServer(old)) = &self.purpose
                                 && *old != saved.url
                             {
-                                let _ = config::remove_server(old);
+                                if let Err(e) = config::move_server(old, &saved.url) {
+                                    eprintln!("Can't move the old server's settings: {e:#}");
+                                }
                                 if self.unlocked.remove(old) {
                                     self.unlocked.insert(saved.url.clone());
                                 }
@@ -1325,6 +1323,35 @@ mod tests {
 
         nav.long_press(1);
         assert_eq!(nav.view().rows[1].checked, Some(true), "long press selects");
+    }
+
+    #[test]
+    fn servers_can_be_edited_without_unlocking() {
+        let mut nav = Navigator::new(Library::start(None));
+        nav.items = vec![
+            Item::Server(Server {
+                name: "NAS".into(),
+                url: "smb://WORK;bob@nas:4455".into(),
+            }),
+            Item::AddServer,
+        ];
+        nav.rebuild_rows();
+        let row = &nav.view().rows[0];
+        assert_eq!(row.lock, Some(false));
+        assert_eq!(row.actions, vec![Action::Edit, Action::Remove]);
+
+        nav.click(Hit::RowAction(0, Action::Remove));
+        assert!(nav.dialog_open(), "removing asks first");
+        assert!(nav.back());
+
+        nav.click(Hit::RowAction(0, Action::Edit));
+        let form = nav.view().form.as_ref().expect("edit form");
+        assert_eq!(form.title, "Edit NAS");
+        let values: Vec<&str> = (0..4).map(|i| form.value(i)).collect();
+        assert_eq!(values, ["nas:4455", "WORK;bob", "", "NAS"]);
+        assert!(
+            matches!(&nav.purpose, Some(Purpose::EditServer(url)) if url == "smb://WORK;bob@nas:4455")
+        );
     }
 
     #[test]
