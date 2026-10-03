@@ -162,7 +162,8 @@ impl<S: BlockSource> ReadAheadReader<S> {
             self.window,
             self.last_index,
             current,
-            self.blocks.contains_key(&current),
+            // Kept from before counts: the reader came back to it.
+            self.blocks.contains_key(&current) || self.cache.iter().any(|(i, _)| *i == current),
             self.options.blocks_ahead,
         );
         self.last_index = Some(current);
@@ -206,8 +207,9 @@ impl<S: BlockSource> ReadAheadReader<S> {
 }
 
 /// The read-ahead window for a read from block `current` (see `INITIAL_WINDOW`):
-/// it doubles as reading moves on to the next block, stays while reading
-/// within what is already requested, and starts small again after a jump.
+/// it doubles as reading moves on, stays while reading back within what is
+/// already requested (demuxers going between audio and video), and starts
+/// small again after a jump to blocks not requested.
 fn next_window(
     window: usize,
     last: Option<u64>,
@@ -219,6 +221,7 @@ fn next_window(
     match last {
         Some(last) if current == last => window,
         Some(last) if current > last && requested => (window * 2).min(max),
+        Some(_) if requested => window,
         _ => initial,
     }
 }
@@ -486,7 +489,9 @@ mod tests {
         // More reads from the same block keep it; a jump starts over.
         assert_eq!(next_window(16, Some(5), 5, true, 32), 16);
         assert_eq!(next_window(32, Some(5), 900, false, 32), 4);
-        assert_eq!(next_window(32, Some(5), 2, true, 32), 4);
+        assert_eq!(next_window(32, Some(5), 2, false, 32), 4);
+        // Back into blocks still held (interleaved audio and video) keeps it.
+        assert_eq!(next_window(32, Some(5), 4, true, 32), 32);
         // Small read-aheads never exceed their own size.
         assert_eq!(next_window(2, None, 0, false, 2), 2);
     }
@@ -496,6 +501,8 @@ mod tests {
     struct Link {
         data: Vec<u8>,
         per_byte: Duration,
+        /// Added to every read after its turn on the link (not queued).
+        rtt: Duration,
         busy_until: std::sync::Mutex<Instant>,
         /// Offsets fetched, in order.
         fetched: std::sync::Mutex<Vec<u64>>,
@@ -510,7 +517,7 @@ mod tests {
             let done = {
                 let mut busy = self.busy_until.lock().unwrap();
                 *busy = (*busy).max(Instant::now()) + self.per_byte * len as u32;
-                *busy
+                *busy + self.rtt
             };
             self.fetched.lock().unwrap().push(offset);
             Box::pin(async move {
@@ -522,6 +529,15 @@ mod tests {
     }
 
     fn link_reader(len: usize, ms_per_block: u64, options: ReadAhead) -> ReadAheadReader<Link> {
+        link_reader_rtt(len, ms_per_block, 0, options)
+    }
+
+    fn link_reader_rtt(
+        len: usize,
+        ms_per_block: u64,
+        rtt_ms: u64,
+        options: ReadAhead,
+    ) -> ReadAheadReader<Link> {
         let runtime = Arc::new(
             tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)
@@ -532,10 +548,33 @@ mod tests {
         let source = Link {
             data: (0..len).map(|i| (i % 251) as u8).collect(),
             per_byte: Duration::from_millis(ms_per_block) / options.block_size as u32,
+            rtt: Duration::from_millis(rtt_ms),
             busy_until: std::sync::Mutex::new(Instant::now()),
             fetched: Default::default(),
         };
         ReadAheadReader::new(runtime, source, len as u64, options)
+    }
+
+    /// A demuxer alternating between streams stored a few blocks apart must
+    /// keep the full window: 4 reads in flight over a 20 ms round trip would
+    /// read 200 blocks in ~1 s, 32 in ~0.25 s.
+    #[test]
+    fn interleaved_reads_keep_the_window() {
+        let options = ReadAhead {
+            block_size: 1000,
+            blocks_ahead: 32,
+        };
+        let mut r = link_reader_rtt(204_000, 1, 20, options);
+        let mut buf = [0u8; 10];
+        let started = Instant::now();
+        for block in 0..200u64 {
+            for at in [block + 3, block] {
+                r.seek(SeekFrom::Start(at * 1000)).unwrap();
+                r.read_exact(&mut buf).unwrap();
+            }
+        }
+        let elapsed = started.elapsed();
+        assert!(elapsed < Duration::from_millis(500), "took {elapsed:?}");
     }
 
     /// Probing an MP4 with its index at the end: header, the end, then back.
