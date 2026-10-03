@@ -526,10 +526,7 @@ fn main() -> anyhow::Result<()> {
                     ""
                 }
             );
-            let mut decoder = media.into_decoder(hw_backend(hw), true, "")?;
-            if start > 0.0 {
-                decoder.seek(start)?;
-            }
+            let decoder = media.into_decoder(hw_backend(hw), true, "")?;
             if let Some(note) = &decoder.stats().note {
                 eprintln!("Decoder: {} ({note})", decoder.stats().decoder);
             } else {

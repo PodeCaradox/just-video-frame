@@ -95,6 +95,8 @@ pub struct Jump {
     pub target: f64,
     /// Request to the new picture on screen.
     pub shown_ms: Option<f64>,
+    /// Request to its keyframe on screen, when shown first as a preview.
+    pub preview_ms: Option<f64>,
     /// What the decode thread did for it.
     pub decoder: Option<SeekReport>,
 }
@@ -111,20 +113,26 @@ pub struct Report {
     pub jumps: Vec<Jump>,
 }
 
-/// Plays until the picture from the latest jump is on screen; None after 60 s.
-fn wait_shown(playback: &mut Playback, since: Instant) -> Option<f64> {
+/// Plays until the picture from the latest jump is on screen (None after
+/// 60 s); also when a preview (its keyframe) showed before that.
+fn wait_shown(playback: &mut Playback, since: Instant) -> (Option<f64>, Option<f64>) {
     let clock = Instant::now();
+    let mut preview = None;
+    let ms = || since.elapsed().as_secs_f64() * 1e3;
     while since.elapsed() < Duration::from_secs(60) {
-        playback.advance(clock.elapsed().as_nanos() as i64);
+        let changed = playback.advance(clock.elapsed().as_nanos() as i64);
         if playback.settled() {
-            return Some(since.elapsed().as_secs_f64() * 1e3);
+            return (Some(ms()), preview);
+        }
+        if changed && preview.is_none() {
+            preview = Some(ms());
         }
         if playback.error.is_some() {
-            return None;
+            break;
         }
         std::thread::sleep(Duration::from_millis(2));
     }
-    None
+    (None, preview)
 }
 
 /// The decode thread's report on the latest jump (it may trail the picture).
@@ -209,7 +217,7 @@ pub fn run(input: Input, options: &Options) -> anyhow::Result<Report> {
     let layout = crate::vr::detect(&name, decoder.info().video.as_ref());
     let open_ms = timing.total_ms();
     let mut playback = Playback::start(decoder, layout, options.resume.unwrap_or(0.0), 0.0);
-    let first_frame_ms = wait_shown(&mut playback, requested);
+    let first_frame_ms = wait_shown(&mut playback, requested).0;
     let start = report_of(&playback);
     let duration = playback.duration;
     let mut jumps = Vec::new();
@@ -219,7 +227,7 @@ pub fn run(input: Input, options: &Options) -> anyhow::Result<Report> {
             let from = playback.position();
             let since = Instant::now();
             playback.seek(target);
-            let shown_ms = wait_shown(playback, since);
+            let (shown_ms, preview_ms) = wait_shown(playback, since);
             eprintln!(
                 "bench-seek: {label}: {from:.1}s -> {target:.1}s shown in {}",
                 shown_ms.map_or("(timed out)".into(), |ms| format!("{ms:.0} ms"))
@@ -229,6 +237,7 @@ pub fn run(input: Input, options: &Options) -> anyhow::Result<Report> {
                 from,
                 target,
                 shown_ms,
+                preview_ms,
                 decoder: report_of(playback),
             });
             play_for(playback, Duration::from_millis(1500));
@@ -284,15 +293,15 @@ pub fn summary(r: &Report) -> String {
         r.first_frame_ms
             .map_or("never".into(), |ms| format!("{ms:.0} ms"))
     );
-    out +=
-        "jump                        target    shown  how         keyframe gap  discarded  read\n";
+    out += "jump                         target   shown preview  how       keyframe gap  discarded  read\n";
     for j in &r.jumps {
         let d = j.decoder.as_ref();
         out += &format!(
-            "{:<26} {:>8.1}s {:>7}  {:<11} {:>12} {:>10}  {}\n",
+            "{:<26} {:>8.1}s {:>7} {:>7}  {:<9} {:>12} {:>10}  {}\n",
             j.label,
             j.target,
             j.shown_ms.map_or("-".into(), |ms| format!("{ms:.0}ms")),
+            j.preview_ms.map_or("-".into(), |ms| format!("{ms:.0}ms")),
             d.map_or("-", |d| d.how),
             d.and_then(|d| d.first_decoded.map(|k| format!("{:.2}s", d.target - k)))
                 .unwrap_or("-".into()),
