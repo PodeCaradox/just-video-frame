@@ -49,7 +49,15 @@ pub struct FrameTiming {
     /// Loop time per frame (all phases but the wait), worst case.
     busy_max: f64,
     busy: f64,
+    /// This frame's and the previous frame's times per phase.
+    current: [f64; PHASES],
+    previous: [f64; PHASES],
+    /// Frames logged one by one (after missed periods) since the last report.
+    slow_logged: u32,
 }
+
+/// At most this many frames logged one by one per report.
+const SLOW_LOGGED: u32 = 6;
 
 impl FrameTiming {
     /// One frame's time in `phase`.
@@ -57,6 +65,7 @@ impl FrameTiming {
         let i = phase as usize;
         self.total[i] += ms;
         self.max[i] = self.max[i].max(ms);
+        self.current[i] += ms;
         if !matches!(phase, Phase::Wait | Phase::GpuUpload | Phase::GpuEyes) {
             self.busy += ms;
         }
@@ -70,7 +79,19 @@ impl FrameTiming {
         {
             let periods = ((display - last) as f64 / period as f64).round() as i64;
             self.missed += (periods - 1).max(0) as u64;
+            // The frame before was too late: show where its time went.
+            if periods > 1 && self.slow_logged < SLOW_LOGGED {
+                self.slow_logged += 1;
+                eprintln!(
+                    "Timing: {} display periods missed after frame {}: {}; then wait {:.1}",
+                    periods - 1,
+                    self.frames,
+                    phase_list(&self.previous),
+                    self.current[Phase::Wait as usize],
+                );
+            }
         }
+        self.previous = std::mem::take(&mut self.current);
         self.last_display = Some(display);
         self.frames += 1;
         self.uploads += uploaded as u64;
@@ -104,6 +125,7 @@ impl FrameTiming {
         );
         *self = Self {
             last_display: self.last_display,
+            previous: self.previous,
             ..Self::default()
         };
     }
@@ -112,4 +134,12 @@ impl FrameTiming {
     pub fn restart(&mut self) {
         self.last_display = None;
     }
+}
+
+/// "wait 1.0, advance 0.1, …" (ms).
+fn phase_list(ms: &[f64; PHASES]) -> String {
+    (0..PHASES)
+        .map(|i| format!("{} {:.1}", NAMES[i], ms[i]))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
