@@ -203,14 +203,28 @@ pub fn open_video(
 ) -> Result<Box<Opened>, String> {
     let err = |e: anyhow::Error| format!("{e:#}");
     let name = path.last().cloned().unwrap_or_default();
-    let external_subtitles = load_sidecars(session, share, path);
-    timing.lap("sidecars");
-    let reader = session
-        .open_owned(share, &smb_path(path), ReadAhead::default())
-        .map_err(err)?;
-    timing.lap("open file");
-    let media = Media::open(&name, reader).map_err(err)?;
-    timing.lap("probe");
+    // Subtitle files load alongside: their folder listing and reads are
+    // round trips the video doesn't need to wait for.
+    let (external_subtitles, media) = std::thread::scope(|scope| {
+        let sidecars = scope.spawn(|| {
+            let started = std::time::Instant::now();
+            let found = load_sidecars(session, share, path);
+            (found, started.elapsed().as_secs_f64() * 1e3)
+        });
+        let media = session
+            .open_owned(share, &smb_path(path), ReadAhead::default())
+            .map_err(err)
+            .and_then(|reader| {
+                timing.lap("open file");
+                Media::open(&name, reader).map_err(err)
+            });
+        timing.lap("probe");
+        let (found, ms) = sidecars.join().unwrap_or_default();
+        timing.lap("rest of sidecars");
+        timing.note(format!("sidecars {ms:.0} alongside"));
+        (found, media)
+    });
+    let media = media?;
     timing.note(format!("probe read {}", media.io()));
     let video = media.info().video.clone();
     let assessment = playability::assess(Platform::current(), video.as_ref());
@@ -532,27 +546,52 @@ fn run(
     }
 }
 
+/// Holds a probe while a video opens or plays: probes read other files over
+/// the same link (and disks), slowing the video. False when the probe's
+/// folder was left meanwhile.
+fn wait_for_quiet(current: &AtomicU64, generation: u64, opening: &AtomicU64) -> bool {
+    loop {
+        if generation != current.load(Ordering::Relaxed) {
+            return false;
+        }
+        if opening.load(Ordering::SeqCst) == 0 && crate::media::open_decoders() == 0 {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
 impl Library {
     /// `hw` is the preferred hardware backend for playback (see `media::default_hw_backend`).
     pub fn start(hw: Option<&'static str>) -> Self {
         let sessions: Sessions = Default::default();
         let probe_generation = Arc::new(AtomicU64::new(0));
+        let opening = Arc::new(AtomicU64::new(0));
         let (response_tx, responses) = mpsc::channel();
         let mut senders = Vec::new();
         for name in ["library", "probe"] {
             let (tx, rx) = mpsc::channel::<(Request, std::time::Instant)>();
             let (sessions, out) = (sessions.clone(), response_tx.clone());
             let current = probe_generation.clone();
+            let opening = opening.clone();
             std::thread::Builder::new()
                 .name(name.into())
                 .spawn(move || {
                     for (request, requested) in rx {
                         if let Request::Probe { generation, .. } = &request
-                            && *generation != current.load(Ordering::Relaxed)
+                            && !wait_for_quiet(&current, *generation, &opening)
                         {
                             continue;
                         }
-                        if out.send(handle(request, requested, &sessions, hw)).is_err() {
+                        let open = matches!(request, Request::Open { .. });
+                        if open {
+                            opening.fetch_add(1, Ordering::SeqCst);
+                        }
+                        let response = handle(request, requested, &sessions, hw);
+                        if open {
+                            opening.fetch_sub(1, Ordering::SeqCst);
+                        }
+                        if out.send(response).is_err() {
                             return;
                         }
                     }

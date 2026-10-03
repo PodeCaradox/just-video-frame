@@ -674,6 +674,8 @@ pub struct VideoDecoder {
     stats: DecodeStats,
     /// When the viewer asked for this video (for the time-to-first-frame log).
     pub requested_at: Option<std::time::Instant>,
+    /// Holds the hardware decoder (see `HARDWARE_DECODERS`).
+    hardware: bool,
 }
 
 // SAFETY: used from one thread at a time (the decode thread).
@@ -704,7 +706,12 @@ impl Media {
             bail!("{}", text(&s.error));
         }
         OPEN_DECODERS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let hardware = optional(&s.hw_backend).is_some();
+        if hardware {
+            HARDWARE_DECODERS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
         Ok(VideoDecoder {
+            hardware,
             raw: decoder,
             media: self,
             stats: DecodeStats {
@@ -851,19 +858,34 @@ impl VideoDecoder {
 
 impl Drop for VideoDecoder {
     fn drop(&mut self) {
+        let started = std::time::Instant::now();
         unsafe { jv_decoder_close(self.raw) };
+        if self.hardware {
+            eprintln!(
+                "Timing: hardware decoder closed in {:.0} ms",
+                started.elapsed().as_secs_f64() * 1e3
+            );
+            HARDWARE_DECODERS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
         OPEN_DECODERS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
-/// Decoders not yet closed. The hardware decoder has buffers for only one 8K
-/// stream: opening a new one before the last closed falls back to the CPU.
+/// Video decoders not yet closed (something is playing or about to).
 static OPEN_DECODERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Of those, on the hardware decoder. It has buffers for only one 8K stream:
+/// opening a new one before the last closed falls back to the CPU.
+static HARDWARE_DECODERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// Waits (up to `limit`) until every earlier decoder has closed.
+pub fn open_decoders() -> usize {
+    OPEN_DECODERS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Waits (up to `limit`) until every earlier hardware decoder has closed.
+/// A closing software decoder holds nothing a new video needs.
 pub fn wait_for_decoders_closed(limit: std::time::Duration) -> bool {
     let started = std::time::Instant::now();
-    while OPEN_DECODERS.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+    while HARDWARE_DECODERS.load(std::sync::atomic::Ordering::SeqCst) > 0 {
         if started.elapsed() > limit {
             return false;
         }
