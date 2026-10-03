@@ -454,7 +454,7 @@ fn draw_icon(canvas: &mut Canvas, icon: &Icon, cx: f32, cy: f32, bg: Rgb) {
                 canvas.rect(x - 5.0, y - 5.0, 10.0, 10.0, 2.0, SUBTLE);
             }
             canvas.circle(cx, cy, 15.0, SUBTLE);
-            canvas.circle(cx, cy, 6.0, BG);
+            canvas.circle(cx, cy, 6.0, bg);
         }
         Icon::Slider => {
             canvas.rect(cx - 20.0, cy - 2.0, 40.0, 4.0, 2.0, FAINT);
@@ -922,6 +922,24 @@ mod tests {
             Hit::DialogButton(1)
         );
         assert_eq!(hit(&view, &mut fonts, 400.0, HEADER + 10.0), Hit::Nothing);
+    }
+
+    #[test]
+    fn icon_cut_outs_show_the_row_behind() {
+        let view = View {
+            rows: vec![Row::new(Icon::Settings, "Settings")],
+            ..Default::default()
+        };
+        let mut fonts = Fonts::load().expect("fonts");
+        let (_, ry, _, _) = row_rect(&view, 0);
+        let (cx, cy) = (PAD + 48.0, ry - 4.0 + ROW / 2.0);
+        let centre = |canvas: &Canvas| {
+            let i = ((cy as u32 * canvas.width + cx as u32) * 4) as usize;
+            [canvas.pixels[i], canvas.pixels[i + 1], canvas.pixels[i + 2]]
+        };
+        assert_eq!(centre(&render(&view, &mut fonts, None, false)), ROW_BG);
+        let hovered = render(&view, &mut fonts, Some((400.0, cy)), false);
+        assert_eq!(centre(&hovered), HOVER, "the gear's hole");
     }
 
     #[test]
