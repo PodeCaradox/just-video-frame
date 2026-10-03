@@ -130,6 +130,25 @@ fn stereo_from_metadata(video: &VideoInfo) -> Option<(Stereo, bool)> {
     Some((stereo, video.stereo_inverted))
 }
 
+impl Layout {
+    /// A short name for file lists, e.g. "VR180 3D"; `None` for a plain flat video.
+    pub fn short_label(&self) -> Option<String> {
+        let shape = match self.projection {
+            Projection::Flat if self.stereo == Stereo::Mono => return None,
+            Projection::Flat => "",
+            Projection::Equirect180 => "VR180",
+            Projection::Equirect360 => "VR360",
+            Projection::Fisheye180 => "Fisheye",
+        };
+        let depth = if self.stereo == Stereo::Mono {
+            ""
+        } else {
+            "3D"
+        };
+        Some([shape, depth].join(" ").trim().to_string())
+    }
+}
+
 pub fn detect(name: &str, video: Option<&VideoInfo>) -> Layout {
     let tokens = tokens(name);
     let (projection, projection_from) = video
@@ -196,6 +215,21 @@ mod tests {
         assert_eq!(by_name("movie.2024.2160p.mkv"), (Flat, Mono, false));
         assert_eq!(by_name("film_sbs.mkv"), (Flat, SideBySide, false));
         assert_eq!(by_name("dir/360/flat_video.mp4"), (Flat, Mono, false));
+    }
+
+    #[test]
+    fn list_labels() {
+        let label = |name| detect(name, None).short_label();
+        assert_eq!(label("movie.2024.2160p.mkv"), None);
+        assert_eq!(label("film_sbs.mkv").as_deref(), Some("3D"));
+        assert_eq!(label("film_TB.mkv").as_deref(), Some("3D"));
+        assert_eq!(label("Trip_180_LR.mp4").as_deref(), Some("VR180 3D"));
+        assert_eq!(label("dive-360_TB.mkv").as_deref(), Some("VR360 3D"));
+        assert_eq!(label("walk_360.mp4").as_deref(), Some("VR360"));
+        assert_eq!(
+            label("scene_FISHEYE190_LR.mp4").as_deref(),
+            Some("Fisheye 3D")
+        );
     }
 
     fn video(projection: Option<&str>, degrees: Option<f64>, stereo: Option<&str>) -> VideoInfo {

@@ -142,7 +142,7 @@ pub enum Response {
     Probe {
         generation: u64,
         name: String,
-        result: Result<Assessment, String>,
+        result: Result<Probed, String>,
     },
     Opened {
         id: u64,
@@ -154,6 +154,14 @@ pub enum Response {
         id: u64,
         result: Result<Server, String>,
     },
+}
+
+/// What a folder listing shows about a video before it is opened.
+#[derive(Clone, Debug)]
+pub struct Probed {
+    pub assessment: Assessment,
+    /// Detected, or as the user last set it for this file.
+    pub layout: Layout,
 }
 
 pub struct Library {
@@ -308,15 +316,25 @@ fn run(request: Request, sessions: &Sessions, hw: Option<&str>) -> Response {
                 block_size: 256 * 1024,
                 blocks_ahead: 4,
             };
+            let name = path.last().cloned().unwrap_or_default();
+            let key = file_key(&server, &share, &path);
             let result = session(sessions, &server, Purpose::Probe).and_then(|s| {
                 let reader = s.open_in(&share, &smb_path(&path), probe).map_err(err)?;
-                Media::open(path.last().map_or("", String::as_str), reader)
-                    .map(|m| playability::assess(Platform::current(), m.info().video.as_ref()))
-                    .map_err(err)
+                let media = Media::open(&name, reader).map_err(err)?;
+                let video = media.info().video.as_ref();
+                // Marked as it will play: a format the user picked wins.
+                let mut layout = vr::detect(&name, video);
+                if let Some(saved) = config::layout_override(&key).ok().flatten() {
+                    saved.apply(&mut layout);
+                }
+                Ok(Probed {
+                    assessment: playability::assess(Platform::current(), video),
+                    layout,
+                })
             });
             Response::Probe {
                 generation,
-                name: path.last().cloned().unwrap_or_default(),
+                name,
                 result,
             }
         }
