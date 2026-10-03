@@ -389,11 +389,7 @@ fn handle(
         | Response::Changed { result: Err(e), .. }
         | Response::ServerAdded { result: Err(e), .. } => Some(e.clone()),
         // A bad file is not a connection problem; a stalled server is.
-        Response::Probe { result: Err(e), .. }
-            if e.contains("stopped sending") || e.contains("did not answer") =>
-        {
-            Some(e.clone())
-        }
+        Response::Probe { result: Err(e), .. } if connection_lost(e) => Some(e.clone()),
         _ => None,
     };
     if let Some(e) = failure {
@@ -401,8 +397,7 @@ fn handle(
             "Library: {what} failed after {:.1}s: {e}",
             started.elapsed().as_secs_f64()
         );
-        // Only unanswered requests mean the connection itself is broken.
-        if e.contains("did not answer") || e.contains("stopped sending") {
+        if connection_lost(&e) {
             match what {
                 "probe" => evict(sessions, &server, Purpose::Probe),
                 // A video has its own connection, which closes with it.
@@ -417,6 +412,25 @@ fn handle(
         );
     }
     response
+}
+
+/// Whether an error means the connection itself is broken (so it must be
+/// replaced), not just this request: unanswered requests, and a connection
+/// or session the server closed, e.g. an idle disconnect while the headset
+/// slept (Windows drops idle sessions after 15 minutes).
+fn connection_lost(error: &str) -> bool {
+    [
+        "did not answer",
+        "stopped sending",
+        "connection is stopped",
+        "Not connected",
+        "IO Error",
+        "Network Session Expired",
+        "User Session Deleted",
+        "Network Name Deleted",
+    ]
+    .iter()
+    .any(|marker| error.contains(marker))
 }
 
 fn run(
@@ -633,5 +647,31 @@ impl LayoutOverride {
         layout.projection = self.projection;
         layout.stereo = self.stereo;
         layout.swap_eyes = self.swap_eyes;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn closed_connections_are_replaced() {
+        for lost in [
+            "The server did not answer (list)",
+            "Open share \\\\nas\\media: Client connection is stopped",
+            "Transport error: Not connected",
+            "IO Error: Connection reset by peer (os error 104)",
+            "Server returned an error message with status: Network Session Expired.",
+            "Server returned an error message with status: User Session Deleted.",
+        ] {
+            assert!(connection_lost(lost), "{lost}");
+        }
+        for kept in [
+            "Server returned an error message with status: Object Name Not Found.",
+            "Server returned an error message with status: Directory Not Empty.",
+            "Server returned an error message with status: Access Denied.",
+        ] {
+            assert!(!connection_lost(kept), "{kept}");
+        }
     }
 }
