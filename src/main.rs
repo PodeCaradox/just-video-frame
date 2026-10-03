@@ -249,6 +249,19 @@ struct ReadAheadArgs {
     /// Reads kept in flight ahead of the demuxer.
     #[arg(long, default_value_t = 32)]
     blocks_ahead: usize,
+    /// SMB connections the file is read over (as when playing).
+    #[arg(long, default_value_t = just_video::library::VIDEO_CONNECTIONS)]
+    connections: usize,
+}
+
+/// `read_ahead.connections` sessions to the server in `url` (at least one).
+fn connect_lanes(
+    url: &str,
+    read_ahead: &ReadAheadArgs,
+) -> anyhow::Result<Vec<std::sync::Arc<SmbSession>>> {
+    (0..read_ahead.connections.max(1))
+        .map(|_| connect(url).map(std::sync::Arc::new))
+        .collect()
 }
 
 impl ReadAheadArgs {
@@ -1184,9 +1197,11 @@ fn main() -> anyhow::Result<()> {
             mib,
             read_ahead,
         } => {
-            let session = connect(&url)?;
+            let sessions = connect_lanes(&url, &read_ahead)?;
+            let session = &sessions[0];
             let path = session.url().path.clone();
-            let mut reader = session.open(&path, read_ahead.get())?;
+            let mut reader =
+                SmbSession::open_striped(&sessions, &session.url().share, &path, read_ahead.get())?;
             let limit = mib.map_or(reader.len(), |m| (m << 20).min(reader.len()));
             let mut buffer = vec![0u8; 256 * 1024];
             let mut total = 0u64;
@@ -1240,12 +1255,12 @@ fn main() -> anyhow::Result<()> {
             use just_video::bench;
             let bench_input = if input.starts_with("smb://") {
                 let started = Instant::now();
-                let session = std::sync::Arc::new(connect(&input)?);
+                let sessions = connect_lanes(&input, &read_ahead)?;
                 let connect_ms = started.elapsed().as_secs_f64() * 1e3;
                 eprintln!("Timing: connect {connect_ms:.0} ms");
-                let url = session.url().clone();
+                let url = sessions[0].url().clone();
                 bench::Input::Smb {
-                    session,
+                    sessions,
                     share: url.share.clone(),
                     path: url.path.split('\\').map(str::to_string).collect(),
                     connect_ms,

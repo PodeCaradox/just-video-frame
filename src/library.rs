@@ -191,10 +191,11 @@ impl OpenTiming {
     }
 }
 
-/// Opens `path` on its own `session` for playback: subtitles next to it,
+/// Opens `path` for playback on its own `sessions` (the file is read over
+/// all of them; see [`SmbSession::open_striped`]): subtitles next to it,
 /// the file, its streams, then the decoder.
 pub fn open_video(
-    session: &Arc<SmbSession>,
+    sessions: &[Arc<SmbSession>],
     share: &str,
     path: &Path,
     key: String,
@@ -203,6 +204,7 @@ pub fn open_video(
 ) -> Result<Box<Opened>, String> {
     let err = |e: anyhow::Error| format!("{e:#}");
     let name = path.last().cloned().unwrap_or_default();
+    let session = sessions.first().ok_or("No connection")?;
     // Subtitle files load alongside: their folder listing and reads are
     // round trips the video doesn't need to wait for.
     let (external_subtitles, media) = std::thread::scope(|scope| {
@@ -211,13 +213,13 @@ pub fn open_video(
             let found = load_sidecars(session, share, path);
             (found, started.elapsed().as_secs_f64() * 1e3)
         });
-        let media = session
-            .open_owned(share, &smb_path(path), ReadAhead::default())
-            .map_err(err)
-            .and_then(|reader| {
-                timing.lap("open file");
-                Media::open(&name, reader).map_err(err)
-            });
+        let media =
+            SmbSession::open_striped(sessions, share, &smb_path(path), ReadAhead::default())
+                .map_err(err)
+                .and_then(|reader| {
+                    timing.lap("open file");
+                    Media::open(&name, reader).map_err(err)
+                });
         timing.lap("probe");
         let (found, ms) = sidecars.join().unwrap_or_default();
         timing.lap("rest of sidecars");
@@ -312,6 +314,28 @@ type Sessions = Arc<Mutex<HashMap<(String, Purpose), Arc<SmbSession>>>>;
 /// Key of a file's saved layout override.
 pub fn file_key(server: &Server, share: &str, path: &Path) -> String {
     format!("{}/{share}/{}", server.url, path.join("/"))
+}
+
+/// Connections a playing video reads over (see [`SmbSession::open_striped`]).
+pub const VIDEO_CONNECTIONS: usize = 2;
+
+/// Connects [`VIDEO_CONNECTIONS`] sessions at once for one video; only the
+/// first must succeed.
+fn connect_lanes(server: &Server) -> Result<Vec<Arc<SmbSession>>, String> {
+    std::thread::scope(|scope| {
+        let extra: Vec<_> = (1..VIDEO_CONNECTIONS)
+            .map(|_| scope.spawn(|| connect(server, None)))
+            .collect();
+        let mut sessions = vec![connect(server, None)?];
+        for handle in extra {
+            match handle.join() {
+                Ok(Ok(session)) => sessions.push(session),
+                Ok(Err(e)) => eprintln!("Library: playing over one connection less: {e}"),
+                Err(_) => {}
+            }
+        }
+        Ok(sessions)
+    })
 }
 
 fn connect(server: &Server, password: Option<String>) -> Result<Arc<SmbSession>, String> {
@@ -498,10 +522,10 @@ fn run(
             // A dedicated connection per video: if it wedges, only this video
             // is affected, and it closes when the video does.
             let mut timing = OpenTiming::new(requested);
-            let result = connect(&server, None).and_then(|s| {
+            let result = connect_lanes(&server).and_then(|sessions| {
                 timing.lap("connect");
                 let key = file_key(&server, &share, &path);
-                open_video(&s, &share, &path, key, hw, &mut timing)
+                open_video(&sessions, &share, &path, key, hw, &mut timing)
             });
             Response::Opened { id, result }
         }

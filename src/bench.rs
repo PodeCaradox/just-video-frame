@@ -66,7 +66,8 @@ impl BlockSource for LocalFile {
 pub enum Input {
     /// A file on an SMB session that was just connected (in `connect_ms`).
     Smb {
-        session: Arc<SmbSession>,
+        /// The video is read over all of them.
+        sessions: Vec<Arc<SmbSession>>,
         share: String,
         path: Vec<String>,
         connect_ms: f64,
@@ -292,7 +293,7 @@ pub fn run(input: Input, options: &Options) -> anyhow::Result<Report> {
     let mut timing = OpenTiming::new(requested);
     let (name, mut decoder) = match input {
         Input::Smb {
-            session,
+            sessions,
             share,
             path,
             connect_ms,
@@ -300,8 +301,9 @@ pub fn run(input: Input, options: &Options) -> anyhow::Result<Report> {
             timing.note(format!("connect {connect_ms:.0} (before)"));
             let name = path.last().cloned().unwrap_or_default();
             let key = format!("bench/{share}/{}", path.join("/"));
-            let opened = library::open_video(&session, &share, &path, key, options.hw, &mut timing)
-                .map_err(anyhow::Error::msg)?;
+            let opened =
+                library::open_video(&sessions, &share, &path, key, options.hw, &mut timing)
+                    .map_err(anyhow::Error::msg)?;
             (name, opened.decoder)
         }
         Input::Local { path, link } => {
