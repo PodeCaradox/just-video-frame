@@ -4,7 +4,7 @@
 //! kept in flight so network latency overlaps decode instead of adding to it.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     future::Future,
     io::{self, Read, Seek, SeekFrom},
     pin::Pin,
@@ -70,6 +70,15 @@ const STALL_LIMIT: Duration = Duration::from_secs(45);
 const READ_RETRIES: u32 = 3;
 /// How long closing waits for outstanding reads.
 const CLOSE_WAIT: Duration = Duration::from_secs(10);
+/// Blocks requested right after a jump; the window doubles with each block
+/// read straight on. Reads can't be cancelled (see `detached`), so a full
+/// window requested just before the demuxer jumps elsewhere (probing a file's
+/// index at its end, a seek) would delay the new position until all of it
+/// arrived: ~0.25 s for 32 MiB over the headset's link.
+const INITIAL_WINDOW: usize = 4;
+/// Finished blocks kept after the reader moved away, for demuxers that come
+/// back (an MP4 index at the end of the file, then the start of the data).
+const CACHED_BLOCKS: usize = 8;
 
 pub struct ReadAheadReader<S: BlockSource> {
     runtime: Arc<Runtime>,
@@ -78,6 +87,12 @@ pub struct ReadAheadReader<S: BlockSource> {
     pos: u64,
     options: ReadAhead,
     blocks: BTreeMap<u64, Block>,
+    /// Recently left finished blocks, oldest first (see `CACHED_BLOCKS`).
+    cache: VecDeque<(u64, Vec<u8>)>,
+    /// Blocks to keep requested ahead now (grows to `blocks_ahead`).
+    window: usize,
+    /// The block the last read came from.
+    last_index: Option<u64>,
     /// Reads no longer needed, left to finish. In-flight requests are never
     /// aborted: smb-rs returns a request's credits only when its response is
     /// received, so cancelled reads would leak credits until the connection
@@ -97,6 +112,9 @@ impl<S: BlockSource> ReadAheadReader<S> {
             pos: 0,
             options,
             blocks: BTreeMap::new(),
+            cache: VecDeque::new(),
+            window: INITIAL_WINDOW.min(options.blocks_ahead),
+            last_index: None,
             detached: Vec::new(),
             in_flight: Arc::new(AtomicUsize::new(0)),
             stats: ReadStats::default(),
@@ -116,6 +134,11 @@ impl<S: BlockSource> ReadAheadReader<S> {
     }
 
     fn spawn(&mut self, index: u64) {
+        if let Some(at) = self.cache.iter().position(|(i, _)| *i == index) {
+            let (_, data) = self.cache.remove(at).expect("cached block");
+            self.blocks.insert(index, Block::Ready(data));
+            return;
+        }
         let size = self.options.block_size as u64;
         let offset = index * size;
         let length = size.min(self.len - offset) as usize;
@@ -132,21 +155,39 @@ impl<S: BlockSource> ReadAheadReader<S> {
         self.blocks.insert(index, Block::Pending(task));
     }
 
-    /// Keeps `[current, current + blocks_ahead)` requested and drops the rest,
+    /// Keeps `[current, current + window)` requested and drops the rest,
     /// except one block behind, which absorbs small backward seeks by demuxers.
     fn schedule(&mut self, current: u64) {
+        self.window = next_window(
+            self.window,
+            self.last_index,
+            current,
+            self.blocks.contains_key(&current),
+            self.options.blocks_ahead,
+        );
+        self.last_index = Some(current);
         let block_count = self.len.div_ceil(self.options.block_size as u64);
-        let end = (current + self.options.blocks_ahead as u64).min(block_count);
+        let end = (current + self.window as u64).min(block_count);
         let keep_from = current.saturating_sub(1);
+        // Only blocks beyond the full window are dropped ahead: a window that
+        // is still growing keeps what it already asked for.
+        let keep_until = (current + self.options.blocks_ahead as u64).min(block_count);
         let stale: Vec<u64> = self
             .blocks
             .keys()
             .copied()
-            .filter(|&i| i < keep_from || i >= end)
+            .filter(|&i| i < keep_from || i >= keep_until)
             .collect();
         for index in stale {
-            if let Some(Block::Pending(handle)) = self.blocks.remove(&index) {
-                self.detached.push(handle);
+            match self.blocks.remove(&index) {
+                Some(Block::Pending(handle)) => self.detached.push(handle),
+                Some(Block::Ready(data)) => {
+                    if self.cache.len() == CACHED_BLOCKS {
+                        self.cache.pop_front();
+                    }
+                    self.cache.push_back((index, data));
+                }
+                None => {}
             }
             self.stats.discarded_blocks += 1;
         }
@@ -155,14 +196,30 @@ impl<S: BlockSource> ReadAheadReader<S> {
         // pile up requests; the block needed now is always requested.
         for index in current..end {
             if !self.blocks.contains_key(&index) {
-                if index != current
-                    && self.in_flight.load(Ordering::SeqCst) >= self.options.blocks_ahead
-                {
+                if index != current && self.in_flight.load(Ordering::SeqCst) >= self.window {
                     break;
                 }
                 self.spawn(index);
             }
         }
+    }
+}
+
+/// The read-ahead window for a read from block `current` (see `INITIAL_WINDOW`):
+/// it doubles as reading moves on to the next block, stays while reading
+/// within what is already requested, and starts small again after a jump.
+fn next_window(
+    window: usize,
+    last: Option<u64>,
+    current: u64,
+    requested: bool,
+    max: usize,
+) -> usize {
+    let initial = INITIAL_WINDOW.min(max);
+    match last {
+        Some(last) if current == last => window,
+        Some(last) if current > last && requested => (window * 2).min(max),
+        _ => initial,
     }
 }
 
@@ -417,6 +474,96 @@ mod tests {
         let mut out = Vec::new();
         r.read_to_end(&mut out).unwrap();
         assert_eq!(out, data);
+    }
+
+    #[test]
+    fn window_grows_and_restarts_after_jumps() {
+        // First read, then straight on: 4, 8, 16, 32 (the maximum).
+        assert_eq!(next_window(32, None, 0, false, 32), 4);
+        assert_eq!(next_window(4, Some(0), 1, true, 32), 8);
+        assert_eq!(next_window(8, Some(1), 2, true, 32), 16);
+        assert_eq!(next_window(32, Some(2), 3, true, 32), 32);
+        // More reads from the same block keep it; a jump starts over.
+        assert_eq!(next_window(16, Some(5), 5, true, 32), 16);
+        assert_eq!(next_window(32, Some(5), 900, false, 32), 4);
+        assert_eq!(next_window(32, Some(5), 2, true, 32), 4);
+        // Small read-aheads never exceed their own size.
+        assert_eq!(next_window(2, None, 0, false, 2), 2);
+    }
+
+    /// A network link: one read at a time at a fixed speed, so later reads
+    /// wait for earlier ones (unlike `Slow`, whose requests overlap freely).
+    struct Link {
+        data: Vec<u8>,
+        per_byte: Duration,
+        busy_until: std::sync::Mutex<Instant>,
+        /// Offsets fetched, in order.
+        fetched: std::sync::Mutex<Vec<u64>>,
+    }
+
+    impl BlockSource for Link {
+        fn fetch(
+            self: Arc<Self>,
+            offset: u64,
+            len: usize,
+        ) -> BoxFuture<'static, io::Result<Vec<u8>>> {
+            let done = {
+                let mut busy = self.busy_until.lock().unwrap();
+                *busy = (*busy).max(Instant::now()) + self.per_byte * len as u32;
+                *busy
+            };
+            self.fetched.lock().unwrap().push(offset);
+            Box::pin(async move {
+                tokio::time::sleep_until(done.into()).await;
+                let start = offset as usize;
+                Ok(self.data[start..start + len].to_vec())
+            })
+        }
+    }
+
+    fn link_reader(len: usize, ms_per_block: u64, options: ReadAhead) -> ReadAheadReader<Link> {
+        let runtime = Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_time()
+                .build()
+                .unwrap(),
+        );
+        let source = Link {
+            data: (0..len).map(|i| (i % 251) as u8).collect(),
+            per_byte: Duration::from_millis(ms_per_block) / options.block_size as u32,
+            busy_until: std::sync::Mutex::new(Instant::now()),
+            fetched: Default::default(),
+        };
+        ReadAheadReader::new(runtime, source, len as u64, options)
+    }
+
+    /// Probing an MP4 with its index at the end: header, the end, then back.
+    #[test]
+    fn a_jump_soon_after_opening_does_not_wait_for_a_full_window() {
+        let options = ReadAhead {
+            block_size: 1000,
+            blocks_ahead: 32,
+        };
+        // 5 ms per block: a full window queued ahead would take 160 ms.
+        let mut r = link_reader(200_000, 5, options);
+        let mut buf = [0u8; 100];
+        let started = Instant::now();
+        r.read_exact(&mut buf).unwrap();
+        r.seek(SeekFrom::Start(150_000)).unwrap();
+        r.read_exact(&mut buf).unwrap();
+        let elapsed = started.elapsed();
+        assert!(elapsed < Duration::from_millis(80), "took {elapsed:?}");
+        // Back to the start: block 0 is still here, not fetched again.
+        r.seek(SeekFrom::Start(10)).unwrap();
+        r.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf[..], &r.source.data[10..110]);
+        let fetched = r.source.fetched.lock().unwrap().clone();
+        assert_eq!(
+            fetched.iter().filter(|&&o| o == 0).count(),
+            1,
+            "{fetched:?}"
+        );
     }
 
     #[test]
