@@ -840,7 +840,8 @@ pub fn run(
         // in the browser): SteamVR only treats an app showing one as running,
         // and otherwise leaves its own menu in front ("start in background").
         let eyes_rendered;
-        // Whether a picture was uploaded, on frames that drew the video.
+        // Whether a picture was uploaded, and pictures skipped so far, on
+        // frames that drew the video.
         let mut uploaded = None;
         match &mut mode {
             Mode::Browser => {
@@ -1528,7 +1529,7 @@ pub fn run(
                 let gpu = renderer.gpu_ms();
                 timing.add(Phase::GpuUpload, gpu[0]);
                 timing.add(Phase::GpuEyes, gpu[1] + gpu[2]);
-                uploaded = Some(upload);
+                uploaded = Some((upload, playback.stats.skipped_frames));
                 if let Some((path, _)) = capture {
                     renderer.take_screenshot(0, &path)?;
                     stats.screenshot = Some(path.display().to_string());
@@ -1646,9 +1647,14 @@ pub fn run(
         }
         ctx.frame_stream
             .end(state.predicted_display_time, ctx.blend_mode, &layers)?;
-        if let Some(uploaded) = uploaded {
+        if let Some((uploaded, skipped)) = uploaded {
             timing.add(Phase::End, lap(&mut mark));
-            timing.frame(state.predicted_display_time.as_nanos(), period, uploaded);
+            timing.frame(
+                state.predicted_display_time.as_nanos(),
+                period,
+                uploaded,
+                skipped,
+            );
         }
     }
     timing.report(period);

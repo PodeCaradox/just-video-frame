@@ -91,6 +91,50 @@ pub struct PlayOptions {
 mod tests {
     use super::*;
 
+    /// Runs `AudioSync` at 60 Hz for `seconds` against an audio clock that
+    /// is `offset(t)` behind the video clock; returns the errors left.
+    fn run_sync(seconds: f64, offset: impl Fn(f64) -> f64) -> Vec<f64> {
+        let mut sync = AudioSync::default();
+        sync.restart(0);
+        let mut moved = 0.0;
+        (0..(seconds * 60.0) as i64)
+            .map(|k| {
+                let t = k as f64 / 60.0;
+                let error = offset(t) - moved;
+                moved += sync.correction((t * 1e9) as i64, error);
+                error
+            })
+            .collect()
+    }
+
+    #[test]
+    fn audio_sync_settles_quickly_then_ignores_the_sawtooth() {
+        // 40 ms off at the start, then the Frame's ~7 ms sawtooth every 1.5 s.
+        let errors = run_sync(20.0, |t| 0.040 + 0.007 * ((t / 1.5).fract() - 0.5));
+        let after_settling = &errors[90..];
+        let worst = after_settling.iter().fold(0.0f64, |m, e| m.max(e.abs()));
+        assert!(worst < 0.012, "worst {worst}");
+        // The clock no longer follows the sawtooth: its errors keep its shape.
+        let late = &errors[600..];
+        let spread = late.iter().cloned().fold(f64::MIN, f64::max)
+            - late.iter().cloned().fold(f64::MAX, f64::min);
+        assert!(spread > 0.006, "spread {spread}");
+    }
+
+    #[test]
+    fn audio_sync_follows_real_drift_and_jumps() {
+        // 1 ms/s of drift: corrected before it reaches a frame (17 ms).
+        let errors = run_sync(60.0, |t| 0.001 * t);
+        assert!(
+            errors.iter().all(|e| e.abs() < 0.015),
+            "{:?}",
+            &errors[3000..]
+        );
+        // A stall puts the sound 400 ms behind: fixed at once.
+        let errors = run_sync(10.0, |t| if t < 5.0 { 0.0 } else { 0.4 });
+        assert!(errors[301..].iter().all(|e| e.abs() < 0.015));
+    }
+
     fn apply(m: [[f32; 3]; 3], v: [f32; 3]) -> [f32; 3] {
         [0, 1, 2].map(|i| (0..3).map(|k| m[k][i] * v[k]).sum())
     }
@@ -1078,7 +1122,78 @@ pub struct Playback {
     /// Display time (ns) corresponding to media time 0.
     clock_start: Option<i64>,
     paused_at: Option<i64>,
+    sync: AudioSync,
     pub stats: PlayStats,
+}
+
+/// Keeps the video clock on the audio clock without passing on the audio
+/// position's jitter. That position (written samples minus the reported
+/// latency) runs in a sawtooth of ~7 ms every ~1.5 s on the Frame; following
+/// it moved the video clock back and forth across frame boundaries, so a
+/// frame was shown twice and the next skipped every second or two. After
+/// the clock starts it follows quickly; then it only corrects a smoothed
+/// error that leaves a band wider than that sawtooth (real drift is ~0.2 ms/s).
+#[derive(Default)]
+struct AudioSync {
+    /// Display time the clock started (or was last set) at.
+    started: Option<i64>,
+    last: Option<i64>,
+    smoothed: f64,
+    correcting: bool,
+}
+
+impl AudioSync {
+    /// Following closely this long after the clock starts (seconds).
+    const SETTLE: f64 = 1.5;
+    /// Smoothing time constant (seconds).
+    const SMOOTHING: f64 = 2.0;
+    /// Smoothed errors beyond this are corrected…
+    const BAND: f64 = 0.012;
+    /// …down to this, over about `CATCH_UP` seconds.
+    const DONE: f64 = 0.002;
+    const CATCH_UP: f64 = 0.5;
+    /// Larger errors (after a stall) are corrected at once.
+    const JUMP: f64 = 0.25;
+
+    fn restart(&mut self, now: i64) {
+        *self = Self {
+            started: Some(now),
+            ..Self::default()
+        };
+    }
+
+    /// Seconds to move the clock's start by, given the video clock's lead
+    /// over the audio (`error`, seconds) at display time `now` (ns).
+    fn correction(&mut self, now: i64, error: f64) -> f64 {
+        let started = *self.started.get_or_insert(now);
+        let dt = self
+            .last
+            .map_or(0.0, |last| ((now - last) as f64 / 1e9).clamp(0.0, 0.1));
+        self.last = Some(now);
+        if error.abs() > Self::JUMP {
+            self.smoothed = 0.0;
+            return error;
+        }
+        if ((now - started) as f64 / 1e9) < Self::SETTLE {
+            let correction = error * 0.1;
+            self.smoothed = error - correction;
+            return correction;
+        }
+        self.smoothed += (error - self.smoothed) * (dt / Self::SMOOTHING).min(1.0);
+        if self.smoothed.abs() > Self::BAND {
+            self.correcting = true;
+        }
+        if !self.correcting {
+            return 0.0;
+        }
+        if self.smoothed.abs() < Self::DONE {
+            self.correcting = false;
+        }
+        let correction = self.smoothed * (dt / Self::CATCH_UP).min(1.0);
+        // Moving the clock moves every later error by as much.
+        self.smoothed -= correction;
+        correction
+    }
 }
 
 impl Playback {
@@ -1177,6 +1292,7 @@ impl Playback {
             duration,
             last_pts: start - 1.0 / fps,
             clock_start: None,
+            sync: AudioSync::default(),
             paused_at: None,
             stats: PlayStats::default(),
         }
@@ -1354,6 +1470,8 @@ impl Playback {
                 if let Some(start) = &mut self.clock_start {
                     *start += now - at;
                 }
+                // The sound restarts with a fresh buffer: follow it closely again.
+                self.sync.restart(now);
             }
             None => self.paused_at = Some(now),
         }
@@ -1437,6 +1555,7 @@ impl Playback {
             if self.clock_start.is_none() {
                 // The first frame starts the clock: it is due exactly now.
                 self.clock_start = Some(now - (pts * 1e9) as i64);
+                self.sync.restart(now);
                 if let Some(at) = &mut self.paused_at {
                     *at = now;
                 }
@@ -1476,12 +1595,7 @@ impl Playback {
         const DISPLAY_LEAD: f64 = 0.02;
         let video = (now - *start) as f64 / 1e9;
         let error = video - (heard + DISPLAY_LEAD);
-        let correction = if error.abs() > 0.25 {
-            error
-        } else {
-            error * 0.1
-        };
-        *start += (correction * 1e9) as i64;
+        *start += (self.sync.correction(now, error) * 1e9) as i64;
     }
 
     /// How the last seek (or the start) went, once its frame was decoded.

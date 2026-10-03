@@ -46,6 +46,10 @@ pub struct FrameTiming {
     missed: u64,
     last_display: Option<i64>,
     uploads: u64,
+    /// Decoded pictures never shown (a later one was already due)…
+    skipped: u64,
+    /// …counted from the player's running total.
+    skipped_total: Option<u64>,
     /// Loop time per frame (all phases but the wait), worst case.
     busy_max: f64,
     busy: f64,
@@ -72,8 +76,13 @@ impl FrameTiming {
     }
 
     /// Ends a frame shown at `display` (ns) with `period` between displays.
-    pub fn frame(&mut self, display: i64, period: i64, uploaded: bool) {
+    /// `skipped_total`: the player's count of pictures passed over.
+    pub fn frame(&mut self, display: i64, period: i64, uploaded: bool, skipped_total: u64) {
         self.since.get_or_insert_with(Instant::now);
+        if let Some(before) = self.skipped_total {
+            self.skipped += skipped_total.saturating_sub(before);
+        }
+        self.skipped_total = Some(skipped_total);
         if let Some(last) = self.last_display
             && period > 0
         {
@@ -114,18 +123,20 @@ impl FrameTiming {
         let seconds = self.since.map_or(0.0, |s| s.elapsed().as_secs_f64());
         eprintln!(
             "Timing: frames {} in {:.1} s ({:.0} Hz), {} display periods missed, {} pictures \
-             uploaded; ms mean/max: {}; loop work max {:.1} ms",
+             uploaded, {} skipped; ms mean/max: {}; loop work max {:.1} ms",
             self.frames,
             seconds,
             1e9 / period.max(1) as f64,
             self.missed,
             self.uploads,
+            self.skipped,
             phases.join(", "),
             self.busy_max,
         );
         *self = Self {
             last_display: self.last_display,
             previous: self.previous,
+            skipped_total: self.skipped_total,
             ..Self::default()
         };
     }
@@ -133,6 +144,7 @@ impl FrameTiming {
     /// Forgets the last display time (after a pause in rendering).
     pub fn restart(&mut self) {
         self.last_display = None;
+        self.skipped_total = None;
     }
 }
 
