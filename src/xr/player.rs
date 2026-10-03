@@ -136,6 +136,19 @@ mod tests {
         let mut s = situation(110.0, 100.0);
         s.key_before = Some(95.0);
         assert_eq!(plan_seek(&s), SeekPlan::Exact);
+        // The hardware decoder catches up fast enough to stay exact,
+        // and to decode on further.
+        s.key_after = Some(112.0);
+        s.hardware = true;
+        assert_eq!(plan_seek(&s), SeekPlan::Exact);
+        s.decoded = Some(100.5);
+        assert_eq!(plan_seek(&s), SeekPlan::Continue);
+        s.decoded = None;
+        // ...but long jumps still land on a keyframe.
+        s.target = 700.0;
+        s.key_before = Some(695.0);
+        s.key_after = Some(701.0);
+        assert_eq!(plan_seek(&s), SeekPlan::Keyframe(701.0));
     }
 
     #[test]
@@ -373,28 +386,36 @@ pub struct SeekSituation {
     pub key_before: Option<f64>,
     pub key_after: Option<f64>,
     pub resume: bool,
+    /// Decoding on the hardware decoder, which catches up quickly.
+    pub hardware: bool,
 }
 
 /// Jumps at least this long land on the nearest keyframe (see `SeekPlan::Keyframe`).
 pub const KEYFRAME_SEEK_FROM: f64 = 60.0;
-/// Shorter jumps are exact unless their keyframe is further than this before
-/// the target: then decoding up to it would take too long on the headset's
-/// CPU (a 10 s GOP of 4K HEVC is 240 frames).
+/// Shorter jumps are exact unless, decoding on the CPU, their keyframe is
+/// further than this before the target: decoding up to it would take too long
+/// (a 10 s GOP of 4K HEVC is 240 frames, ~0.7 s on the headset even skipping
+/// non-reference frames). The hardware decoder runs 40-75x real time.
 const EXACT_GAP: f64 = 3.0;
 
 pub fn plan_seek(s: &SeekSituation) -> SeekPlan {
     // An index still being built while reading (Matroska before its first
     // seek) knows no keyframe after the target, and may miss some before it.
-    // Decoding on is as slow as an exact jump beyond `EXACT_GAP`.
+    // On the CPU, decoding on is as slow as an exact jump beyond `EXACT_GAP`.
+    let reach = if s.hardware {
+        KEYFRAME_SEEK_FROM
+    } else {
+        EXACT_GAP
+    };
     if let (Some(decoded), Some(key), Some(_)) = (s.decoded, s.key_before, s.key_after)
         && decoded < s.target
-        && s.target - decoded <= EXACT_GAP
+        && s.target - decoded <= reach
         && key <= decoded
     {
         return SeekPlan::Continue;
     }
     let jump = s.target - s.from;
-    let exact_is_quick = s.key_before.is_none_or(|key| s.target - key <= EXACT_GAP);
+    let exact_is_quick = s.hardware || s.key_before.is_none_or(|key| s.target - key <= EXACT_GAP);
     if !s.resume && jump.abs() < KEYFRAME_SEEK_FROM && exact_is_quick {
         return SeekPlan::Exact;
     }
@@ -533,6 +554,7 @@ fn spawn_decoder(
         .spawn(move || {
             let (mut generation, mut start) = (0u64, start);
             let opened = decoder.requested_at;
+            let hardware = decoder.stats().hw_backend.is_some();
             let mut catchup = Some(Catchup::new(
                 0,
                 start,
@@ -551,6 +573,8 @@ fn spawn_decoder(
             // Time of the last frame decoded since the last jump.
             let mut decoded: Option<f64> = None;
             let mut preview_pending = false;
+            // Where the last jump went (the start, until the first frame, of a keyframe jump).
+            let mut aim = start;
             'decode: loop {
                 // Before seeks: the seek that follows a switch restarts the new track.
                 while let Ok(track) = audio_changes.try_recv() {
@@ -573,6 +597,7 @@ fn spawn_decoder(
                         key_before: decoder.keyframe(request.target, false),
                         key_after: decoder.keyframe(request.target, true),
                         resume: request.resume,
+                        hardware,
                     });
                     let how = match plan {
                         _ if request.resume => "resume",
@@ -620,6 +645,7 @@ fn spawn_decoder(
                     generation = request.generation;
                     // A keyframe jump starts at the first frame, whatever its time.
                     start = if keyframe { f64::NEG_INFINITY } else { to };
+                    aim = to;
                 }
                 while let Ok(track) = subtitle_changes.try_recv() {
                     embedded_cues.lock().expect("cues").clear();
@@ -643,8 +669,10 @@ fn spawn_decoder(
                         c.report.first_decoded = frame.pts();
                     }
                     if start == f64::NEG_INFINITY {
-                        start = frame.pts().map_or(0.0, |t| t - 1e-3);
+                        start = frame.pts().map_or(aim, |t| t - 1e-3);
                     }
+                } else if start == f64::NEG_INFINITY {
+                    start = aim; // ended or failed before any frame
                 }
                 let cues = decoder.take_subtitles();
                 if !cues.is_empty() {
