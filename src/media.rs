@@ -517,6 +517,7 @@ unsafe extern "C" {
     ) -> *mut RawDecoder;
     fn jv_decoder_next(decoder: *mut RawDecoder, frame: *mut RawFrame) -> c_int;
     fn jv_decoder_seek(decoder: *mut RawDecoder, seconds: f64) -> c_int;
+    fn jv_decoder_reopen_video(decoder: *mut RawDecoder) -> c_int;
     fn jv_decoder_skip_nonref_until(decoder: *mut RawDecoder, seconds: f64);
     fn jv_decoder_keyframe(decoder: *mut RawDecoder, seconds: f64, after: c_int) -> f64;
     fn jv_frame_release(handle: *mut c_void);
@@ -859,6 +860,22 @@ impl VideoDecoder {
             0 => Ok(()),
             code => bail!("Seek failed (FFmpeg error {code})"),
         }
+    }
+
+    /// Replaces a failed hardware video decoder with a new one, or with
+    /// software decoding if the device won't open. Seek afterwards.
+    pub fn reopen_video(&mut self) -> anyhow::Result<()> {
+        let code = unsafe { jv_decoder_reopen_video(self.raw) };
+        if code < 0 {
+            bail!("Reopening the decoder failed (FFmpeg error {code})");
+        }
+        if code == 0 && self.hardware {
+            self.hardware = false;
+            HARDWARE_DECODERS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            self.stats.hw_backend = None;
+            self.stats.note = Some("Hardware decoder failed; decoding on the CPU".into());
+        }
+        Ok(())
     }
 }
 

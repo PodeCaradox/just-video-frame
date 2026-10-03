@@ -92,6 +92,7 @@ JVDecoder *jv_decoder_open(JVMedia *media, const char *hw_backend, int allow_sof
 // unsupported pixel format, other negative AVERROR on failure.
 int jv_decoder_next(JVDecoder *decoder, JVFrame *frame);
 int jv_decoder_seek(JVDecoder *decoder, double seconds);
+int jv_decoder_reopen_video(JVDecoder *decoder);
 // While catching up after a seek, skip non-reference frames of packets before
 // `seconds` (they would be discarded anyway); <= 0 turns it off.
 void jv_decoder_skip_nonref_until(JVDecoder *decoder, double seconds);

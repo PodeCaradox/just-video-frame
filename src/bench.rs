@@ -92,6 +92,8 @@ pub struct Options {
     /// renderer's upload does.
     pub play: Option<f64>,
     pub hz: f64,
+    /// While playing: jump +5 s this often (seconds), like D-pad presses.
+    pub jump_every: Option<f64>,
 }
 
 /// Steady playback, as the headset's frame loop sees it.
@@ -118,6 +120,10 @@ pub struct PlayReport {
     /// `advance` (frame selection), excluding the copy.
     pub advance_ms_mean: f64,
     pub advance_ms_max: f64,
+    /// +5 s jumps made while playing (`jump_every`).
+    pub jumps: u64,
+    /// Why playback stopped early.
+    pub error: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -162,7 +168,12 @@ fn copy_frame(frame: &crate::media::Frame, staging: &mut Vec<u8>) -> usize {
 }
 
 /// Plays for `seconds` in real time, ticking at `hz` like the frame loop.
-fn play_steady(playback: &mut Playback, seconds: f64, hz: f64) -> PlayReport {
+fn play_steady(
+    playback: &mut Playback,
+    seconds: f64,
+    hz: f64,
+    jump_every: Option<f64>,
+) -> PlayReport {
     let period = Duration::from_secs_f64(1.0 / hz);
     let clock = Instant::now();
     let mut staging = Vec::new();
@@ -175,7 +186,15 @@ fn play_steady(playback: &mut Playback, seconds: f64, hz: f64) -> PlayReport {
     let skipped_before = playback.stats.skipped_frames;
     let first_time = playback.media_time(now_ns());
     let mut next_tick = Instant::now();
+    let mut next_jump = jump_every.map(|s| clock + Duration::from_secs_f64(s));
     while clock.elapsed().as_secs_f64() < seconds {
+        if let (Some(at), Some(every)) = (next_jump, jump_every)
+            && Instant::now() >= at
+        {
+            playback.seek(playback.position() + 5.0);
+            r.jumps += 1;
+            next_jump = Some(at + Duration::from_secs_f64(every));
+        }
         let now = now_ns();
         let tick = Instant::now();
         let changed = playback.advance(now);
@@ -201,7 +220,8 @@ fn play_steady(playback: &mut Playback, seconds: f64, hz: f64) -> PlayReport {
         if tick.elapsed() > period {
             r.over_budget_ticks += 1;
         }
-        if playback.error.is_some() {
+        if let Some(e) = &playback.error {
+            r.error = Some(e.to_string());
             break;
         }
         next_tick += period;
@@ -349,7 +369,12 @@ pub fn run(input: Input, options: &Options) -> anyhow::Result<Report> {
         }
         // Settle in before measuring.
         play_for(&mut playback, Duration::from_secs(2));
-        play = Some(play_steady(&mut playback, seconds, options.hz));
+        play = Some(play_steady(
+            &mut playback,
+            seconds,
+            options.hz,
+            options.jump_every,
+        ));
     } else if first_frame_ms.is_some() && options.resume.is_none() {
         let from = options.from.min(duration * 0.5);
         let mut jump = |playback: &mut Playback, label: &str, target: f64| {
@@ -441,6 +466,12 @@ pub fn summary(r: &Report) -> String {
             p.advance_ms_mean,
             p.advance_ms_max,
         );
+        if p.jumps > 0 {
+            out += &format!("{} jumps of +5 s while playing\n", p.jumps);
+        }
+        if let Some(e) = &p.error {
+            out += &format!("stopped: {e}\n");
+        }
         return out;
     }
     out += "jump                         target   shown preview  how       keyframe gap  discarded  read\n";

@@ -579,6 +579,46 @@ fail:
     return NULL;
 }
 
+// Replaces a failed V4L2 video decoder with a new one (the file, audio and
+// subtitle state stay); falls back to the CPU if the device won't open.
+// Returns 1 when the new decoder is the hardware one, 0 for software, < 0 on failure.
+int jv_decoder_reopen_video(JVDecoder *d) {
+    if (!d->choice.hardware_wrapper) return AVERROR(ENOSYS);
+    AVStream *video = d->media->format->streams[d->media->video_stream];
+    const AVCodec *codec = d->ctx->codec;
+    // The old instance goes first: the driver counts every open session's load.
+    avcodec_free_context(&d->ctx);
+    for (int hardware = 1; hardware >= 0; --hardware) {
+        if (!hardware) codec = avcodec_find_decoder(video->codecpar->codec_id);
+        if (!codec) return AVERROR_DECODER_NOT_FOUND;
+        d->choice = (FormatChoice){ AV_PIX_FMT_NONE, 1, hardware };
+        d->ctx = avcodec_alloc_context3(codec);
+        if (!d->ctx) return AVERROR(ENOMEM);
+        int ret = avcodec_parameters_to_context(d->ctx, video->codecpar);
+        if (ret < 0) return ret;
+        d->ctx->pkt_timebase = video->time_base;
+        d->ctx->opaque = &d->choice;
+        d->ctx->get_format = choose_format;
+        d->ctx->thread_count = 0;
+        AVDictionary *options = NULL;
+        if (hardware) {
+            int64_t pixels = (int64_t)video->codecpar->width * video->codecpar->height;
+            av_dict_set_int(&options, "num_capture_buffers", pixels > 4096 * 2304 ? 6 : 12, 0);
+            av_dict_set_int(&options, "num_output_buffers", 16, 0);
+        }
+        ret = avcodec_open2(d->ctx, codec, &options);
+        av_dict_free(&options);
+        if (ret >= 0) {
+            d->skip_until = AV_NOPTS_VALUE;
+            d->flushing = 0;
+            return hardware;
+        }
+        avcodec_free_context(&d->ctx);
+        if (!hardware) return ret;
+    }
+    return AVERROR_BUG;
+}
+
 static int describe_frame(JVDecoder *d, AVFrame *frame, JVFrame *out) {
     AVStream *video = d->media->format->streams[d->media->video_stream];
     memset(out, 0, sizeof(*out));

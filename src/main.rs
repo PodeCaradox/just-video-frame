@@ -188,6 +188,9 @@ enum Command {
         /// Frame loop rate for `--play`.
         #[arg(long, default_value_t = 90.0)]
         hz: f64,
+        /// With `--play`: jump +5 s this often (seconds), like D-pad presses.
+        #[arg(long)]
+        jump_every: Option<f64>,
         /// Print the full report as JSON instead of a table.
         #[arg(long)]
         json: bool,
@@ -1308,6 +1311,7 @@ fn main() -> anyhow::Result<()> {
             rtt_ms,
             play,
             hz,
+            jump_every,
             json,
             read_ahead,
         } => {
@@ -1340,6 +1344,7 @@ fn main() -> anyhow::Result<()> {
                     random,
                     play,
                     hz,
+                    jump_every,
                 },
             )?;
             if json {

@@ -664,6 +664,9 @@ struct StaleFrames {
     key: Option<f64>,
 }
 
+/// Restarts of the hardware decoder after it fails at a jump, before giving up.
+const MAX_RESTARTS: u32 = 3;
+
 /// Never drop more than this many frames as stale (the decoder holds ~20).
 const MAX_STALE: u32 = 64;
 
@@ -762,7 +765,7 @@ fn spawn_decoder(
         .spawn(move || {
             let (mut generation, mut start) = (0u64, start);
             let opened = decoder.requested_at;
-            let hardware = decoder.stats().hw_backend.is_some();
+            let mut hardware = decoder.stats().hw_backend.is_some();
             let mut catchup = Some(Catchup::new(
                 0,
                 start,
@@ -785,6 +788,8 @@ fn spawn_decoder(
             let mut stale: Option<StaleFrames> = None;
             // Where the last jump went (the start, until the first frame, of a keyframe jump).
             let mut aim = start;
+            // Restarts tried after the hardware decoder failed to restart at a jump.
+            let mut restarts = 0;
             'decode: loop {
                 // Before seeks: the seek that follows a switch restarts the new track.
                 while let Ok(track) = audio_changes.try_recv() {
@@ -867,6 +872,7 @@ fn spawn_decoder(
                     // A keyframe jump starts at the first frame, whatever its time.
                     start = if keyframe { f64::NEG_INFINITY } else { to };
                     aim = to;
+                    restarts = 0;
                 }
                 while let Ok(track) = subtitle_changes.try_recv() {
                     embedded_cues.lock().expect("cues").clear();
@@ -877,10 +883,44 @@ fn spawn_decoder(
                 if stop.load(Ordering::Relaxed) {
                     return;
                 }
-                let mut message = match decoder.next_frame() {
+                let mut message = 'failed: {
+                    match decoder.next_frame() {
                     Ok(Some(frame)) => Decoded::Frame(generation, frame),
                     Ok(None) => Decoded::End(generation),
+                    // At a jump, the hardware decoder's driver sometimes refuses to
+                    // restart (iris: "current session not supported", then busy for
+                    // good): replace the decoder and jump again.
+                    Err(e) if hardware && restarts < MAX_RESTARTS => {
+                        restarts += 1;
+                        let began = Instant::now();
+                        let reopened = decoder.reopen_video();
+                        hardware = decoder.stats().hw_backend.is_some();
+                        let at = decoded.unwrap_or(aim);
+                        eprintln!(
+                            "Decoder failed ({e:#}); replaced in {:.0} ms ({}), continuing at {at:.1}s",
+                            began.elapsed().as_secs_f64() * 1e3,
+                            match &reopened {
+                                Ok(()) if hardware => "hardware".to_string(),
+                                Ok(()) => "software".to_string(),
+                                Err(e) => format!("{e:#}"),
+                            }
+                        );
+                        if reopened.is_err() {
+                            break 'failed Decoded::Failed(generation, format!("{e:#}"));
+                        }
+                        if let Err(e) = decoder.seek(at) {
+                            eprintln!("Seek to {at:.1}s failed: {e:#}");
+                        }
+                        // Frames up to `at` were already shown (or aimed past).
+                        if decoded.is_some() {
+                            start = at + 1e-3;
+                        }
+                        stale = None;
+                        decoded = None;
+                        continue 'decode;
+                    }
                     Err(e) => Decoded::Failed(generation, format!("{e:#}")),
+                    }
                 };
                 if let Decoded::Frame(_, frame) = &message {
                     if let Some(s) = &stale {
