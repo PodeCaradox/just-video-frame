@@ -7,6 +7,7 @@ use crate::media::{Frame, Matrix, PlaneLayout, Transfer};
 use anyhow::{Context, bail};
 use ash::vk;
 use openxr as xr;
+use std::cell::Cell;
 
 const SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/video.spv"));
 
@@ -37,6 +38,8 @@ struct Buffer {
     memory: vk::DeviceMemory,
     mapped: *mut u8,
     size: u64,
+    /// Properties of the memory type it was given.
+    flags: vk::MemoryPropertyFlags,
 }
 
 struct Texture {
@@ -100,7 +103,19 @@ pub struct Renderer {
     command: vk::CommandBuffer,
     fence: vk::Fence,
     pub eyes: Vec<EyeTarget>,
+    /// Time the last upload spent copying the picture into the staging buffer.
+    pub copy_ms: f64,
+    /// GPU timestamps: frame start, after the upload, after each eye.
+    queries: vk::QueryPool,
+    timestamp_ns: f64,
+    gpu_ms: Cell<[f64; 3]>,
+    /// A submission may still be running (its fence not yet waited for)…
+    in_flight: Cell<bool>,
+    /// …and it is a frame (with timestamps).
+    frame_in_flight: Cell<bool>,
 }
+
+const TIMESTAMPS: u32 = 4;
 
 fn find_memory(
     props: &vk::PhysicalDeviceMemoryProperties,
@@ -279,6 +294,16 @@ impl Renderer {
                     .command_buffer_count(1),
             )?[0];
             let fence = device.create_fence(&vk::FenceCreateInfo::default(), None)?;
+            let limits = ctx
+                .vk
+                .get_physical_device_properties(ctx.physical_device)
+                .limits;
+            let queries = device.create_query_pool(
+                &vk::QueryPoolCreateInfo::default()
+                    .query_type(vk::QueryType::TIMESTAMP)
+                    .query_count(TIMESTAMPS),
+                None,
+            )?;
 
             let mut renderer = Self {
                 device,
@@ -297,6 +322,7 @@ impl Renderer {
                     memory: vk::DeviceMemory::null(),
                     mapped: std::ptr::null_mut(),
                     size: 0,
+                    flags: vk::MemoryPropertyFlags::empty(),
                 },
                 adjust: [0.0, 1.0, 1.0, 0.0],
                 staging: None,
@@ -312,6 +338,12 @@ impl Renderer {
                 command,
                 fence,
                 eyes: Vec::new(),
+                copy_ms: 0.0,
+                queries,
+                timestamp_ns: limits.timestamp_period as f64,
+                gpu_ms: Cell::new([0.0; 3]),
+                in_flight: Cell::new(false),
+                frame_in_flight: Cell::new(false),
             };
             renderer.color = renderer.create_buffer(
                 size_of::<ColorParams>() as u64,
@@ -407,15 +439,15 @@ impl Renderer {
                 None,
             )?;
             let requirements = self.device.get_buffer_memory_requirements(buffer);
+            let memory_type = find_memory(
+                &self.memory_types,
+                requirements.memory_type_bits,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            )?;
             let memory = self.device.allocate_memory(
                 &vk::MemoryAllocateInfo::default()
                     .allocation_size(requirements.size)
-                    .memory_type_index(find_memory(
-                        &self.memory_types,
-                        requirements.memory_type_bits,
-                        vk::MemoryPropertyFlags::HOST_VISIBLE
-                            | vk::MemoryPropertyFlags::HOST_COHERENT,
-                    )?),
+                    .memory_type_index(memory_type),
                 None,
             )?;
             self.device.bind_buffer_memory(buffer, memory, 0)?;
@@ -428,6 +460,7 @@ impl Renderer {
                 memory,
                 mapped,
                 size,
+                flags: self.memory_types.memory_types[memory_type as usize].property_flags,
             })
         }
     }
@@ -499,6 +532,7 @@ impl Renderer {
     }
 
     fn begin_commands(&self) -> anyhow::Result<()> {
+        self.wait_gpu()?;
         unsafe {
             self.device
                 .reset_command_buffer(self.command, vk::CommandBufferResetFlags::empty())?;
@@ -520,8 +554,39 @@ impl Renderer {
                 &[vk::SubmitInfo::default().command_buffers(&commands)],
                 self.fence,
             )?;
+            self.in_flight.set(true);
+        }
+        self.wait_gpu()
+    }
+
+    /// Waits for the last submission (if any) to finish; after a frame, reads
+    /// its GPU times.
+    fn wait_gpu(&self) -> anyhow::Result<()> {
+        if !self.in_flight.get() {
+            return Ok(());
+        }
+        unsafe {
             self.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
             self.device.reset_fences(&[self.fence])?;
+        }
+        self.in_flight.set(false);
+        if self.frame_in_flight.replace(false) {
+            let mut stamps = [0u64; TIMESTAMPS as usize];
+            // Every query was written in that submission, which has finished.
+            let read = unsafe {
+                self.device.get_query_pool_results(
+                    self.queries,
+                    0,
+                    &mut stamps,
+                    vk::QueryResultFlags::TYPE_64,
+                )
+            };
+            self.gpu_ms.set(match read {
+                Ok(()) => std::array::from_fn(|i| {
+                    stamps[i + 1].saturating_sub(stamps[i]) as f64 * self.timestamp_ns / 1e6
+                }),
+                Err(_) => [0.0; 3],
+            });
         }
         Ok(())
     }
@@ -668,8 +733,19 @@ impl Renderer {
             if let Some(old) = self.staging.take() {
                 self.destroy_buffer(old);
             }
-            self.staging = Some(self.create_buffer(total, vk::BufferUsageFlags::TRANSFER_SRC)?);
+            let buffer = self.create_buffer(total, vk::BufferUsageFlags::TRANSFER_SRC)?;
+            eprintln!(
+                "Renderer: video {}x{} ({} MB per picture), staging memory {:?}, eyes {}x{}",
+                frame.width(),
+                frame.height(),
+                total / 1_000_000,
+                buffer.flags,
+                self.eyes[0].width,
+                self.eyes[0].height,
+            );
+            self.staging = Some(buffer);
         }
+        let copy_started = std::time::Instant::now();
         let staging = self.staging.as_ref().expect("staging buffer");
         let mut offset = 0usize;
         let mut regions = Vec::new();
@@ -688,6 +764,7 @@ impl Renderer {
             }
             regions.push(start as u64);
         }
+        self.copy_ms = copy_started.elapsed().as_secs_f64() * 1e3;
         let color = ColorParams {
             adjust: self.adjust,
             ..color_params(frame)
@@ -829,6 +906,16 @@ impl Renderer {
     /// Starts recording a frame; uploads `frame` first when it changed.
     pub fn begin_frame(&mut self, upload: Option<&Frame>) -> anyhow::Result<()> {
         self.begin_commands()?;
+        unsafe {
+            self.device
+                .cmd_reset_query_pool(self.command, self.queries, 0, TIMESTAMPS);
+            self.device.cmd_write_timestamp(
+                self.command,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                self.queries,
+                0,
+            );
+        }
         // Corrections change without a new frame (e.g. while paused).
         // SAFETY: the mapped uniform holds a whole ColorParams.
         if !self.color.mapped.is_null() {
@@ -840,6 +927,7 @@ impl Renderer {
         if let Some(frame) = upload {
             self.record_upload(frame)?;
         }
+        self.timestamp(1);
         Ok(())
     }
 
@@ -946,6 +1034,7 @@ impl Renderer {
             }
             self.device.cmd_end_render_pass(self.command);
         }
+        self.timestamp(2 + eye as u32);
     }
 
     /// Records a copy of an eye image for [`Renderer::take_screenshot`].
@@ -997,6 +1086,7 @@ impl Renderer {
         let Some(buffer) = &self.readback else {
             bail!("No readback recorded");
         };
+        self.wait_gpu()?;
         let (width, height) = (self.eyes[eye].width, self.eyes[eye].height);
         let mut pixels =
             unsafe { std::slice::from_raw_parts(buffer.mapped, (width * height * 4) as usize) }
@@ -1015,10 +1105,40 @@ impl Renderer {
         Ok(())
     }
 
-    /// Submits the recorded frame and waits for the GPU (swapchain images
-    /// must be finished before OpenXR releases them).
+    /// Submits the recorded frame without waiting for it: OpenXR waits for
+    /// the queue before it uses the swapchain images, and the next frame
+    /// waits before reusing the command buffer and staging memory. (Waiting
+    /// here cost most of a display period: the GPU runs our 2–3 ms of work
+    /// only after the compositor's.)
     pub fn end_frame(&self) -> anyhow::Result<()> {
-        self.submit_and_wait()
+        unsafe {
+            self.device.end_command_buffer(self.command)?;
+            self.device.queue_submit(
+                self.queue,
+                &[vk::SubmitInfo::default().command_buffers(&[self.command])],
+                self.fence,
+            )?;
+        }
+        self.in_flight.set(true);
+        self.frame_in_flight.set(true);
+        Ok(())
+    }
+
+    /// GPU time of the last finished frame: upload, then each eye (ms).
+    pub fn gpu_ms(&self) -> [f64; 3] {
+        self.gpu_ms.get()
+    }
+
+    /// Records GPU timestamp `index` once the work so far is done.
+    fn timestamp(&self, index: u32) {
+        unsafe {
+            self.device.cmd_write_timestamp(
+                self.command,
+                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                self.queries,
+                index,
+            );
+        }
     }
 }
 
@@ -1045,6 +1165,7 @@ impl Drop for Renderer {
                     memory: vk::DeviceMemory::null(),
                     mapped: std::ptr::null_mut(),
                     size: 0,
+                    flags: vk::MemoryPropertyFlags::empty(),
                 },
             );
             self.destroy_buffer(color);
@@ -1057,6 +1178,7 @@ impl Drop for Renderer {
                 }
             }
             self.device.destroy_fence(self.fence, None);
+            self.device.destroy_query_pool(self.queries, None);
             self.device.destroy_command_pool(self.command_pool, None);
             self.device.destroy_sampler(self.sampler, None);
             self.device
