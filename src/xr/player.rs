@@ -125,13 +125,18 @@ mod tests {
         assert_eq!(plan_seek(&s), SeekPlan::Keyframe(112.0));
         // Nearest would be behind where we are: take the other one.
         s.key_before = Some(99.0);
+        s.key_after = Some(115.0);
+        assert_eq!(plan_seek(&s), SeekPlan::Keyframe(115.0));
+        // ...but not one that makes +10 s a +20 s jump: exact.
         s.key_after = Some(130.0);
-        assert_eq!(plan_seek(&s), SeekPlan::Keyframe(130.0));
+        assert_eq!(plan_seek(&s), SeekPlan::Exact);
         // -10 s: the nearest keyframe is past where we are, so the one before.
         let mut s = situation(90.0, 100.0);
-        s.key_before = Some(80.0);
+        s.key_before = Some(86.0);
         s.key_after = Some(101.0);
-        assert_eq!(plan_seek(&s), SeekPlan::Keyframe(80.0));
+        assert_eq!(plan_seek(&s), SeekPlan::Keyframe(86.0));
+        s.key_before = Some(80.0);
+        assert_eq!(plan_seek(&s), SeekPlan::Exact);
         // No keyframe after the target known: exact.
         let mut s = situation(110.0, 100.0);
         s.key_before = Some(95.0);
@@ -159,9 +164,14 @@ mod tests {
         s.key_before = Some(98.0);
         s.key_after = Some(110.0);
         assert_eq!(plan_seek(&s), SeekPlan::Continue);
-        // Too far to decode on quickly (and to the keyframe before): snap.
-        s.target = 105.0;
+        // Too far to decode on quickly (and to the keyframe before): snap,
+        // unless that would overshoot a short jump by much.
+        s.target = 107.0;
+        s.from = 101.0;
         assert_eq!(plan_seek(&s), SeekPlan::Keyframe(110.0));
+        s.target = 105.0;
+        s.from = 100.5;
+        assert_eq!(plan_seek(&s), SeekPlan::Exact);
         s.target = 103.0;
         // An index that knows nothing past the target may be incomplete.
         s.key_after = None;
@@ -441,6 +451,11 @@ pub fn plan_seek(s: &SeekSituation) -> SeekPlan {
             } else {
                 key < s.from
             }
+        })
+        // A short jump must still feel like the jump asked for: +5 s may
+        // not land at +12 s.
+        .filter(|&key| {
+            jump.abs() >= KEYFRAME_SEEK_FROM || (key - s.target).abs() <= jump.abs() / 2.0
         })
         .map_or(SeekPlan::Exact, SeekPlan::Keyframe)
 }
@@ -1167,7 +1182,13 @@ impl Playback {
 
     /// Jumps to `seconds`; the current picture stays until the new one arrives.
     pub fn seek(&mut self, seconds: f64) {
-        let target = seconds.clamp(0.0, (self.duration - 0.5).max(0.0));
+        // An unknown length (0) must not turn every jump into one to the start.
+        let end = if self.duration > 0.0 {
+            (self.duration - 0.5).max(0.0)
+        } else {
+            f64::INFINITY
+        };
+        let target = seconds.clamp(0.0, end);
         let from = self.position();
         self.generation += 1;
         self.decode
