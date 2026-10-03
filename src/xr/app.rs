@@ -7,7 +7,7 @@ use super::player::{Placement, PlayOptions, PlayStats, Playback, ViewOptions, ey
 use super::renderer::{QuadTarget, Renderer};
 use crate::ui::canvas::Fonts;
 use crate::ui::navigator::Navigator;
-use crate::ui::{browser, captions, controls};
+use crate::ui::{browser, captions, controls, focus};
 use crate::vr::Projection;
 use anyhow::Context;
 use openxr as xr;
@@ -664,6 +664,14 @@ pub fn run(
     let mut controls_drawn: Option<(controls::State, controls::Hit)> = None;
     let mut press: Option<Press> = None;
     let mut browser_press: Option<BrowserPress> = None;
+    // D-pad focus on the browser panel (None: pointing), where the pointer was
+    // when it was last moved, and the place (crumbs, dialog, form) it is for.
+    let mut focus: Option<focus::Focus> = None;
+    let mut focus_pointer: Option<(f32, f32)> = None;
+    let mut focus_place: (Vec<String>, bool, bool) = Default::default();
+    // The same for a dialog open while playing: the focused button and its centre.
+    let mut dialog_focus: Option<(controls::Hit, (f32, f32))> = None;
+    let mut dialog_focus_pointer: Option<(f32, f32)> = None;
     // The control bar shows the page with every format.
     // The dialog open above the control bar, and what it last showed.
     let mut dialog: Option<controls::Dialog> = None;
@@ -760,6 +768,16 @@ pub fn run(
             buttons.back = false;
             controls_drawn = None;
         }
+        // B with a dialog open while playing: close it (one level back).
+        if buttons.back
+            && dialog.is_some()
+            && controls_panel_at.is_some()
+            && matches!(mode, Mode::Playing(_))
+        {
+            dialog = None;
+            dialog_drawn = None;
+            buttons.back = false;
+        }
         // Leaving playback: B, end of video, or --duration reached.
         let mut stop_playback = switch_video.is_some();
         if let Mode::Playing(playback) = &mut mode {
@@ -772,6 +790,7 @@ pub fn run(
         if stop_playback {
             set_phase(3);
             if let Mode::Playing(playback) = std::mem::replace(&mut mode, Mode::Browser) {
+                input.wait_for_dpad_release();
                 save_resume(playing_key.as_ref(), &playback);
                 stats.displayed_frames += playback.stats.displayed_frames;
                 stats.uploaded_frames += playback.stats.uploaded_frames;
@@ -843,6 +862,7 @@ pub fn run(
                     dialog = None;
                     caption_edit = false;
                     mode = Mode::Playing(Box::new(playback));
+                    input.wait_for_dpad_release();
                     ctx.frame_stream
                         .end(state.predicted_display_time, ctx.blend_mode, &[])?;
                     continue;
@@ -851,7 +871,49 @@ pub fn run(
                 let hit = point.map_or(browser::Hit::Nothing, |(x, y)| {
                     browser::hit(nav.view(), &mut fonts, x, y)
                 });
-                if buttons.select[active_hand]
+                // D-pad: move the focus (the first press shows it). Pointing
+                // somewhere else hands control back to the pointer.
+                let view = nav.view();
+                let place = (
+                    view.crumbs.clone(),
+                    view.dialog.is_some(),
+                    view.form.is_some(),
+                );
+                if let Some(dir) = focus::Dir::from_steps(buttons.seek, buttons.volume) {
+                    focus = match focus {
+                        Some(f) if place == focus_place && focus::valid(view, &mut fonts, &f) => {
+                            Some(focus::step(view, &mut fonts, f, dir))
+                        }
+                        Some(f) if place == focus_place => focus::refind(view, &mut fonts, &f),
+                        _ => focus::initial(view, &mut fonts),
+                    };
+                    focus_pointer = point;
+                    focus_place = place;
+                } else if focus.is_some() {
+                    let moved = match (point, focus_pointer) {
+                        (Some(a), Some(b)) => (a.0 - b.0).hypot(a.1 - b.1) > FOCUS_POINTER_MOVE,
+                        (a, b) => a.is_some() != b.is_some(),
+                    };
+                    if moved {
+                        focus = None;
+                    } else if place != focus_place {
+                        // Into a folder, a dialog or a form: start over there.
+                        focus = focus::initial(view, &mut fonts);
+                        focus_place = place;
+                    } else if let Some(f) = focus.filter(|f| !focus::valid(view, &mut fonts, f)) {
+                        focus = focus::refind(view, &mut fonts, &f);
+                    }
+                }
+                if let Some(scroll) = focus.and_then(|f| focus::scroll_to_show(nav.view(), &f)) {
+                    nav.set_scroll(scroll);
+                }
+                // A (or the trigger) clicks the focused item.
+                let focus_click = focus.filter(|_| buttons.select.iter().any(|&s| s));
+                if let Some(f) = focus_click {
+                    nav.click(f.hit);
+                }
+                if focus_click.is_none()
+                    && buttons.select[active_hand]
                     && browser_press.is_none()
                     && let Some((_, y)) = point
                 {
@@ -910,16 +972,19 @@ pub fn run(
                     let speed = if buttons.grip { 48.0 } else { 12.0 };
                     nav.scroll_by(-buttons.scroll * speed * dt);
                 }
-                if nav.take_dirty() || hovered != Some(hit) {
-                    hovered = Some(hit);
-                    let hover_point = match hit {
-                        browser::Hit::Nothing => None,
-                        _ => point,
+                // The focus is drawn as if pointed at.
+                let shown = focus.map_or(hit, |f| f.hit);
+                if nav.take_dirty() || hovered != Some(shown) {
+                    hovered = Some(shown);
+                    let hover_point = match (&focus, hit) {
+                        (Some(f), _) => focus::point_of(nav.view(), &mut fonts, f),
+                        (None, browser::Hit::Nothing) => None,
+                        (None, _) => point,
                     };
                     let canvas = browser::render(nav.view(), &mut fonts, hover_point, false);
                     renderer.upload_quad(target, &canvas.pixels)?;
                 }
-                if let Some((x, y)) = point {
+                if let Some((x, y)) = point.filter(|_| focus.is_none()) {
                     cursor_at = Some((BROWSER_PANEL, x, y));
                 }
                 set_phase(6);
@@ -983,6 +1048,43 @@ pub fn run(
                 } else {
                     bar_hit
                 };
+                // A dialog open: the D-pad moves between its buttons (instead of
+                // jumping and volume) and A clicks; pointing elsewhere ends that.
+                if dialog.is_some() && controls_panel_at.is_some() {
+                    let targets = controls::dialog_targets(&ui_state);
+                    let points: Vec<(f32, f32)> = targets.iter().map(|t| t.1).collect();
+                    let pointer = dialog_point.map(|(_, p)| p);
+                    // Still there after a change (another page): the nearest button.
+                    if let Some((hit, at)) = dialog_focus
+                        && !targets.iter().any(|t| t.0 == hit)
+                    {
+                        dialog_focus = focus::closest_point(&points, at).map(|i| targets[i]);
+                    }
+                    if let Some(dir) = focus::Dir::from_steps(buttons.seek, buttons.volume) {
+                        let next = match dialog_focus {
+                            Some((_, at)) => focus::nearest_point(&points, at, dir),
+                            // First press: the first button after Close.
+                            None => targets.iter().position(|t| t.0 != controls::Hit::Close),
+                        };
+                        if let Some(i) = next {
+                            dialog_focus = Some(targets[i]);
+                        }
+                        dialog_focus_pointer = pointer;
+                        buttons.seek = 0;
+                        buttons.volume = 0;
+                    } else if dialog_focus.is_some() {
+                        let moved = match (pointer, dialog_focus_pointer) {
+                            (Some(a), Some(b)) => (a.0 - b.0).hypot(a.1 - b.1) > FOCUS_POINTER_MOVE,
+                            (a, b) => a.is_some() != b.is_some(),
+                        };
+                        if moved {
+                            dialog_focus = None;
+                        }
+                    }
+                } else {
+                    dialog_focus = None;
+                }
+                let dialog_hit = dialog_focus.map_or(dialog_hit, |f| f.0);
 
                 // Controls act on release, so buttons with a long press can
                 // tell the two apart; the seek bar acts at once.
@@ -1001,7 +1103,12 @@ pub fn run(
                         control_press = None;
                     }
                 }
-                if buttons.select[active_hand] && press.is_none() && control_press.is_none() {
+                if let Some((hit, _)) = dialog_focus
+                    && buttons.select.iter().any(|&s| s)
+                {
+                    clicked = Some(hit);
+                } else if buttons.select[active_hand] && press.is_none() && control_press.is_none()
+                {
                     if control_point.is_some() {
                         if let controls::Hit::Seek(_) = control_hit {
                             clicked = Some(control_hit);
@@ -1496,6 +1603,9 @@ pub fn run(
     drop(renderer);
     Ok(stats)
 }
+
+/// Moving the pointer this far (panel pixels) ends D-pad focus.
+const FOCUS_POINTER_MOVE: f32 = 60.0;
 
 /// How long a jump notice stays up.
 const NOTICE: Duration = Duration::from_millis(1500);

@@ -70,6 +70,13 @@ const REPEAT_DELAY: i64 = 500_000_000;
 const REPEAT_EVERY: i64 = 250_000_000;
 
 impl Repeat {
+    /// A direction held now fires again only after it is let go.
+    fn wait_for_release(&mut self) {
+        if self.next.is_some() {
+            self.next = Some(i64::MAX);
+        }
+    }
+
     fn update(&mut self, held: bool, now: i64) -> bool {
         match self.next {
             _ if !held => {
@@ -413,6 +420,14 @@ impl Input {
         }
         state.volume = fired[2] as i32 - fired[3] as i32;
         Ok(state)
+    }
+
+    /// D-pad directions held now do nothing until let go (e.g. a jump held
+    /// while a video opens doesn't repeat into it).
+    pub fn wait_for_dpad_release(&mut self) {
+        for r in &mut self.repeats {
+            r.wait_for_release();
+        }
     }
 
     /// Logs the interaction profile the runtime chose for each hand (at

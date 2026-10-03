@@ -229,6 +229,11 @@ pub enum Hit {
     Nothing,
 }
 
+/// Canvas y where the list starts (below the header).
+pub fn list_top() -> f32 {
+    HEADER
+}
+
 pub fn visible_rows() -> f32 {
     (HEIGHT as f32 - HEADER - BOTTOM) / ROW
 }
@@ -243,7 +248,7 @@ impl View {
     }
 }
 
-type Rect = (f32, f32, f32, f32);
+pub type Rect = (f32, f32, f32, f32);
 
 fn inside((x, y, w, h): Rect, px: f32, py: f32) -> bool {
     px >= x && px <= x + w && py >= y && py <= y + h
@@ -341,6 +346,52 @@ fn action_rect(view: &View, i: usize, k: usize) -> Rect {
         actions[k].width(),
         h - 12.0,
     )
+}
+
+/// What the D-pad moves between besides the list's rows, with their
+/// rectangles: a form's fields and keys, a dialog's buttons (left to right),
+/// or the header's breadcrumbs and tools (left to right).
+pub fn fixed_targets(view: &View, fonts: &mut Fonts) -> Vec<(Hit, Rect)> {
+    if let Some(f) = &view.form {
+        return form::targets(f, WIDTH as f32)
+            .into_iter()
+            .map(|(h, r)| (Hit::Form(h), r))
+            .collect();
+    }
+    if let Some(dialog) = &view.dialog {
+        return dialog_buttons(dialog.buttons.len())
+            .into_iter()
+            .enumerate()
+            .map(|(i, r)| (Hit::DialogButton(i), r))
+            .collect();
+    }
+    // The last crumb is where we are: not a link.
+    let spans = crumb_spans(view, fonts);
+    let links = spans.len().saturating_sub(1);
+    let crumbs = spans
+        .into_iter()
+        .take(links)
+        .enumerate()
+        .map(|(i, (a, b))| (Hit::Crumb(i), (a - 8.0, 36.0, b - a + 16.0, 62.0)));
+    let tools = (0..view.tools.len()).map(|k| (Hit::Tool(k), tool_rect(view, k)));
+    crumbs.chain(tools).collect()
+}
+
+/// Row `i`'s targets, left to right: the row itself, its actions, its lock.
+pub fn row_targets(view: &View, i: usize) -> Vec<(Hit, Rect)> {
+    let Some(row) = view.rows.get(i) else {
+        return Vec::new();
+    };
+    let (x, y, _, h) = row_rect(view, i);
+    // The row: its label, left of any buttons.
+    let mut out = vec![(Hit::Row(i), (x, y, 400.0, h))];
+    for (k, action) in row.actions.iter().enumerate() {
+        out.push((Hit::RowAction(i, *action), action_rect(view, i, k)));
+    }
+    if row.lock.is_some() {
+        out.push((Hit::Lock(i), lock_rect(view, i)));
+    }
+    out
 }
 
 /// What the pointer at canvas pixel (x, y) would activate.

@@ -341,6 +341,15 @@ fn dialog_buttons(state: &State) -> Vec<(Hit, Rect, bool)> {
     out
 }
 
+/// The open dialog's usable buttons with their centres (for the D-pad).
+pub fn dialog_targets(state: &State) -> Vec<(Hit, (f32, f32))> {
+    dialog_buttons(state)
+        .into_iter()
+        .filter(|(_, _, enabled)| *enabled)
+        .map(|(hit, (x, y, w, h), _)| (hit, (x + w / 2.0, y + h / 2.0)))
+        .collect()
+}
+
 /// What the open dialog would do for a pointer at (x, y).
 pub fn dialog_hit(state: &State, x: f32, y: f32) -> Hit {
     dialog_buttons(state)

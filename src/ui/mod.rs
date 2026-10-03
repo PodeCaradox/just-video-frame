@@ -4,6 +4,7 @@ pub mod browser;
 pub mod canvas;
 pub mod captions;
 pub mod controls;
+pub mod focus;
 pub mod form;
 pub mod navigator;
 pub mod settings;

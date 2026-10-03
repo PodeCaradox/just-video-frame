@@ -157,7 +157,7 @@ fn rows(layer: Layer) -> [&'static str; 4] {
     }
 }
 
-type Rect = (f32, f32, f32, f32);
+pub type Rect = (f32, f32, f32, f32);
 
 fn keyboard_top(form: &Form) -> f32 {
     FIELD_Y + form.fields.len() as f32 * (FIELD_H + FIELD_GAP) + 24.0
@@ -258,6 +258,22 @@ fn caret_at(form: &Form, i: usize, x: f32, fonts: &mut Fonts) -> usize {
         left += w;
     }
     chars.len()
+}
+
+/// What the D-pad moves between: the fields (caret at the end) and the keys.
+pub fn targets(form: &Form, panel_width: f32) -> Vec<(Hit, Rect)> {
+    if form.busy.is_some() {
+        return Vec::new();
+    }
+    let fields = form
+        .fields
+        .iter()
+        .enumerate()
+        .map(|(i, f)| (Hit::Field(i, f.value.chars().count()), field_rect(i)));
+    let keys = keys(form, panel_width)
+        .into_iter()
+        .map(|(k, r)| (Hit::Key(k), r));
+    fields.chain(keys).collect()
 }
 
 pub fn hit(form: &Form, fonts: &mut Fonts, panel_width: f32, x: f32, y: f32) -> Hit {
