@@ -6,6 +6,9 @@
 # and the app starts "in the background". Steam only reads that flag at startup
 # and rewrites the file while running, so setting it needs one Steam restart:
 # FRAME_RESTART_STEAM=1 does that (the headset's interface restarts briefly).
+# Library art (assets/steam, made by `just-video steam-art`) goes into each
+# Steam user's config/grid on every run; the shortcut's icon field is only
+# edited while Steam is stopped, for the same reason as the VR flag.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 binary=target/aarch64-unknown-linux-gnu/release/just-video
@@ -16,6 +19,8 @@ ssh_opts=(-i "$HOME/.ssh/steam_frame_ed25519" -o IdentitiesOnly=yes -o BatchMode
 ssh "${ssh_opts[@]}" "$host" 'mkdir -p ~/Applications/JustVideo && cd ~/Applications/JustVideo &&
     { [ ! -f just-video ] || cp -p just-video just-video.prev; }'
 rsync -a -e "ssh ${ssh_opts[*]}" "$binary" "$host:Applications/JustVideo/just-video"
+rsync -a -e "ssh ${ssh_opts[*]}" scripts/steam-shortcut.py "$host:Applications/JustVideo/"
+rsync -a --delete -e "ssh ${ssh_opts[*]}" assets/steam/ "$host:Applications/JustVideo/art/"
 ssh "${ssh_opts[@]}" "$host" "RESTART_STEAM=${FRAME_RESTART_STEAM:-0} bash -s" <<'REMOTE'
 set -euo pipefail
 dir=$HOME/Applications/JustVideo
@@ -54,16 +59,28 @@ for path in glob.glob(os.path.expanduser("~/.local/share/Steam/userdata/*/config
         open(path, "wb").write(data)
 PY
 }
-if [ "$(openvr check x)" = 1 ]; then
+# Library art: copies it into config/grid; with --set-icon also sets the icon.
+art() {
+    python3 "$dir/steam-shortcut.py" "$dir/art" "$@" ||
+        echo "Warning: couldn't install the Steam library art." >&2
+}
+if [ "$(openvr check x)" = 1 ] && python3 "$dir/steam-shortcut.py" "$dir/art" --icon-ok; then
     :
 elif [ "$RESTART_STEAM" = 1 ]; then
-    echo "Restarting Steam to mark Just Video as a VR app…"
+    echo "Restarting Steam to mark Just Video as a VR app and set its icon…"
     steam -shutdown >/dev/null 2>&1 || true
     for _ in $(seq 60); do pgrep -x steam >/dev/null || break; sleep 1; done
     openvr set x >/dev/null
-    echo "Marked. Steam restarts on its own; if it doesn't, restart the headset."
-else
+    pgrep -x steam >/dev/null || art --set-icon >/dev/null
+    echo "Done. Steam restarts on its own; if it doesn't, restart the headset."
+elif [ "$(openvr check x)" != 1 ]; then
     echo "Note: Just Video isn't marked as a VR app yet, so it starts in the background."
     echo "      Run again with FRAME_RESTART_STEAM=1 to fix (restarts Steam once)."
+fi
+if pgrep -x steam >/dev/null; then
+    art
+    echo "Steam may need a restart to show new library art (FRAME_RESTART_STEAM=1 also sets its icon)."
+else
+    art --set-icon
 fi
 REMOTE
