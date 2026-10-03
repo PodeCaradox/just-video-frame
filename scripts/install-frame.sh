@@ -12,16 +12,21 @@ binary=target/aarch64-unknown-linux-gnu/release/just-video
 [ -x "$binary" ] || { echo "Build first: scripts/build-frame.sh" >&2; exit 1; }
 host=steamos@${FRAME_HOST:-frame.local}
 ssh_opts=(-i "$HOME/.ssh/steam_frame_ed25519" -o IdentitiesOnly=yes -o BatchMode=yes)
-ssh "${ssh_opts[@]}" "$host" 'mkdir -p ~/Applications/JustVideo'
+# The installed binary is kept as just-video.prev (to roll back: move it back).
+ssh "${ssh_opts[@]}" "$host" 'mkdir -p ~/Applications/JustVideo && cd ~/Applications/JustVideo &&
+    { [ ! -f just-video ] || cp -p just-video just-video.prev; }'
 rsync -a -e "ssh ${ssh_opts[*]}" "$binary" "$host:Applications/JustVideo/just-video"
 ssh "${ssh_opts[@]}" "$host" "RESTART_STEAM=${FRAME_RESTART_STEAM:-0} bash -s" <<'REMOTE'
 set -euo pipefail
 dir=$HOME/Applications/JustVideo
 launcher="$dir/Just Video"
-# Steam names the library entry after this file.
+# Steam names the library entry after this file. Messages go to just-video.log
+# (the previous run's to just-video.log.1): Steam doesn't keep them.
 cat > "$launcher" <<'SH'
 #!/bin/sh
-exec "$(dirname "$0")/just-video" "$@"
+dir=$(dirname "$0")
+[ -f "$dir/just-video.log" ] && mv -f "$dir/just-video.log" "$dir/just-video.log.1"
+exec "$dir/just-video" "$@" 2>>"$dir/just-video.log"
 SH
 chmod +x "$launcher" "$dir/just-video"
 if grep -rqs --text "Applications/JustVideo/Just Video" ~/.local/share/Steam/userdata/*/config/shortcuts.vdf; then
