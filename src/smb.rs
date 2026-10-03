@@ -127,6 +127,8 @@ pub struct Entry {
     pub name: String,
     pub is_dir: bool,
     pub size: u64,
+    /// Last write time (100 ns units since 1601), to notice changed files.
+    pub modified: u64,
 }
 
 /// One authenticated server connection plus the runtime that drives it.
@@ -138,6 +140,8 @@ pub struct SmbSession {
     url: SmbUrl,
     password: String,
     connected: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Longest a request may take, in ms (see `REQUEST_DEADLINE`).
+    deadline_ms: std::sync::atomic::AtomicU64,
 }
 
 /// Longest a browsing request may take. A request that never completes means
@@ -147,11 +151,12 @@ const REQUEST_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15)
 
 fn run_with_deadline<T>(
     runtime: &Runtime,
+    deadline: std::time::Duration,
     what: &str,
     future: impl std::future::Future<Output = anyhow::Result<T>>,
 ) -> anyhow::Result<T> {
     runtime
-        .block_on(async { tokio::time::timeout(REQUEST_DEADLINE, future).await })
+        .block_on(async { tokio::time::timeout(deadline, future).await })
         .map_err(|_| anyhow::anyhow!("The server did not answer ({what})"))?
 }
 
@@ -187,9 +192,10 @@ impl SmbSession {
             url,
             password,
             connected: Default::default(),
+            deadline_ms: (REQUEST_DEADLINE.as_millis() as u64).into(),
         };
         if session.url.share.is_empty() {
-            run_with_deadline(&runtime, "sign in", async {
+            run_with_deadline(&runtime, REQUEST_DEADLINE, "sign in", async {
                 Ok(session
                     .client()
                     .ipc_connect(
@@ -207,6 +213,18 @@ impl SmbSession {
         Ok(session)
     }
 
+    fn deadline(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.deadline_ms.load(Ordering::Relaxed))
+    }
+
+    /// Changes how long requests may take before the connection counts as
+    /// lost; `None` restores the default. Reads already open are unaffected.
+    pub fn set_deadline(&self, deadline: Option<std::time::Duration>) {
+        let deadline = deadline.unwrap_or(REQUEST_DEADLINE);
+        self.deadline_ms
+            .store(deadline.as_millis() as u64, Ordering::Relaxed);
+    }
+
     fn client(&self) -> &Client {
         self.client.as_ref().expect("client lives until drop")
     }
@@ -221,7 +239,7 @@ impl SmbSession {
             return Ok(());
         }
         let unc = self.url.unc(share, "")?;
-        run_with_deadline(&self.runtime, "open share", async {
+        run_with_deadline(&self.runtime, self.deadline(), "open share", async {
             Ok(self
                 .client()
                 .share_connect(&unc, &self.url.login_name(), self.password.clone())
@@ -235,7 +253,7 @@ impl SmbSession {
     /// Disk shares on the server, without administrative ones (`C$`, `IPC$`).
     pub fn shares(&self) -> anyhow::Result<Vec<String>> {
         let server = self.url.server();
-        let mut names = run_with_deadline(&self.runtime, "list shares", async {
+        let mut names = run_with_deadline(&self.runtime, self.deadline(), "list shares", async {
             if !self.connected.lock().expect("share set").contains("IPC$") {
                 self.client()
                     .ipc_connect(&server, &self.url.login_name(), self.password.clone())
@@ -283,7 +301,7 @@ impl SmbSession {
     pub fn list_in(&self, share: &str, path: &str) -> anyhow::Result<Vec<Entry>> {
         self.ensure_share(share)?;
         let unc = self.url.unc(share, path)?;
-        run_with_deadline(&self.runtime, "list folder", async {
+        run_with_deadline(&self.runtime, self.deadline(), "list folder", async {
             let access = DirAccessMask::new()
                 .with_list_directory(true)
                 .with_synchronize(true);
@@ -306,6 +324,7 @@ impl SmbSession {
                         name,
                         is_dir: item.file_attributes.directory(),
                         size: item.end_of_file,
+                        modified: *item.last_write_time,
                     });
                 }
             }
@@ -360,10 +379,20 @@ impl SmbSession {
         options: ReadAhead,
     ) -> anyhow::Result<SmbReader> {
         let first = sessions.first().context("No connection")?;
-        let (file, len) = first.open_file(share, path)?;
+        // Each open is a round trip (two before a share's first use): all at once.
+        let (opened, extra) = std::thread::scope(|scope| {
+            let extra: Vec<_> = sessions[1..]
+                .iter()
+                .map(|session| scope.spawn(move || (session, session.open_file(share, path))))
+                .collect();
+            let opened = first.open_file(share, path);
+            let extra: Vec<_> = extra.into_iter().filter_map(|h| h.join().ok()).collect();
+            (opened, extra)
+        });
+        let (file, len) = opened?;
         let mut source = SmbFile::single(file, Some(first.clone()));
-        for session in &sessions[1..] {
-            match session.open_file(share, path) {
+        for (session, opened) in extra {
+            match opened {
                 Ok((file, _)) => source.lanes.push(Lane {
                     file,
                     busy: Default::default(),
@@ -427,7 +456,7 @@ impl SmbSession {
     ) -> anyhow::Result<()> {
         self.ensure_share(share)?;
         let unc = self.url.unc(share, path)?;
-        run_with_deadline(&self.runtime, what, async {
+        run_with_deadline(&self.runtime, self.deadline(), what, async {
             let access = FileAccessMask::new()
                 .with_delete(true)
                 .with_synchronize(true);
@@ -450,7 +479,7 @@ impl SmbSession {
     fn open_file(&self, share: &str, path: &str) -> anyhow::Result<(File, u64)> {
         self.ensure_share(share)?;
         let unc = self.url.unc(share, path)?;
-        let file = run_with_deadline(&self.runtime, "open file", async {
+        let file = run_with_deadline(&self.runtime, self.deadline(), "open file", async {
             let args =
                 FileCreateArgs::make_open_existing(FileAccessMask::new().with_generic_read(true));
             let resource = self.client().create_file(&unc, &args).await?;

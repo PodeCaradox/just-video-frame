@@ -108,6 +108,15 @@ enum Command {
         /// Seeks per round while playing.
         #[arg(long, default_value_t = 0)]
         seeks: usize,
+        /// Forget what earlier runs probed (the probe cache) first.
+        #[arg(long)]
+        cold: bool,
+        /// Connect for playing ahead of time, as the browser does.
+        #[arg(long)]
+        warm: bool,
+        /// Open the first video while the folder is still being probed.
+        #[arg(long)]
+        click_at_once: bool,
     },
     /// Print the subtitles decoded while playing through a stretch of video.
     #[command(hide = true)]
@@ -492,6 +501,8 @@ fn main() -> anyhow::Result<()> {
                 "media": media.info(),
                 "layout": vr::detect(&input, video),
                 "playability": playability::assess(platform, video),
+                // What probing read: bytes, and jumps (each a round trip).
+                "read": media.io(),
             }))?;
         }
         Command::Play {
@@ -579,6 +590,9 @@ fn main() -> anyhow::Result<()> {
             folder,
             rounds,
             seeks,
+            cold,
+            warm,
+            click_at_once,
         } => {
             use just_video::library::{Library, Request, Response};
             use std::time::{Duration, Instant};
@@ -586,6 +600,9 @@ fn main() -> anyhow::Result<()> {
                 .into_iter()
                 .find(|s| s.name == server)
                 .ok_or_else(|| anyhow::anyhow!("No saved server {server}"))?;
+            if cold {
+                let _ = std::fs::remove_file(just_video::config::dir()?.join("probe-cache.json"));
+            }
             let library = Library::start(just_video::media::default_hw_backend());
             let path: Vec<String> = folder
                 .split('/')
@@ -619,26 +636,51 @@ fn main() -> anyhow::Result<()> {
             let Response::List { result, .. } = wait("list")? else {
                 anyhow::bail!("unexpected")
             };
-            let videos: Vec<String> = result
+            let listed: Vec<just_video::library::ProbeVideo> = result
                 .map_err(anyhow::Error::msg)?
                 .into_iter()
                 .filter(|e| !e.is_dir && just_video::ui::navigator::is_video(&e.name))
-                .map(|e| e.name)
+                .map(|e| just_video::library::ProbeVideo {
+                    name: e.name,
+                    size: e.size,
+                    modified: e.modified,
+                })
                 .collect();
+            let videos: Vec<String> = listed.iter().map(|v| v.name.clone()).collect();
             anyhow::ensure!(!videos.is_empty(), "No videos in that folder");
             for round in 0..rounds {
                 let name = &videos[round % videos.len()];
                 eprintln!("round {round}: {name}");
                 library.set_probe_generation(round as u64);
-                for v in &videos {
-                    let mut file = path.clone();
-                    file.push(v.clone());
-                    library.send(Request::Probe {
-                        generation: round as u64,
+                if warm {
+                    library.send(Request::Warm {
                         server: index.clone(),
                         share: share.clone(),
-                        path: file,
                     });
+                    // Unanswered; connecting takes ~25-115 ms.
+                    std::thread::sleep(Duration::from_secs(1));
+                }
+                library.send(Request::ProbeFolder {
+                    generation: round as u64,
+                    server: index.clone(),
+                    share: share.clone(),
+                    folder: path.clone(),
+                    videos: listed.clone(),
+                });
+                if round == 0 && !click_at_once {
+                    // Marking the folder alone, as when it is first shown.
+                    let started = Instant::now();
+                    let (mut marked, mut cached) = (0, 0);
+                    while marked < videos.len() {
+                        if let Response::Probe { cached: c, .. } = wait("probe")? {
+                            marked += 1;
+                            cached += c as usize;
+                        }
+                    }
+                    eprintln!(
+                        "Marked {marked} videos in {:.0} ms ({cached} from cache)",
+                        started.elapsed().as_secs_f64() * 1e3
+                    );
                 }
                 let mut file = path.clone();
                 file.push(name.clone());
@@ -693,6 +735,23 @@ fn main() -> anyhow::Result<()> {
                 }
                 eprintln!("  played {shown} frames, stopping");
                 just_video::xr::app::drop_in_background(playback);
+                if round == 0 && click_at_once {
+                    // Probes paused for the video carry on once it closes.
+                    let started = Instant::now();
+                    let mut marked = 0;
+                    while marked < videos.len() && started.elapsed() < Duration::from_secs(30) {
+                        match library.try_recv() {
+                            Some(Response::Probe { generation: 0, .. }) => marked += 1,
+                            Some(_) => {}
+                            None => std::thread::sleep(Duration::from_millis(5)),
+                        }
+                    }
+                    eprintln!(
+                        "Marked {marked} of {} videos after playback, in {:.0} ms",
+                        videos.len(),
+                        started.elapsed().as_secs_f64() * 1e3
+                    );
+                }
                 library.send(Request::List {
                     id: 2,
                     server: index.clone(),

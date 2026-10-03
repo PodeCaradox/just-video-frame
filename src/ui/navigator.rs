@@ -12,7 +12,7 @@ use super::browser::{Action, Dialog, Hit, Icon, Row, Tool, ToolIcon, View, forma
 use super::form::{self, Field, Form, Key};
 use super::settings::{self, Setting};
 use crate::config::{self, Server};
-use crate::library::{Library, Opened, Path, Request, Response, file_key};
+use crate::library::{Library, Opened, Path, ProbeVideo, Probed, Request, Response, file_key};
 use crate::playability::{Assessment, Verdict};
 use crate::smb::SmbUrl;
 use crate::vr::Layout;
@@ -154,11 +154,22 @@ pub struct Navigator {
     return_scroll: Option<f32>,
     next_id: u64,
     generation: u64,
+    /// This folder's listing and marking, for its `Timing:` line.
+    folder_timing: Option<FolderTiming>,
     dirty: bool,
     /// As last read or saved, for the Settings screen.
     prefs: config::Preferences,
     /// A setting changed since [`Navigator::take_preferences`].
     prefs_changed: bool,
+}
+
+/// How long a folder took to list and to mark its videos.
+struct FolderTiming {
+    requested: std::time::Instant,
+    listed_ms: f64,
+    videos: usize,
+    marked: usize,
+    cached: usize,
 }
 
 impl Navigator {
@@ -182,6 +193,7 @@ impl Navigator {
             return_scroll: None,
             next_id: 1,
             generation: 0,
+            folder_timing: None,
             dirty: true,
             prefs: config::Preferences::default(),
             prefs_changed: false,
@@ -369,6 +381,13 @@ impl Navigator {
                 path,
             } => {
                 self.set_status("Loading…");
+                self.folder_timing = Some(FolderTiming {
+                    requested: std::time::Instant::now(),
+                    listed_ms: 0.0,
+                    videos: 0,
+                    marked: 0,
+                    cached: 0,
+                });
                 self.library.send(Request::List {
                     id,
                     server,
@@ -496,6 +515,9 @@ impl Navigator {
 
     /// Handles worker results; returns a video ready to play.
     pub fn poll(&mut self) -> Option<Box<Opened>> {
+        // Marks arriving together (a cached folder's come all at once) are
+        // applied, and the rows rebuilt, once.
+        let mut marks = std::collections::HashMap::new();
         while let Some(response) = self.library.try_recv() {
             match response {
                 Response::Shares { id, result } if Some(id) == self.pending => {
@@ -525,6 +547,21 @@ impl Navigator {
                     };
                     match result {
                         Ok(entries) => {
+                            let videos: Vec<ProbeVideo> = entries
+                                .iter()
+                                .filter(|e| {
+                                    !e.is_dir && !e.name.starts_with('.') && is_video(&e.name)
+                                })
+                                .map(|e| ProbeVideo {
+                                    name: e.name.clone(),
+                                    size: e.size,
+                                    modified: e.modified,
+                                })
+                                .collect();
+                            if let Some(t) = &mut self.folder_timing {
+                                t.listed_ms = t.requested.elapsed().as_secs_f64() * 1e3;
+                                t.videos = videos.len();
+                            }
                             self.items = entries
                                 .into_iter()
                                 .filter(|e| !e.name.starts_with('.'))
@@ -547,17 +584,21 @@ impl Navigator {
                                     }
                                 })
                                 .collect();
-                            for item in &self.items {
-                                if let Item::Video { name, .. } = item {
-                                    let mut file = path.clone();
-                                    file.push(name.clone());
-                                    self.library.send(Request::Probe {
-                                        generation: self.generation,
-                                        server: server.clone(),
-                                        share: share.clone(),
-                                        path: file,
-                                    });
-                                }
+                            if videos.is_empty() {
+                                self.log_folder_timing();
+                            } else {
+                                // A video may be chosen next: connect for it now.
+                                self.library.send(Request::Warm {
+                                    server: server.clone(),
+                                    share: share.clone(),
+                                });
+                                self.library.send(Request::ProbeFolder {
+                                    generation: self.generation,
+                                    server,
+                                    share,
+                                    folder: path,
+                                    videos,
+                                });
                             }
                             self.view.status = if self.items.is_empty() {
                                 Some("This folder is empty.".into())
@@ -576,27 +617,16 @@ impl Navigator {
                     generation,
                     name,
                     result,
+                    cached,
                 } if generation == self.generation => {
-                    for item in &mut self.items {
-                        if let Item::Video {
-                            name: n,
-                            assessment,
-                            layout,
-                            broken,
-                            ..
-                        } = item
-                            && *n == name
-                        {
-                            match &result {
-                                Ok(p) => {
-                                    *assessment = Some(p.assessment.clone());
-                                    *layout = Some(p.layout);
-                                }
-                                Err(e) => *broken = Some(e.clone()),
-                            }
+                    if let Some(t) = &mut self.folder_timing {
+                        t.marked += 1;
+                        t.cached += cached as usize;
+                        if t.marked == t.videos {
+                            self.log_folder_timing();
                         }
                     }
-                    self.rebuild_rows();
+                    marks.insert(name, result);
                 }
                 Response::Opened { id, result } if Some(id) == self.pending => {
                     self.pending = None;
@@ -611,7 +641,10 @@ impl Navigator {
                                 [a.detail, a.hint].into_iter().flatten().collect(),
                             );
                         }
-                        Ok(opened) => return Some(opened),
+                        Ok(opened) => {
+                            self.apply_marks(marks);
+                            return Some(opened);
+                        }
                         Err(e) => self.dialog("Can't open this video", vec![e]),
                     }
                 }
@@ -656,7 +689,56 @@ impl Navigator {
                 _ => {} // stale response for a place we already left
             }
         }
+        self.apply_marks(marks);
         None
+    }
+
+    /// Shows probe results (by video name) in the list.
+    fn apply_marks(
+        &mut self,
+        mut marks: std::collections::HashMap<String, Result<Probed, String>>,
+    ) {
+        if marks.is_empty() {
+            return;
+        }
+        for item in &mut self.items {
+            if let Item::Video {
+                name,
+                assessment,
+                layout,
+                broken,
+                ..
+            } = item
+                && let Some(result) = marks.remove(name.as_str())
+            {
+                match result {
+                    Ok(p) => {
+                        *assessment = Some(p.assessment);
+                        *layout = Some(p.layout);
+                    }
+                    Err(e) => *broken = Some(e),
+                }
+            }
+        }
+        self.rebuild_rows();
+    }
+
+    /// Logs the folder just listed and marked: `Timing: folder …`.
+    fn log_folder_timing(&mut self) {
+        let Some(t) = self.folder_timing.take() else {
+            return;
+        };
+        let name = match &self.location {
+            Location::Folder { share, path, .. } => path.last().unwrap_or(share).clone(),
+            _ => return,
+        };
+        eprintln!(
+            "Timing: folder {name}: listed in {:.0} ms, {} videos marked in {:.0} ms ({} from cache)",
+            t.listed_ms,
+            t.videos,
+            t.requested.elapsed().as_secs_f64() * 1e3,
+            t.cached,
+        );
     }
 
     fn changes_done(&mut self) {
@@ -803,6 +885,13 @@ impl Navigator {
 
     /// Back from playing: outlines the video that played, and keeps it in view.
     pub fn playback_ended(&mut self) {
+        // The next video likely comes from the same folder.
+        if let Location::Folder { server, share, .. } = &self.location {
+            self.library.send(Request::Warm {
+                server: server.clone(),
+                share: share.clone(),
+            });
+        }
         self.came_from = self
             .playing
             .and_then(|i| self.items.get(i))
@@ -1294,6 +1383,53 @@ impl Navigator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A cached folder's marks all arrive at once: one rebuild, not one per video.
+    #[test]
+    fn a_big_cached_folder_is_marked_in_one_go() {
+        let (library, responses) = Library::detached();
+        let mut nav = Navigator::new(library);
+        let server = Server {
+            name: "nas".into(),
+            url: "smb://me@nas".into(),
+        };
+        nav.show_entries_for_test(server, &[]);
+        let names: Vec<String> = (0..2000).map(|i| format!("clip {i:04}.mp4")).collect();
+        nav.items = names
+            .iter()
+            .map(|n| Item::Video {
+                name: n.clone(),
+                size: 1,
+                assessment: None,
+                layout: None,
+                broken: None,
+            })
+            .collect();
+        let probed = Probed {
+            assessment: crate::playability::assess(crate::playability::Platform::SteamFrame, None),
+            layout: crate::vr::detect("clip.mp4", None),
+        };
+        for name in &names {
+            responses
+                .send(Response::Probe {
+                    generation: nav.generation,
+                    name: name.clone(),
+                    result: Ok(probed.clone()),
+                    cached: true,
+                })
+                .unwrap();
+        }
+        let started = std::time::Instant::now();
+        assert!(nav.poll().is_none());
+        let elapsed = started.elapsed();
+        assert!(nav.items.iter().all(
+            |i| matches!(i, Item::Video { assessment, layout, .. } if assessment.is_some() && layout.is_some())
+        ));
+        assert!(
+            elapsed < std::time::Duration::from_millis(250),
+            "took {elapsed:?}"
+        );
+    }
 
     #[test]
     fn video_extensions() {

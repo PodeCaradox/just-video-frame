@@ -60,6 +60,15 @@ fn read_json<T: for<'de> Deserialize<'de> + Default>(name: &str) -> anyhow::Resu
 
 /// Writes atomically; `private` files are created with mode 0600.
 fn write_json<T: Serialize>(name: &str, value: &T, private: bool) -> anyhow::Result<()> {
+    write_file(name, &serde_json::to_vec_pretty(value)?, private)
+}
+
+/// Writes a cache file (already serialized) atomically, next to the settings.
+pub(crate) fn write_cache(name: &str, bytes: &[u8]) -> anyhow::Result<()> {
+    write_file(name, bytes, false)
+}
+
+fn write_file(name: &str, bytes: &[u8], private: bool) -> anyhow::Result<()> {
     let dir = dir()?;
     std::fs::create_dir_all(&dir)?;
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
@@ -70,7 +79,7 @@ fn write_json<T: Serialize>(name: &str, value: &T, private: bool) -> anyhow::Res
         .create_new(true)
         .mode(if private { 0o600 } else { 0o644 })
         .open(&tmp)?;
-    file.write_all(&serde_json::to_vec_pretty(value)?)?;
+    file.write_all(bytes)?;
     file.sync_all()?;
     std::fs::rename(&tmp, dir.join(name))?;
     Ok(())
@@ -195,6 +204,11 @@ impl Default for ImageAdjust {
             rotation: 0,
         }
     }
+}
+
+/// Every saved override, by file key.
+pub fn layout_overrides() -> anyhow::Result<BTreeMap<String, LayoutOverride>> {
+    read_json("layouts.json")
 }
 
 pub fn layout_override(key: &str) -> anyhow::Result<Option<LayoutOverride>> {

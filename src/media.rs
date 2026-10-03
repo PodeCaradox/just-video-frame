@@ -1,7 +1,7 @@
 //! Safe wrapper over `native/media.c`: FFmpeg demux/decode over any `Read + Seek`.
 
 use anyhow::bail;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     ffi::{CStr, CString, c_char, c_int, c_void},
     io::{Read, Seek, SeekFrom},
@@ -258,7 +258,7 @@ fn optional(raw: &[c_char]) -> Option<String> {
     Some(text(raw)).filter(|s| !s.is_empty())
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct VideoInfo {
     pub codec: String,
     pub profile: Option<String>,
