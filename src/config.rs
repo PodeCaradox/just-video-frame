@@ -19,7 +19,27 @@ pub struct Server {
     pub url: String,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Per-test config directory, so tests never touch the real one (and
+    /// don't race each other through `XDG_CONFIG_HOME`).
+    static TEST_DIR: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Points this test thread's config at a fresh temporary directory.
+#[cfg(test)]
+pub(crate) fn temp_config(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("jv-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    TEST_DIR.with(|d| *d.borrow_mut() = Some(dir.clone()));
+    dir
+}
+
 pub fn dir() -> anyhow::Result<PathBuf> {
+    #[cfg(test)]
+    if let Some(dir) = TEST_DIR.with(|d| d.borrow().clone()) {
+        return Ok(dir);
+    }
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
@@ -229,6 +249,82 @@ struct Settings {
     favourite_formats: Option<Vec<Format>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     captions: Option<CaptionSettings>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    player: Option<Preferences>,
+}
+
+/// Choices made on the Settings screen, plus the volume (set with the D-pad).
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Preferences {
+    /// D-pad left/right (and a sideways stick flick), seconds.
+    pub short_jump: u32,
+    /// The same with the grip held, seconds.
+    pub long_jump: u32,
+    /// Volume, percent: 100 = as decoded, above that boosted (limited).
+    pub volume: u32,
+    /// D-pad up/down step, percent.
+    pub volume_step: u32,
+    /// Continue videos where they were left.
+    pub resume: bool,
+}
+
+/// Highest volume, percent (a boost for quiet videos).
+pub const MAX_VOLUME: u32 = 150;
+
+impl Default for Preferences {
+    fn default() -> Self {
+        Self {
+            short_jump: 5,
+            long_jump: 60,
+            volume: 100,
+            volume_step: 10,
+            resume: true,
+        }
+    }
+}
+
+impl Preferences {
+    /// Seconds a D-pad press jumps (`direction` -1 or +1); the grip makes it long.
+    pub fn jump(&self, direction: i32, long: bool) -> f64 {
+        let seconds = if long {
+            self.long_jump
+        } else {
+            self.short_jump
+        };
+        seconds.max(1) as f64 * direction.signum() as f64
+    }
+
+    /// The volume one D-pad step up (+1) or down (-1), on the step grid.
+    pub fn stepped_volume(&self, direction: i32) -> u32 {
+        let step = self.volume_step.clamp(1, 50) as i64;
+        let v = self.volume.min(MAX_VOLUME) as i64;
+        // Off-grid values (after changing the step) go to the neighbouring step.
+        let next = if direction > 0 {
+            (v / step + 1) * step
+        } else {
+            ((v + step - 1) / step - 1) * step
+        };
+        next.clamp(0, MAX_VOLUME as i64) as u32
+    }
+}
+
+pub fn preferences() -> Preferences {
+    read_json::<Settings>("settings.json")
+        .ok()
+        .and_then(|s| s.player)
+        .unwrap_or_default()
+}
+
+/// Changes the saved preferences: read, `change`, write, so other settings
+/// (and fields changed elsewhere) are kept. Returns the result.
+pub fn update_preferences(change: impl FnOnce(&mut Preferences)) -> anyhow::Result<Preferences> {
+    let mut settings: Settings = read_json("settings.json")?;
+    let mut prefs = settings.player.unwrap_or_default();
+    change(&mut prefs);
+    settings.player = Some(prefs);
+    write_json("settings.json", &settings, false)?;
+    Ok(prefs)
 }
 
 /// Subtitle size and position, the same for every video.
@@ -291,6 +387,59 @@ pub fn save_favourite_formats(formats: &[Format]) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn old_settings_files_still_parse() {
+        let old = r#"{"captions":{"scale":1.2,"raise":0.1}}"#;
+        let s: Settings = serde_json::from_str(old).unwrap();
+        assert_eq!(s.player, None);
+        assert_eq!(s.captions.unwrap().scale, 1.2);
+        let s: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(s.player.unwrap_or_default(), Preferences::default());
+        // A partial object (fields added later) fills in defaults.
+        let s: Settings = serde_json::from_str(r#"{"player":{"volume":70}}"#).unwrap();
+        let p = s.player.unwrap();
+        assert_eq!(p.volume, 70);
+        assert_eq!(p.short_jump, 5);
+        assert!(p.resume);
+    }
+
+    #[test]
+    fn preferences_round_trip_keeping_other_settings() {
+        let dir = temp_config("prefs");
+        assert_eq!(preferences(), Preferences::default());
+        save_caption_settings(CaptionSettings {
+            scale: 1.5,
+            raise: 0.0,
+        })
+        .unwrap();
+        update_preferences(|p| p.long_jump = 600).unwrap();
+        update_preferences(|p| p.volume = 80).unwrap();
+        let p = preferences();
+        assert_eq!((p.long_jump, p.volume), (600, 80));
+        assert_eq!(caption_settings().scale, 1.5);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn jumps_and_volume_steps() {
+        let mut p = Preferences::default();
+        assert_eq!(p.jump(-1, false), -5.0);
+        assert_eq!(p.jump(1, true), 60.0);
+        assert_eq!(p.stepped_volume(1), 110);
+        assert_eq!(p.stepped_volume(-1), 90);
+        p.volume = MAX_VOLUME;
+        assert_eq!(p.stepped_volume(1), MAX_VOLUME, "at most");
+        p.volume = 0;
+        assert_eq!(p.stepped_volume(-1), 0);
+        // Off the grid: to the neighbouring step.
+        p.volume = 75;
+        assert_eq!(p.stepped_volume(1), 80);
+        assert_eq!(p.stepped_volume(-1), 70);
+        p.volume_step = 5;
+        p.volume = 70;
+        assert_eq!(p.stepped_volume(-1), 65);
+    }
 
     #[test]
     fn resume_skips_start_and_end() {

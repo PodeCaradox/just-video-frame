@@ -139,11 +139,14 @@ struct AudioChunk {
     samples: Vec<f32>,
 }
 
+/// Highest volume level (1 = as decoded).
+const MAX_LEVEL: f32 = crate::config::MAX_VOLUME as f32 / 100.0;
+
 /// State shared with the audio thread.
 struct AudioShared {
     generation: AtomicU64,
     paused: AtomicBool,
-    /// Volume 0..=1 as f32 bits.
+    /// Volume 0..=1.5 as f32 bits (above 1: boosted, limited).
     volume: AtomicU32,
     /// Media time heard at an instant, for the current generation.
     clock: Mutex<Option<(u64, f64, Instant)>>,
@@ -175,6 +178,7 @@ fn spawn_audio(
             let channels = crate::audio::CHANNELS as usize;
             let rate = crate::audio::RATE as f64;
             let mut played_generation = 0;
+            let mut gain = crate::audio::Gain::default();
             while !stop.load(Ordering::Relaxed) {
                 let chunk = match chunks.recv_timeout(Duration::from_millis(50)) {
                     Ok(chunk) => chunk,
@@ -205,12 +209,7 @@ fn spawn_audio(
                     }
                     let end = (offset + slice).min(chunk.samples.len());
                     let level = f32::from_bits(shared.volume.load(Ordering::Relaxed));
-                    // Perceptual curve: bar steps sound evenly spaced.
-                    let gain = level * level;
-                    let scaled: Vec<f32> = chunk.samples[offset..end]
-                        .iter()
-                        .map(|s| s * gain)
-                        .collect();
+                    let scaled = gain.apply(&chunk.samples[offset..end], level);
                     if let Err(e) = out.write(&scaled) {
                         eprintln!("{e:#}");
                         return;
@@ -529,7 +528,7 @@ impl Playback {
             Arc::new(AudioShared {
                 generation: AtomicU64::new(0),
                 paused: AtomicBool::new(false),
-                volume: AtomicU32::new(volume.clamp(0.0, 1.0).to_bits()),
+                volume: AtomicU32::new(volume.clamp(0.0, MAX_LEVEL).to_bits()),
                 clock: Mutex::new(None),
             })
         });
@@ -724,7 +723,7 @@ impl Playback {
         if let Some(audio) = &self.audio {
             audio
                 .volume
-                .store(volume.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+                .store(volume.clamp(0.0, MAX_LEVEL).to_bits(), Ordering::Relaxed);
         }
     }
 
