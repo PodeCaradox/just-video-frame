@@ -348,13 +348,28 @@ mod tests {
     }
 
     #[test]
-    fn resume_lands_on_the_keyframe_before() {
+    fn resume_lands_on_a_nearby_keyframe_never_past_the_point_left() {
+        // Resuming is already rewound 3 s (`RESUME_REWIND`).
         let mut s = situation(1200.0, 0.0);
         s.resume = true;
-        s.key_before = Some(1195.0);
+        s.key_before = Some(1198.5);
         s.key_after = Some(1201.0);
-        assert_eq!(plan_seek(&s), SeekPlan::Keyframe(1195.0));
+        assert_eq!(plan_seek(&s), SeekPlan::Keyframe(1198.5));
+        // The keyframe before is far back: the one after, short of 1203 s.
+        s.key_before = Some(1195.0);
+        assert_eq!(plan_seek(&s), SeekPlan::Keyframe(1201.0));
+        // Both far (8K with 10 s between keyframes): the hardware decodes on
+        // to the target; the CPU would take seconds, so it starts earlier.
+        s.key_before = Some(1196.5);
+        s.key_after = Some(1206.5);
+        assert_eq!(plan_seek(&s), SeekPlan::Keyframe(1196.5));
+        s.hardware = true;
+        assert_eq!(plan_seek(&s), SeekPlan::Exact);
+        // ...unless that would take long too.
+        s.key_before = Some(1191.4);
+        assert_eq!(plan_seek(&s), SeekPlan::Keyframe(1191.4));
         // Only the start indexed so far (Matroska): exact.
+        s.hardware = false;
         s.key_before = Some(0.0);
         s.key_after = None;
         assert_eq!(plan_seek(&s), SeekPlan::Exact);
@@ -423,6 +438,66 @@ impl AudioShared {
     }
 }
 
+/// What the audio thread saw over a few seconds: `Timing: audio …` in the log.
+struct AudioWatch {
+    since: Instant,
+    writes: u32,
+    /// Writes made with less than `DRY` queued: the sound was about to stop.
+    dry: u32,
+    min_queued: f64,
+    queued_sum: f64,
+    /// Time spent waiting for decoded sound while playing (ms), and the longest wait.
+    starved_ms: f64,
+    longest_ms: f64,
+}
+
+impl AudioWatch {
+    const DRY: f64 = 0.015;
+
+    fn new() -> Self {
+        Self {
+            since: Instant::now(),
+            writes: 0,
+            dry: 0,
+            min_queued: f64::INFINITY,
+            queued_sum: 0.0,
+            starved_ms: 0.0,
+            longest_ms: 0.0,
+        }
+    }
+
+    fn wrote(&mut self, queued: f64) {
+        self.writes += 1;
+        self.dry += (queued < Self::DRY) as u32;
+        self.min_queued = self.min_queued.min(queued);
+        self.queued_sum += queued;
+    }
+
+    fn waited(&mut self, ms: f64) {
+        self.starved_ms += ms;
+        self.longest_ms = self.longest_ms.max(ms);
+    }
+
+    fn maybe_log(&mut self) {
+        if self.since.elapsed() < Duration::from_secs(5) {
+            return;
+        }
+        if self.writes > 0 {
+            eprintln!(
+                "Timing: audio {} writes, queued min {:.0} mean {:.0} ms, {} nearly dry; \
+                 waited for sound {:.0} ms (longest {:.0})",
+                self.writes,
+                self.min_queued * 1e3,
+                self.queued_sum / self.writes as f64 * 1e3,
+                self.dry,
+                self.starved_ms,
+                self.longest_ms,
+            );
+        }
+        *self = Self::new();
+    }
+}
+
 fn spawn_audio(
     name: String,
     chunks: mpsc::Receiver<AudioChunk>,
@@ -443,12 +518,23 @@ fn spawn_audio(
             let rate = crate::audio::RATE as f64;
             let mut played_generation = 0;
             let gain = crate::audio::Gain;
+            let mut watch = AudioWatch::new();
             while !stop.load(Ordering::Relaxed) {
+                watch.maybe_log();
+                let waiting = Instant::now();
                 let chunk = match chunks.recv_timeout(Duration::from_millis(50)) {
                     Ok(chunk) => chunk,
                     Err(mpsc::RecvTimeoutError::Timeout) => continue,
                     Err(mpsc::RecvTimeoutError::Disconnected) => return,
                 };
+                // Waiting while sound is queued and playing means it is running out.
+                let waited = waiting.elapsed().as_secs_f64() * 1e3;
+                if played_generation == chunk.generation
+                    && !shared.paused.load(Ordering::Relaxed)
+                    && waited > 1.0
+                {
+                    watch.waited(waited);
+                }
                 let Some(out) = output.as_mut() else { continue };
                 if chunk.generation != shared.generation.load(Ordering::Relaxed) {
                     continue; // from before a seek
@@ -472,6 +558,7 @@ fn spawn_audio(
                         continue;
                     }
                     let end = (offset + slice).min(chunk.samples.len());
+                    watch.wrote(out.latency());
                     let level = f32::from_bits(shared.volume.load(Ordering::Relaxed));
                     let scaled = gain.apply(&chunk.samples[offset..end], level);
                     if let Err(e) = out.write(&scaled) {
@@ -556,6 +643,15 @@ pub fn hardware_speed(video: &crate::media::VideoInfo) -> Option<f64> {
 /// A keyframe at most this far before the target is where a jump lands.
 const KEYFRAME_NEAR: f64 = 1.0;
 
+/// Resuming lands on a keyframe at most this far before the target; further
+/// back, it replays too much of what was already seen.
+const RESUME_NEAR: f64 = 2.0;
+
+/// Resuming decodes on from a keyframe at most this far before the target
+/// (on the hardware decoder): 8K decodes at ~1.8x real time, so this is a
+/// ~2 s wait on the keyframe.
+const RESUME_EXACT_GAP: f64 = 4.0;
+
 pub fn plan_seek(s: &SeekSituation) -> SeekPlan {
     // An index still being built while reading (Matroska before its first
     // seek) knows no keyframe after the target, and may miss some before it.
@@ -598,8 +694,22 @@ pub fn plan_seek(s: &SeekSituation) -> SeekPlan {
         return SeekPlan::Exact;
     };
     if s.resume {
-        // Never past the point left: it is already rewound a little.
-        return SeekPlan::Keyframe(before);
+        // A keyframe a little before the target, or after it but not past
+        // the point left (the target is already rewound that much).
+        if s.target - before <= RESUME_NEAR {
+            return SeekPlan::Keyframe(before);
+        }
+        if after - s.target <= super::app::RESUME_REWIND {
+            return SeekPlan::Keyframe(after);
+        }
+        // Keyframes far apart (10 s in some 8K videos): the hardware decodes
+        // on to the target, showing the keyframe meanwhile, if that's quick;
+        // otherwise replaying a few seconds beats a still picture.
+        return if s.hardware && s.target - before <= RESUME_EXACT_GAP {
+            SeekPlan::Exact
+        } else {
+            SeekPlan::Keyframe(before)
+        };
     }
     // The nearest keyframe that still moves the way the viewer asked.
     let nearest = if after - s.target < s.target - before {
@@ -664,8 +774,13 @@ struct StaleFrames {
     key: Option<f64>,
 }
 
-/// Restarts of the hardware decoder after it fails at a jump, before giving up.
+/// Restarts of the hardware decoder after it fails at a jump; the last one
+/// moves decoding to the CPU.
 const MAX_RESTARTS: u32 = 3;
+
+/// Shown when the hardware video decoder can't be used.
+pub const ON_CPU_NOTICE: &str = "Hardware video decoder unavailable: playing on the CPU. \
+                                 If this keeps happening, restart the headset.";
 
 /// Never drop more than this many frames as stale (the decoder holds ~20).
 const MAX_STALE: u32 = 64;
@@ -742,6 +857,60 @@ struct DecodeThread {
     subtitle_track: mpsc::Sender<Option<usize>>,
     /// Which audio track to play (a seek follows).
     audio_track: mpsc::Sender<usize>,
+    /// Set when the hardware decoder failed at a jump and the CPU took over.
+    moved_to_cpu: Arc<AtomicBool>,
+}
+
+/// Media time on screen at an instant, for the current generation; `None`
+/// while paused or before the clock starts. The decode thread reads it to
+/// notice falling behind.
+type ShownClock = Arc<Mutex<Option<(u64, f64, Instant)>>>;
+
+/// Decoding this late (seconds), frames no other frame needs are skipped for
+/// `CATCH_UP` seconds. (Late frames still go to the player, which shows the
+/// newest one due. The sound is read ~1 s ahead of the picture, so it
+/// keeps playing meanwhile.)
+const LATE: f64 = 0.0;
+/// This far behind, only keyframes are decoded until one past the clock: the
+/// picture would be visibly behind the sound. With keyframes seconds apart
+/// that freezes the picture, so only as a last resort.
+const FAR_BEHIND: f64 = 1.0;
+const CATCH_UP: f64 = 1.0;
+
+/// How decoding kept up over a few seconds: `Playback: decoding behind …`.
+struct Behind {
+    since: Instant,
+    /// Frames decoded late.
+    dropped: u32,
+    to_keyframe: u32,
+    worst: f64,
+}
+
+impl Behind {
+    fn new() -> Self {
+        Self {
+            since: Instant::now(),
+            dropped: 0,
+            to_keyframe: 0,
+            worst: 0.0,
+        }
+    }
+
+    fn maybe_log(&mut self) {
+        if self.since.elapsed() < Duration::from_secs(5) {
+            return;
+        }
+        if self.dropped > 0 {
+            eprintln!(
+                "Playback: decoding fell behind (up to {:.0} ms): {} late frames, \
+                 {} times keyframes only, to keep up with the sound",
+                self.worst * 1e3,
+                self.dropped,
+                self.to_keyframe
+            );
+        }
+        *self = Self::new();
+    }
 }
 
 fn spawn_decoder(
@@ -750,6 +919,7 @@ fn spawn_decoder(
     audio: Option<mpsc::Sender<AudioChunk>>,
     stop: Arc<AtomicBool>,
     embedded_cues: Arc<Mutex<Cues>>,
+    shown: ShownClock,
 ) -> DecodeThread {
     let (subtitle_track, subtitle_changes) = mpsc::channel::<Option<usize>>();
     let (audio_track, audio_changes) = mpsc::channel::<usize>();
@@ -760,6 +930,8 @@ fn spawn_decoder(
     let pending = requested.clone();
     let report = Arc::new(Mutex::new(None));
     let shared_report = report.clone();
+    let moved_to_cpu = Arc::new(AtomicBool::new(false));
+    let on_cpu = moved_to_cpu.clone();
     std::thread::Builder::new()
         .name("decode".into())
         .spawn(move || {
@@ -790,6 +962,11 @@ fn spawn_decoder(
             let mut aim = start;
             // Restarts tried after the hardware decoder failed to restart at a jump.
             let mut restarts = 0;
+            // Skipping to catch up is set until this media time, and whether
+            // it skips to a keyframe.
+            let mut catching_up_until = f64::NEG_INFINITY;
+            let mut to_keyframe = false;
+            let mut behind = Behind::new();
             'decode: loop {
                 // Before seeks: the seek that follows a switch restarts the new track.
                 while let Ok(track) = audio_changes.try_recv() {
@@ -845,7 +1022,7 @@ fn spawn_decoder(
                         _ => request.target,
                     };
                     if plan != SeekPlan::Continue {
-                        stale = hardware
+                        stale = (hardware && !decoder.seek_replaces_decoder())
                             .then_some(decoded)
                             .flatten()
                             .map(|old| StaleFrames {
@@ -858,6 +1035,15 @@ fn spawn_decoder(
                         let began = Instant::now();
                         if let Err(e) = decoder.seek(to) {
                             eprintln!("Seek to {to:.1}s failed: {e:#}");
+                        }
+                        // A seek may replace the decoder (H.264 on the hardware),
+                        // with the CPU's if the device won't open.
+                        let was_hardware = std::mem::replace(
+                            &mut hardware,
+                            decoder.stats().hw_backend.is_some(),
+                        );
+                        if was_hardware && !hardware {
+                            on_cpu.store(true, Ordering::Relaxed);
                         }
                         next.report.seek_ms = began.elapsed().as_secs_f64() * 1e3;
                         decoded = None;
@@ -888,13 +1074,17 @@ fn spawn_decoder(
                     Ok(Some(frame)) => Decoded::Frame(generation, frame),
                     Ok(None) => Decoded::End(generation),
                     // At a jump, the hardware decoder's driver sometimes refuses to
-                    // restart (iris: "current session not supported", then busy for
-                    // good): replace the decoder and jump again.
+                    // restart (iris: "current session not supported", then busy or
+                    // out of memory for good): replace the decoder and jump again,
+                    // the last time on the CPU rather than stop playing.
                     Err(e) if hardware && restarts < MAX_RESTARTS => {
                         restarts += 1;
                         let began = Instant::now();
-                        let reopened = decoder.reopen_video();
+                        let reopened = decoder.reopen_video(restarts < MAX_RESTARTS);
                         hardware = decoder.stats().hw_backend.is_some();
+                        if reopened.is_ok() && !hardware {
+                            on_cpu.store(true, Ordering::Relaxed);
+                        }
                         let at = decoded.unwrap_or(aim);
                         eprintln!(
                             "Decoder failed ({e:#}); replaced in {:.0} ms ({}), continuing at {at:.1}s",
@@ -994,6 +1184,35 @@ fn spawn_decoder(
                 } else {
                     preview_pending = false;
                 }
+                // Software decoding slower than the video (8K on the CPU):
+                // decode less, so the sound (decoded here too) keeps up.
+                behind.maybe_log();
+                if let Decoded::Frame(_, frame) = &message
+                    && !hardware
+                    && catchup.is_none()
+                    && let Some(pts) = frame.pts()
+                    && let Some((g, shown_at, at)) = *shown.lock().expect("shown clock")
+                    && g == generation
+                {
+                    let now = shown_at + at.elapsed().as_secs_f64();
+                    let lag = now - pts;
+                    if lag > LATE {
+                        behind.dropped += 1;
+                        behind.worst = behind.worst.max(lag);
+                        let far = lag > FAR_BEHIND;
+                        // A new catch-up, or skipping more when skipping less didn't do.
+                        if pts >= catching_up_until || (far && !to_keyframe) {
+                            catching_up_until = now + CATCH_UP;
+                            to_keyframe = far;
+                            if far {
+                                behind.to_keyframe += 1;
+                                decoder.skip_to_keyframe_after(now + CATCH_UP / 2.0);
+                            } else {
+                                decoder.skip_nonref_until(catching_up_until);
+                            }
+                        }
+                    }
+                }
                 let preview = matches!(message, Decoded::Preview(..));
                 let finished = !matches!(message, Decoded::Frame(..) | Decoded::Preview(..));
                 let mut message = Some(message);
@@ -1043,6 +1262,7 @@ fn spawn_decoder(
         requested,
         subtitle_track,
         audio_track,
+        moved_to_cpu,
     }
 }
 
@@ -1163,6 +1383,10 @@ pub struct Playback {
     clock_start: Option<i64>,
     paused_at: Option<i64>,
     sync: AudioSync,
+    /// What is on screen, for the decode thread (see [`ShownClock`]).
+    shown: ShownClock,
+    /// Video lead over the sound (seconds) since `.0`: count, sum, min, max.
+    sync_log: (Instant, u32, f64, f64, f64),
     pub stats: PlayStats,
 }
 
@@ -1282,6 +1506,7 @@ impl Playback {
         let fps = info.video.as_ref().map_or(30.0, |v| v.fps.max(1.0));
         let duration = info.duration_seconds;
         let stop = Arc::new(AtomicBool::new(false));
+        let shown: ShownClock = Default::default();
         let has_audio = decoder.enable_audio(crate::audio::RATE, crate::audio::CHANNELS);
         let audio_labels: Vec<String> = decoder
             .info()
@@ -1314,6 +1539,7 @@ impl Playback {
                 audio_tx,
                 stop.clone(),
                 embedded_cues.clone(),
+                shown.clone(),
             ),
             subtitle_tracks,
             subtitle,
@@ -1333,6 +1559,8 @@ impl Playback {
             last_pts: start - 1.0 / fps,
             clock_start: None,
             sync: AudioSync::default(),
+            sync_log: (Instant::now(), 0, 0.0, f64::INFINITY, f64::NEG_INFINITY),
+            shown,
             paused_at: None,
             stats: PlayStats::default(),
         }
@@ -1557,10 +1785,17 @@ impl Playback {
     /// Moves to the newest decoded frame due at `now`; true if it changed.
     pub fn advance(&mut self, now: i64) -> bool {
         if self.paused() && self.clock_start.is_some() {
+            *self.shown.lock().expect("shown clock") = None;
             return false;
+        }
+        if self.decode.moved_to_cpu.swap(false, Ordering::Relaxed) {
+            eprintln!("Playing on the CPU: the hardware decoder failed at a jump");
+            self.notice(ON_CPU_NOTICE.into(), Duration::from_secs(6));
         }
         self.sync_to_audio(now);
         let mut media_time = self.media_time(now);
+        *self.shown.lock().expect("shown clock") =
+            media_time.map(|t| (self.generation, t, Instant::now()));
         let mut changed = false;
         loop {
             if self.next.is_none() && !self.ended {
@@ -1636,6 +1871,18 @@ impl Playback {
         let video = (now - *start) as f64 / 1e9;
         let error = video - (heard + DISPLAY_LEAD);
         *start += (self.sync.correction(now, error) * 1e9) as i64;
+        let log = &mut self.sync_log;
+        (log.1, log.2, log.3, log.4) =
+            (log.1 + 1, log.2 + error, log.3.min(error), log.4.max(error));
+        if log.0.elapsed() >= Duration::from_secs(5) {
+            eprintln!(
+                "Timing: sync picture ahead of sound by mean {:.1} ms (min {:.1}, max {:.1})",
+                log.2 / log.1 as f64 * 1e3,
+                log.3 * 1e3,
+                log.4 * 1e3
+            );
+            self.sync_log = (Instant::now(), 0, 0.0, f64::INFINITY, f64::NEG_INFINITY);
+        }
     }
 
     /// How the last seek (or the start) went, once its frame was decoded.

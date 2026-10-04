@@ -323,7 +323,7 @@ fn save_resume(key: Option<&String>, playback: &Playback) {
 const RESUME_SAVE_INTERVAL: Duration = Duration::from_secs(15);
 
 /// Resuming starts this much before where the video was left.
-const RESUME_REWIND: f64 = 3.0;
+pub const RESUME_REWIND: f64 = 3.0;
 
 struct Press {
     hand: usize,
@@ -865,6 +865,13 @@ pub fn run(
                         .resume
                         .filter(|_| prefs.resume)
                         .map_or(0.0, |t| (t - RESUME_REWIND).max(0.0));
+                    // Large videos on the CPU play choppily: say why.
+                    let hardware_failed = opened
+                        .decoder
+                        .stats()
+                        .note
+                        .clone()
+                        .filter(|n| n.starts_with("Hardware decoder failed"));
                     let mut playback = Playback::start(
                         opened.decoder,
                         opened.layout,
@@ -872,7 +879,11 @@ pub fn run(
                         // As decoded: the headset's volume sets loudness.
                         1.0,
                     );
-                    if start > 0.0 {
+                    if let Some(why) = hardware_failed {
+                        eprintln!("Playing on the CPU: {why}");
+                        playback
+                            .notice(super::player::ON_CPU_NOTICE.into(), Duration::from_secs(6));
+                    } else if start > 0.0 {
                         playback.notice(
                             format!("Continuing from {}", controls::format_time(start)),
                             Duration::from_secs(4),

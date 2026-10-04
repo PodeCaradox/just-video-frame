@@ -517,8 +517,9 @@ unsafe extern "C" {
     ) -> *mut RawDecoder;
     fn jv_decoder_next(decoder: *mut RawDecoder, frame: *mut RawFrame) -> c_int;
     fn jv_decoder_seek(decoder: *mut RawDecoder, seconds: f64) -> c_int;
-    fn jv_decoder_reopen_video(decoder: *mut RawDecoder) -> c_int;
+    fn jv_decoder_reopen_video(decoder: *mut RawDecoder, try_hardware: c_int) -> c_int;
     fn jv_decoder_skip_nonref_until(decoder: *mut RawDecoder, seconds: f64);
+    fn jv_decoder_skip_to_keyframe_after(decoder: *mut RawDecoder, seconds: f64);
     fn jv_decoder_keyframe(decoder: *mut RawDecoder, seconds: f64, after: c_int) -> f64;
     fn jv_frame_release(handle: *mut c_void);
     fn jv_decoder_enable_audio(decoder: *mut RawDecoder, rate: c_int, channels: c_int) -> c_int;
@@ -763,6 +764,13 @@ impl VideoDecoder {
         unsafe { jv_decoder_skip_nonref_until(self.raw, seconds) }
     }
 
+    /// Decodes only keyframes until one at or after `seconds`: for catching
+    /// up when decoding has fallen far behind. Hardware (V4L2) decoders
+    /// ignore this.
+    pub fn skip_to_keyframe_after(&mut self, seconds: f64) {
+        unsafe { jv_decoder_skip_to_keyframe_after(self.raw, seconds) }
+    }
+
     /// Decoder name, backend and fallback note (counters are not updated).
     pub fn stats(&self) -> &DecodeStats {
         &self.stats
@@ -856,16 +864,26 @@ impl VideoDecoder {
     /// Jumps to the keyframe at or before `seconds`; frames before the target
     /// still arrive and should be skipped by the caller.
     pub fn seek(&mut self, seconds: f64) -> anyhow::Result<()> {
+        if self.seek_replaces_decoder() {
+            self.reopen_video(true)?;
+        }
         match unsafe { jv_decoder_seek(self.raw, seconds.max(0.0)) } {
             0 => Ok(()),
             code => bail!("Seek failed (FFmpeg error {code})"),
         }
     }
 
+    /// Whether [`Self::seek`] starts a new decoder, so no frames from before
+    /// the jump come out after it.
+    pub fn seek_replaces_decoder(&self) -> bool {
+        self.hardware && reopen_to_seek(self.info().video.as_ref())
+    }
+
     /// Replaces a failed hardware video decoder with a new one, or with
-    /// software decoding if the device won't open. Seek afterwards.
-    pub fn reopen_video(&mut self) -> anyhow::Result<()> {
-        let code = unsafe { jv_decoder_reopen_video(self.raw) };
+    /// software decoding if the device won't open (or at once without
+    /// `try_hardware`). Seek afterwards.
+    pub fn reopen_video(&mut self, try_hardware: bool) -> anyhow::Result<()> {
+        let code = unsafe { jv_decoder_reopen_video(self.raw, try_hardware as c_int) };
         if code < 0 {
             bail!("Reopening the decoder failed (FFmpeg error {code})");
         }
@@ -877,6 +895,14 @@ impl VideoDecoder {
         }
         Ok(())
     }
+}
+
+/// The headset's hardware H.264 decoder (iris) stops for good after a jump
+/// flushes it: it returns one empty picture and never takes the next packet.
+/// A new decoder costs 14-26 ms at 1080p, like opening a video at a time.
+/// HEVC flushes fine (VP9 untested).
+fn reopen_to_seek(video: Option<&VideoInfo>) -> bool {
+    video.is_some_and(|v| v.codec == "h264")
 }
 
 impl Drop for VideoDecoder {
@@ -915,4 +941,33 @@ pub fn wait_for_decoders_closed(limit: std::time::Duration) -> bool {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     true
+}
+
+#[cfg(test)]
+mod seek_tests {
+    use super::*;
+
+    fn info(codec: &str) -> Option<VideoInfo> {
+        Some(VideoInfo {
+            codec: codec.into(),
+            profile: None,
+            pixel_format: Some("yuv420p".into()),
+            width: 1920,
+            height: 1080,
+            bit_depth: 8,
+            fps: 30.0,
+            stereo_mode: None,
+            stereo_inverted: false,
+            projection: None,
+            horizontal_degrees: None,
+        })
+    }
+
+    #[test]
+    fn only_h264_gets_a_new_hardware_decoder_at_a_jump() {
+        assert!(reopen_to_seek(info("h264").as_ref()));
+        assert!(!reopen_to_seek(info("hevc").as_ref()));
+        assert!(!reopen_to_seek(info("vp9").as_ref()));
+        assert!(!reopen_to_seek(None));
+    }
 }

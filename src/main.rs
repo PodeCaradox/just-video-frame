@@ -1352,6 +1352,11 @@ fn main() -> anyhow::Result<()> {
             } else {
                 print!("{}", bench::summary(&report));
             }
+            let failures = report.failures();
+            if !failures.is_empty() {
+                eprintln!("bench-seek failed: {}", failures.join("; "));
+                std::process::exit(3);
+            }
         }
         Command::Bench {
             input,

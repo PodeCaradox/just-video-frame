@@ -5,6 +5,7 @@
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/error.h>
+#include <libavutil/fifo.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/pixdesc.h>
 #include <libavutil/spherical.h>
@@ -227,6 +228,17 @@ struct JVDecoder {
     // While catching up to a seek target: video packets before this time (stream
     // time base) skip non-reference frames, which nothing else needs.
     int64_t skip_until;
+    // Skip every frame but keyframes instead, until a keyframe at or after
+    // `skip_until` (frames after a skipped one can't be decoded until then).
+    int skip_to_key;
+    // Video packets read ahead of the video decoder (AVPacket *), so the sound,
+    // decoded as it is read, stays ahead even when decoding the picture is
+    // slower than real time (8K on the CPU). `held`: one the decoder refused for now.
+    AVFifo *video_packets;
+    AVPacket *held;
+    int end_of_file;
+    // No picture decoded since the last jump: read only what it needs.
+    int awaiting_picture;
     // Audio (optional): decoded and resampled to interleaved float.
     AVCodecContext *audio;
     SwrContext *swr;
@@ -457,6 +469,14 @@ int jv_decoder_subtitle_read(JVDecoder *d, JVSubtitleCue *out) {
     return 1;
 }
 
+static void drop_video_packets(JVDecoder *d) {
+    AVPacket *p;
+    while (d->video_packets && av_fifo_read(d->video_packets, &p, 1) >= 0) av_packet_free(&p);
+    av_packet_free(&d->held);
+    d->end_of_file = 0;
+    d->awaiting_picture = 1;
+}
+
 void jv_decoder_close(JVDecoder *d) {
     if (!d) return;
     drop_cues(d);
@@ -468,6 +488,8 @@ void jv_decoder_close(JVDecoder *d) {
     avcodec_free_context(&d->ctx);
     av_buffer_unref(&d->device);
     av_packet_free(&d->packet);
+    drop_video_packets(d);
+    av_fifo_freep2(&d->video_packets);
     av_frame_free(&d->transfer);
     av_free(d);
 }
@@ -483,6 +505,7 @@ JVDecoder *jv_decoder_open(JVMedia *media, const char *hw_backend, int allow_sof
     d->subtitle_stream = -1;
     d->skip_until = AV_NOPTS_VALUE;
     d->packet = av_packet_alloc();
+    d->video_packets = av_fifo_alloc2(64, sizeof(AVPacket *), AV_FIFO_FLAG_AUTO_GROW);
     d->transfer = av_frame_alloc();
     if (!d->packet || !d->transfer) goto fail;
     d->choice = (FormatChoice){ AV_PIX_FMT_NONE, allow_software, 0 };
@@ -522,6 +545,7 @@ JVDecoder *jv_decoder_open(JVMedia *media, const char *hw_backend, int allow_sof
             codec = avcodec_find_decoder(id);
         }
     }
+    int hw_retries = 0;
 reopen:
     for (int attempt = 0; attempt < 2; ++attempt) {
         avcodec_free_context(&d->ctx);
@@ -559,6 +583,19 @@ reopen:
         ret = AVERROR_OPTION_NOT_FOUND;
         goto fail;
     }
+    if (ret < 0 && d->choice.hardware_wrapper && hw_retries < 2) {
+        // The driver sometimes can't get buffers right away ("REQBUFS: Cannot
+        // allocate memory", seen after many decoder sessions): try again
+        // shortly before settling for the CPU, which can't keep up with 8K.
+        ++hw_retries;
+        av_log(NULL, AV_LOG_ERROR, "Hardware decoder failed to open (%s); trying again\n", av_err2str(ret));
+        av_usleep(250000 * hw_retries);
+        av_dict_free(&open_options);
+        int64_t pixels = (int64_t)video->codecpar->width * video->codecpar->height;
+        av_dict_set_int(&open_options, "num_capture_buffers", pixels > 4096 * 2304 ? 6 : 12, 0);
+        av_dict_set_int(&open_options, "num_output_buffers", 16, 0);
+        goto reopen;
+    }
     if (ret < 0 && d->choice.hardware_wrapper && allow_software) {
         // Device missing, busy or its firmware recovering: never fail playback
         // over it when the CPU can decode instead.
@@ -580,15 +617,16 @@ fail:
 }
 
 // Replaces a failed V4L2 video decoder with a new one (the file, audio and
-// subtitle state stay); falls back to the CPU if the device won't open.
+// subtitle state stay); falls back to the CPU if the device won't open, or
+// goes straight there without `try_hardware`.
 // Returns 1 when the new decoder is the hardware one, 0 for software, < 0 on failure.
-int jv_decoder_reopen_video(JVDecoder *d) {
+int jv_decoder_reopen_video(JVDecoder *d, int try_hardware) {
     if (!d->choice.hardware_wrapper) return AVERROR(ENOSYS);
     AVStream *video = d->media->format->streams[d->media->video_stream];
     const AVCodec *codec = d->ctx->codec;
     // The old instance goes first: the driver counts every open session's load.
     avcodec_free_context(&d->ctx);
-    for (int hardware = 1; hardware >= 0; --hardware) {
+    for (int hardware = !!try_hardware; hardware >= 0; --hardware) {
         if (!hardware) codec = avcodec_find_decoder(video->codecpar->codec_id);
         if (!codec) return AVERROR_DECODER_NOT_FOUND;
         d->choice = (FormatChoice){ AV_PIX_FMT_NONE, 1, hardware };
@@ -737,44 +775,94 @@ int jv_decoder_audio_read(JVDecoder *d, float *out, int frames, double *pts) {
     return n;
 }
 
+// Seconds of video packets read ahead of the video decoder (see `video_packets`;
+// 8K: ~15 MB). Software decoding catches up from 1 s behind (see the player),
+// and a cap in packets for streams without timestamps.
+#define VIDEO_READ_AHEAD 1.0
+#define VIDEO_READ_AHEAD_PACKETS 240
+
+// Seconds between the first and last queued video packets (decode order).
+static double queued_video_seconds(const JVDecoder *d) {
+    size_t n = av_fifo_can_read(d->video_packets);
+    if (n < 2) return 0;
+    AVPacket *first, *last;
+    av_fifo_peek(d->video_packets, &first, 1, 0);
+    av_fifo_peek(d->video_packets, &last, 1, n - 1);
+    int64_t a = first->dts != AV_NOPTS_VALUE ? first->dts : first->pts;
+    int64_t b = last->dts != AV_NOPTS_VALUE ? last->dts : last->pts;
+    if (a == AV_NOPTS_VALUE || b == AV_NOPTS_VALUE) return 0;
+    return (b - a) * av_q2d(d->media->format->streams[d->media->video_stream]->time_base);
+}
+
+// Reads packets until a video packet is queued, decoding sound and subtitles
+// as they come. With sound, the queue then grows by up to three packets per
+// call (four read, one decoded) until it holds VIDEO_READ_AHEAD: filling it at once
+// would delay the first picture after every jump by a second of reading.
+static int read_ahead(JVDecoder *d) {
+    // Right after a jump, the picture comes first: one packet at a time.
+    size_t extra = 0, room = d->awaiting_picture ? 1 : 4;
+    for (;;) {
+        size_t queued = av_fifo_can_read(d->video_packets);
+        if (d->end_of_file) return 0;
+        if (queued > 0 && (!d->audio || extra >= room || queued >= VIDEO_READ_AHEAD_PACKETS ||
+                           queued_video_seconds(d) >= VIDEO_READ_AHEAD))
+            return 0;
+        int ret = av_read_frame(d->media->format, d->packet);
+        if (ret == AVERROR_EOF) { d->end_of_file = 1; return 0; }
+        if (ret < 0) return queued > 0 ? 0 : ret;  // a read error waits until it matters
+        int stream = d->packet->stream_index;
+        if (d->audio && stream == d->media->audio_stream) {
+            decode_audio_packet(d, d->packet);
+        } else if (d->subtitle && stream == d->subtitle_stream) {
+            decode_subtitle_packet(d, d->packet);
+        } else if (stream == d->media->video_stream) {
+            AVPacket *p = av_packet_alloc();
+            if (!p) return AVERROR(ENOMEM);
+            av_packet_move_ref(p, d->packet);
+            if (av_fifo_write(d->video_packets, &p, 1) < 0) { av_packet_free(&p); return AVERROR(ENOMEM); }
+            ++extra;
+            continue;
+        }
+        av_packet_unref(d->packet);
+    }
+}
+
 int jv_decoder_next(JVDecoder *d, JVFrame *out) {
+    if (!d->ctx) return AVERROR(EINVAL);  // a failed reopen left no decoder
     AVFrame *frame = av_frame_alloc();
     if (!frame) return AVERROR(ENOMEM);
     for (;;) {
         int ret = avcodec_receive_frame(d->ctx, frame);
         if (ret == 0) {
+            d->awaiting_picture = 0;
             ret = describe_frame(d, frame, out);
             if (ret < 0) av_frame_free(&frame);
             return ret;
         }
         if (ret != AVERROR(EAGAIN)) { av_frame_free(&frame); return ret; }  // EOF or error
-        ret = av_read_frame(d->media->format, d->packet);
-        if (ret == AVERROR_EOF && !d->flushing) {
-            d->flushing = 1;
+        ret = read_ahead(d);
+        if (ret < 0) { av_frame_free(&frame); return ret; }
+        AVPacket *p = d->held;
+        d->held = NULL;
+        if (!p && av_fifo_read(d->video_packets, &p, 1) < 0) p = NULL;
+        if (!p) {
+            if (d->flushing) { av_frame_free(&frame); return AVERROR_EOF; }
+            d->flushing = 1;  // end of file: drain the decoder
             avcodec_send_packet(d->ctx, NULL);
             continue;
         }
-        if (ret < 0) { av_frame_free(&frame); return ret; }
-        if (d->audio && d->packet->stream_index == d->media->audio_stream) {
-            decode_audio_packet(d, d->packet);
-            av_packet_unref(d->packet);
-            continue;
-        }
-        if (d->subtitle && d->packet->stream_index == d->subtitle_stream) {
-            decode_subtitle_packet(d, d->packet);
-            av_packet_unref(d->packet);
-            continue;
-        }
-        if (d->packet->stream_index != d->media->video_stream) { av_packet_unref(d->packet); continue; }
         if (d->skip_until != AV_NOPTS_VALUE) {
             // Decode order: once a packet reaches the target, every later one
             // decodes normally (a packet without a time ends skipping too).
-            int skip = d->packet->pts != AV_NOPTS_VALUE && d->packet->pts < d->skip_until;
-            d->ctx->skip_frame = skip ? AVDISCARD_NONREF : AVDISCARD_DEFAULT;
-            if (!skip) d->skip_until = AV_NOPTS_VALUE;
+            int skip = p->pts != AV_NOPTS_VALUE && p->pts < d->skip_until;
+            if (d->skip_to_key) skip = skip || !(p->flags & AV_PKT_FLAG_KEY);
+            d->ctx->skip_frame = !skip ? AVDISCARD_DEFAULT
+                               : d->skip_to_key ? AVDISCARD_NONKEY : AVDISCARD_NONREF;
+            if (!skip) { d->skip_until = AV_NOPTS_VALUE; d->skip_to_key = 0; }
         }
-        ret = avcodec_send_packet(d->ctx, d->packet);
-        av_packet_unref(d->packet);
+        ret = avcodec_send_packet(d->ctx, p);
+        if (ret == AVERROR(EAGAIN)) { d->held = p; continue; }  // take a frame first
+        av_packet_free(&p);
         // A damaged packet costs a glitch, not the whole playback.
         if (ret < 0 && ret != AVERROR_INVALIDDATA) { av_frame_free(&frame); return ret; }
     }
@@ -793,11 +881,14 @@ static int64_t video_ts(const JVDecoder *d, double seconds) {
 }
 
 int jv_decoder_seek(JVDecoder *d, double seconds) {
+    if (!d->ctx) return AVERROR(EINVAL);
     int ret = av_seek_frame(d->media->format, d->media->video_stream, video_ts(d, seconds), AVSEEK_FLAG_BACKWARD);
     if (ret < 0) return ret;
     avcodec_flush_buffers(d->ctx);
     d->ctx->skip_frame = AVDISCARD_DEFAULT;
     d->skip_until = AV_NOPTS_VALUE;
+    d->skip_to_key = 0;
+    drop_video_packets(d);
     if (d->audio) {
         avcodec_flush_buffers(d->audio);
         swr_close(d->swr);
@@ -812,7 +903,13 @@ int jv_decoder_seek(JVDecoder *d, double seconds) {
 
 void jv_decoder_skip_nonref_until(JVDecoder *d, double seconds) {
     d->skip_until = seconds > 0 ? video_ts(d, seconds) : AV_NOPTS_VALUE;
+    d->skip_to_key = 0;
     if (d->skip_until == AV_NOPTS_VALUE) d->ctx->skip_frame = AVDISCARD_DEFAULT;
+}
+
+void jv_decoder_skip_to_keyframe_after(JVDecoder *d, double seconds) {
+    d->skip_until = video_ts(d, seconds);
+    d->skip_to_key = 1;
 }
 
 double jv_decoder_keyframe(JVDecoder *d, double seconds, int after) {

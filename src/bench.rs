@@ -438,6 +438,26 @@ pub fn run(input: Input, options: &Options) -> anyhow::Result<Report> {
     Ok(report)
 }
 
+impl Report {
+    /// What went wrong for a viewer: jumps that never showed their picture,
+    /// and playback that stopped.
+    pub fn failures(&self) -> Vec<String> {
+        let mut failures: Vec<String> = self
+            .jumps
+            .iter()
+            .filter(|j| j.shown_ms.is_none())
+            .map(|j| format!("{}: never shown", j.label))
+            .collect();
+        if self.first_frame_ms.is_none() {
+            failures.push("no first frame".into());
+        }
+        if let Some(e) = self.play.as_ref().and_then(|p| p.error.as_ref()) {
+            failures.push(format!("playback stopped: {e}"));
+        }
+        failures
+    }
+}
+
 /// The report as an aligned table.
 pub fn summary(r: &Report) -> String {
     let mut out = format!(
@@ -491,4 +511,44 @@ pub fn summary(r: &Report) -> String {
         );
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn jump(label: &str, shown_ms: Option<f64>) -> Jump {
+        Jump {
+            label: label.into(),
+            from: 0.0,
+            target: 10.0,
+            shown_ms,
+            preview_ms: None,
+            decoder: None,
+        }
+    }
+
+    #[test]
+    fn jumps_without_a_picture_fail_the_run() {
+        let mut r = Report {
+            name: "v.mp4".into(),
+            decoder: "h264_v4l2m2m".into(),
+            open_ms: 100.0,
+            open_phases: Vec::new(),
+            first_frame_ms: Some(150.0),
+            start: None,
+            jumps: vec![jump("+10 s", Some(120.0)), jump("-10 s", Some(80.0))],
+            play: None,
+        };
+        assert!(r.failures().is_empty());
+        r.jumps.push(jump("+10 min", None));
+        r.play = Some(PlayReport {
+            error: Some("Decoding failed".into()),
+            ..Default::default()
+        });
+        assert_eq!(
+            r.failures(),
+            ["+10 min: never shown", "playback stopped: Decoding failed"]
+        );
+    }
 }
