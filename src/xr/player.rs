@@ -1366,6 +1366,8 @@ pub struct Playback {
     embedded_cues: Arc<Mutex<Cues>>,
     /// Briefly shown instead of subtitles ("Subtitles: English"), until then.
     subtitle_notice: Option<(String, Instant)>,
+    /// The hardware decoder failed at a jump and the CPU took over.
+    pub moved_to_cpu: bool,
     audio_labels: Vec<String>,
     audio_track: Option<usize>,
     decode: DecodeThread,
@@ -1545,6 +1547,7 @@ impl Playback {
             subtitle,
             embedded_cues,
             subtitle_notice: None,
+            moved_to_cpu: false,
             audio_labels,
             audio_track,
             audio,
@@ -1790,6 +1793,7 @@ impl Playback {
         }
         if self.decode.moved_to_cpu.swap(false, Ordering::Relaxed) {
             eprintln!("Playing on the CPU: the hardware decoder failed at a jump");
+            self.moved_to_cpu = true;
             self.notice(ON_CPU_NOTICE.into(), Duration::from_secs(6));
         }
         self.sync_to_audio(now);

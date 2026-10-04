@@ -150,6 +150,8 @@ pub struct Report {
     pub start: Option<SeekReport>,
     pub jumps: Vec<Jump>,
     pub play: Option<PlayReport>,
+    /// The hardware decoder failed at a jump and the CPU took over.
+    pub moved_to_cpu: bool,
 }
 
 /// Copies every row of `frame` into `staging`, like `Renderer::record_upload`.
@@ -433,6 +435,7 @@ pub fn run(input: Input, options: &Options) -> anyhow::Result<Report> {
         start,
         jumps,
         play,
+        moved_to_cpu: playback.moved_to_cpu,
     };
     crate::xr::app::drop_in_background(playback);
     Ok(report)
@@ -450,6 +453,9 @@ impl Report {
             .collect();
         if self.first_frame_ms.is_none() {
             failures.push("no first frame".into());
+        }
+        if self.moved_to_cpu {
+            failures.push("hardware decoder failed at a jump; moved to the CPU".into());
         }
         if let Some(e) = self.play.as_ref().and_then(|p| p.error.as_ref()) {
             failures.push(format!("playback stopped: {e}"));
@@ -539,8 +545,15 @@ mod tests {
             start: None,
             jumps: vec![jump("+10 s", Some(120.0)), jump("-10 s", Some(80.0))],
             play: None,
+            moved_to_cpu: false,
         };
         assert!(r.failures().is_empty());
+        r.moved_to_cpu = true;
+        assert_eq!(
+            r.failures(),
+            ["hardware decoder failed at a jump; moved to the CPU"]
+        );
+        r.moved_to_cpu = false;
         r.jumps.push(jump("+10 min", None));
         r.play = Some(PlayReport {
             error: Some("Decoding failed".into()),
