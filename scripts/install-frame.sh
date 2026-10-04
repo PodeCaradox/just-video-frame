@@ -15,9 +15,8 @@ binary=target/aarch64-unknown-linux-gnu/release/just-video
 [ -x "$binary" ] || { echo "Build first: scripts/build-frame.sh" >&2; exit 1; }
 host=steamos@${FRAME_HOST:-frame.local}
 ssh_opts=(-i "$HOME/.ssh/steam_frame_ed25519" -o IdentitiesOnly=yes -o BatchMode=yes)
-# The installed binary is kept as just-video.prev (to roll back: move it back).
-ssh "${ssh_opts[@]}" "$host" 'mkdir -p ~/Applications/JustVideo && cd ~/Applications/JustVideo &&
-    { [ ! -f just-video ] || cp -p just-video just-video.prev; }'
+# No copy of the old binary is kept: to roll back, build and install an older commit.
+ssh "${ssh_opts[@]}" "$host" 'mkdir -p ~/Applications/JustVideo'
 rsync -a -e "ssh ${ssh_opts[*]}" "$binary" "$host:Applications/JustVideo/just-video"
 rsync -a -e "ssh ${ssh_opts[*]}" scripts/steam-shortcut.py "$host:Applications/JustVideo/"
 rsync -a --delete -e "ssh ${ssh_opts[*]}" assets/steam/ "$host:Applications/JustVideo/art/"
