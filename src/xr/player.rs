@@ -2034,6 +2034,17 @@ impl Playback {
         self.current.as_ref()
     }
 
+    /// The picture `advance(at)` will show next, if already decoded and due
+    /// by then (for copying it ahead, see `Renderer::precopy`).
+    pub fn upcoming(&self, at: i64) -> Option<&Frame> {
+        if self.paused() {
+            return None;
+        }
+        let next = self.next.as_ref()?;
+        let due = self.media_time(at)?;
+        next.pts().is_some_and(|pts| pts <= due).then_some(next)
+    }
+
     /// Whether a picture is on screen; it stays after its frame is let go.
     pub fn showing(&self) -> bool {
         self.showing

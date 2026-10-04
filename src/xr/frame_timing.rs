@@ -11,6 +11,8 @@ pub enum Phase {
     Advance,
     /// Copying the new picture into the staging buffer.
     Copy,
+    /// Copying the next one ahead, after the frame (see `Renderer::precopy`).
+    CopyAhead,
     /// Recording the upload and draws, acquiring swapchain images.
     Record,
     /// Submitting to the GPU.
@@ -23,11 +25,12 @@ pub enum Phase {
     GpuEyes,
 }
 
-const PHASES: usize = 8;
+const PHASES: usize = 9;
 const NAMES: [&str; PHASES] = [
     "wait",
     "advance",
     "copy",
+    "copy ahead",
     "record",
     "gpu",
     "end",
@@ -50,7 +53,7 @@ pub struct FrameTiming {
     skipped: u64,
     /// …counted from the player's running total.
     skipped_total: Option<u64>,
-    /// Loop time per frame (all phases but the wait), worst case.
+    /// Loop time per frame (all phases but waits and copying ahead), worst case.
     busy_max: f64,
     busy: f64,
     /// This frame's and the previous frame's times per phase.
@@ -70,7 +73,11 @@ impl FrameTiming {
         self.total[i] += ms;
         self.max[i] = self.max[i].max(ms);
         self.current[i] += ms;
-        if !matches!(phase, Phase::Wait | Phase::GpuUpload | Phase::GpuEyes) {
+        // Copying ahead happens between frames, not against the deadline.
+        if !matches!(
+            phase,
+            Phase::Wait | Phase::CopyAhead | Phase::GpuUpload | Phase::GpuEyes
+        ) {
             self.busy += ms;
         }
     }

@@ -107,6 +107,8 @@ pub struct Renderer {
     pub eyes: Vec<EyeTarget>,
     /// Time the last upload spent copying the picture into the staging buffer.
     pub copy_ms: f64,
+    /// Slot and frame serial `precopy` copied into that slot's staging buffer.
+    precopied: Option<(usize, u64)>,
     timestamp_ns: f64,
     gpu_ms: Cell<[f64; 3]>,
 }
@@ -368,6 +370,7 @@ impl Renderer {
                 slot: 0,
                 eyes: Vec::new(),
                 copy_ms: 0.0,
+                precopied: None,
                 timestamp_ns: limits.timestamp_period as f64,
                 gpu_ms: Cell::new([0.0; 3]),
             };
@@ -747,10 +750,20 @@ impl Renderer {
         Ok(())
     }
 
-    /// Copies a decoded frame into the staging buffer and records its upload.
-    /// Must be called between `begin_frame` and `draw_eye`.
-    fn record_upload(&mut self, frame: &Frame) -> anyhow::Result<()> {
-        self.ensure_video_textures(frame)?;
+    /// Copies `frame` into the staging buffer of the slot the next frame
+    /// records into, ahead of time: while the loop would wait for the runtime
+    /// anyway, rather than within the frame (8K: 3 ms, at worst 10-18 ms).
+    /// `begin_frame` then uploads it without copying again.
+    pub fn precopy(&mut self, frame: &Frame) -> anyhow::Result<()> {
+        self.wait_slot(self.slot)?;
+        self.copy_to_staging(frame)?;
+        self.precopied = Some((self.slot, frame.serial()));
+        Ok(())
+    }
+
+    /// Copies `frame`'s planes into this slot's staging buffer (its GPU work
+    /// done), packed; sets `copy_ms`.
+    fn copy_to_staging(&mut self, frame: &Frame) -> anyhow::Result<()> {
         let bytes = frame.bytes_per_sample();
         let total: u64 = (0..frame.plane_count())
             .map(|p| {
@@ -786,17 +799,34 @@ impl Renderer {
             .staging
             .as_ref()
             .expect("staging buffer");
+        // SAFETY: the staging buffer is mapped and holds `total` bytes, the
+        // sum of all rows; the GPU isn't reading this slot's buffer (its fence passed).
+        let dst = unsafe { std::slice::from_raw_parts_mut(staging.mapped, total as usize) };
+        frame.copy_to(dst);
+        self.copy_ms = copy_started.elapsed().as_secs_f64() * 1e3;
+        Ok(())
+    }
+
+    /// Records the upload of a decoded frame, copying it into the staging
+    /// buffer first unless `precopy` did. Must be called between `begin_frame`
+    /// and `draw_eye`.
+    fn record_upload(&mut self, frame: &Frame) -> anyhow::Result<()> {
+        self.ensure_video_textures(frame)?;
+        if self.precopied.take() == Some((self.slot, frame.serial())) {
+            self.copy_ms = 0.0;
+        } else {
+            self.copy_to_staging(frame)?;
+        }
+        let staging = self.slots[self.slot]
+            .staging
+            .as_ref()
+            .expect("staging buffer");
         let mut regions = Vec::new();
         let mut offset = 0u64;
         for plane in 0..frame.plane_count() {
             regions.push(offset);
             offset += frame.rows(plane).map(|r| r.len() as u64).sum::<u64>();
         }
-        // SAFETY: the staging buffer is mapped and holds `total` bytes, the
-        // sum of all rows; the GPU isn't reading this slot's buffer (its fence passed).
-        let dst = unsafe { std::slice::from_raw_parts_mut(staging.mapped, total as usize) };
-        frame.copy_to(dst);
-        self.copy_ms = copy_started.elapsed().as_secs_f64() * 1e3;
         self.color_params = color_params(frame);
         self.write_color();
         let video = self.video.as_ref().expect("video textures");

@@ -587,6 +587,8 @@ pub enum Transfer {
 /// One decoded picture in CPU memory. Freed when dropped.
 pub struct Frame {
     raw: RawFrame,
+    /// Unique among the process's frames (see [`Frame::serial`]).
+    serial: u64,
     /// The decoder's count of frames alive (see [`VideoDecoder::frames_alive`]).
     alive: Arc<AtomicUsize>,
 }
@@ -595,7 +597,15 @@ pub struct Frame {
 // once decoded; freeing from another thread is allowed.
 unsafe impl Send for Frame {}
 
+/// The next [`Frame::serial`].
+static FRAME_SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 impl Frame {
+    /// Tells this frame from any other, e.g. one already copied for upload.
+    pub fn serial(&self) -> u64 {
+        self.serial
+    }
+
     pub fn layout(&self) -> PlaneLayout {
         match self.raw.layout {
             0 => PlaneLayout::Planar,
@@ -855,6 +865,7 @@ impl VideoDecoder {
                 self.alive.fetch_add(1, Ordering::SeqCst);
                 Ok(Some(Frame {
                     raw: unsafe { raw.assume_init() },
+                    serial: FRAME_SERIAL.fetch_add(1, Ordering::Relaxed),
                     alive: self.alive.clone(),
                 }))
             }

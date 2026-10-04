@@ -1667,6 +1667,14 @@ pub fn run(
                 skipped,
             );
         }
+        // The next picture, copied while the runtime would make us wait.
+        if let Mode::Playing(playback) = &mode
+            && let Some(frame) = playback.upcoming(state.predicted_display_time.as_nanos() + period)
+        {
+            let started = Instant::now();
+            renderer.precopy(frame)?;
+            timing.add(Phase::CopyAhead, started.elapsed().as_secs_f64() * 1e3);
+        }
     }
     timing.report(period);
     options.quit.store(true, Ordering::Relaxed);
