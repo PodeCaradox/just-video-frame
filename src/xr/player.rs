@@ -199,6 +199,47 @@ mod tests {
     }
 
     #[test]
+    fn slow_hardware_decoding_lands_on_keyframes() {
+        let video = |width, height, fps| crate::media::VideoInfo {
+            codec: "hevc".into(),
+            profile: None,
+            pixel_format: None,
+            width,
+            height,
+            bit_depth: 8,
+            fps,
+            stereo_mode: None,
+            stereo_inverted: false,
+            projection: None,
+            horizontal_degrees: None,
+        };
+        // 8K60: ~1.4x real time, so ~1 s of decoding on fits in the budget.
+        let speed_8k = hardware_speed(&video(7680, 3840, 60.0)).unwrap();
+        assert!((1.2..1.7).contains(&speed_8k), "{speed_8k}");
+        assert!(hardware_speed(&video(1920, 1080, 30.0)).unwrap() > 30.0);
+        assert!(hardware_speed(&video(0, 0, 0.0)).is_none());
+        // +10 s in 8K with keyframes 10 s apart: the one after, not 5 s of decoding.
+        let mut s = situation(110.0, 100.0);
+        s.hardware = true;
+        s.speed = Some(speed_8k);
+        s.key_before = Some(105.0);
+        s.key_after = Some(114.0);
+        assert_eq!(plan_seek(&s), SeekPlan::Keyframe(114.0));
+        // The nearer keyframe, before the target too.
+        s.key_before = Some(108.5);
+        assert_eq!(plan_seek(&s), SeekPlan::Keyframe(108.5));
+        // No decoding on for seconds from where it is either.
+        s.decoded = Some(101.0);
+        s.key_before = Some(98.0);
+        assert_eq!(plan_seek(&s), SeekPlan::Keyframe(114.0));
+        // 1080p: fast enough to stay exact.
+        s.speed = hardware_speed(&video(1920, 1080, 30.0));
+        s.decoded = None;
+        s.key_before = Some(105.0);
+        assert_eq!(plan_seek(&s), SeekPlan::Exact);
+    }
+
+    #[test]
     fn a_keyframe_just_before_the_target_is_close_enough() {
         let mut s = situation(110.0, 100.0);
         s.key_before = Some(109.6);
@@ -441,8 +482,10 @@ pub struct SeekSituation {
     pub key_before: Option<f64>,
     pub key_after: Option<f64>,
     pub resume: bool,
-    /// Decoding on the hardware decoder, which catches up quickly.
+    /// Decoding on the hardware decoder, which catches up quickly...
     pub hardware: bool,
+    /// ...at this many times real time, if known (see [`hardware_speed`]).
+    pub speed: Option<f64>,
 }
 
 /// Jumps at least this long land on the nearest keyframe (see `SeekPlan::Keyframe`).
@@ -450,8 +493,21 @@ pub const KEYFRAME_SEEK_FROM: f64 = 60.0;
 /// Shorter jumps are exact unless, decoding on the CPU, their keyframe is
 /// further than this before the target: decoding up to it would take too long
 /// (a 10 s GOP of 4K HEVC is 240 frames, ~0.7 s on the headset even skipping
-/// non-reference frames). The hardware decoder runs 40-75x real time.
+/// non-reference frames). The hardware decoder's limit is `DECODE_BUDGET`.
 const EXACT_GAP: f64 = 3.0;
+
+/// Decoding on to a target on the hardware may take this long (seconds)...
+const DECODE_BUDGET: f64 = 0.75;
+
+/// ...at the hardware decoder's throughput, pixels per second: measured on the
+/// headset from ~1,200 frames/s at 1080p to ~110 frames/s at 8K (1.8x real time).
+const HARDWARE_PIXEL_RATE: f64 = 2.5e9;
+
+/// How many times real time the hardware decoder runs for this video.
+pub fn hardware_speed(video: &crate::media::VideoInfo) -> Option<f64> {
+    let pixels_per_second = video.width as f64 * video.height as f64 * video.fps;
+    (pixels_per_second > 0.0).then(|| HARDWARE_PIXEL_RATE / pixels_per_second)
+}
 
 /// A keyframe at most this far before the target is where a jump lands.
 const KEYFRAME_NEAR: f64 = 1.0;
@@ -459,9 +515,12 @@ const KEYFRAME_NEAR: f64 = 1.0;
 pub fn plan_seek(s: &SeekSituation) -> SeekPlan {
     // An index still being built while reading (Matroska before its first
     // seek) knows no keyframe after the target, and may miss some before it.
-    // On the CPU, decoding on is as slow as an exact jump beyond `EXACT_GAP`.
+    // On the CPU, decoding on is as slow as an exact jump beyond `EXACT_GAP`;
+    // on the hardware, beyond what it decodes in `DECODE_BUDGET`.
     let reach = if s.hardware {
-        KEYFRAME_SEEK_FROM
+        s.speed
+            .map_or(KEYFRAME_SEEK_FROM, |x| x * DECODE_BUDGET)
+            .min(KEYFRAME_SEEK_FROM)
     } else {
         EXACT_GAP
     };
@@ -486,7 +545,7 @@ pub fn plan_seek(s: &SeekSituation) -> SeekPlan {
     {
         return SeekPlan::Keyframe(key);
     }
-    let exact_is_quick = s.hardware || s.key_before.is_none_or(|key| s.target - key <= EXACT_GAP);
+    let exact_is_quick = s.key_before.is_none_or(|key| s.target - key <= reach);
     if !s.resume && jump.abs() < KEYFRAME_SEEK_FROM && exact_is_quick {
         return SeekPlan::Exact;
     }
@@ -705,6 +764,7 @@ fn spawn_decoder(
                         key_after: decoder.keyframe(request.target, true),
                         resume: request.resume,
                         hardware,
+                        speed: decoder.info().video.as_ref().and_then(hardware_speed),
                     });
                     let how = match plan {
                         _ if request.resume => "resume",
