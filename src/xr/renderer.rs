@@ -786,23 +786,16 @@ impl Renderer {
             .staging
             .as_ref()
             .expect("staging buffer");
-        let mut offset = 0usize;
         let mut regions = Vec::new();
+        let mut offset = 0u64;
         for plane in 0..frame.plane_count() {
-            let start = offset;
-            for row in frame.rows(plane) {
-                // SAFETY: the staging buffer holds `total` bytes, the sum of all rows.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        row.as_ptr(),
-                        staging.mapped.add(offset),
-                        row.len(),
-                    )
-                };
-                offset += row.len();
-            }
-            regions.push(start as u64);
+            regions.push(offset);
+            offset += frame.rows(plane).map(|r| r.len() as u64).sum::<u64>();
         }
+        // SAFETY: the staging buffer is mapped and holds `total` bytes, the
+        // sum of all rows; the GPU isn't reading this slot's buffer (its fence passed).
+        let dst = unsafe { std::slice::from_raw_parts_mut(staging.mapped, total as usize) };
+        frame.copy_to(dst);
         self.copy_ms = copy_started.elapsed().as_secs_f64() * 1e3;
         self.color_params = color_params(frame);
         self.write_color();

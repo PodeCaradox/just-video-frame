@@ -157,17 +157,11 @@ pub struct Report {
 
 /// Copies every row of `frame` into `staging`, like `Renderer::record_upload`.
 fn copy_frame(frame: &crate::media::Frame, staging: &mut Vec<u8>) -> usize {
-    let mut offset = 0;
-    for plane in 0..frame.plane_count() {
-        for row in frame.rows(plane) {
-            if staging.len() < offset + row.len() {
-                staging.resize(offset + row.len(), 0);
-            }
-            staging[offset..offset + row.len()].copy_from_slice(row);
-            offset += row.len();
-        }
+    let len = frame.packed_len();
+    if staging.len() < len {
+        staging.resize(len, 0);
     }
-    offset
+    frame.copy_to(staging)
 }
 
 /// Plays for `seconds` in real time, ticking at `hz` like the frame loop.

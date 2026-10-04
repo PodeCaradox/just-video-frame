@@ -675,6 +675,61 @@ impl Frame {
     }
 }
 
+/// Pictures larger than this are copied by several threads: one core copies
+/// 8K (44 MB) in ~2.5 ms on the Frame, with spikes to 9 ms.
+const PARALLEL_COPY_BYTES: usize = 16 << 20;
+/// Threads copying a large picture, the caller's included.
+const COPY_THREADS: usize = 4;
+
+impl Frame {
+    /// Bytes `copy_to` writes: every plane's rows, packed.
+    pub fn packed_len(&self) -> usize {
+        (0..self.plane_count())
+            .map(|p| self.rows(p).map(<[u8]>::len).sum::<usize>())
+            .sum()
+    }
+
+    /// Copies every plane's rows, packed one after another, to the start of
+    /// `dst` (at least `packed_len` bytes); returns the bytes written.
+    pub fn copy_to(&self, dst: &mut [u8]) -> usize {
+        let rows: Vec<&[u8]> = (0..self.plane_count()).flat_map(|p| self.rows(p)).collect();
+        copy_rows(&rows, dst)
+    }
+}
+
+/// Copies `rows` packed into `dst`, large copies split over `COPY_THREADS`.
+fn copy_rows(rows: &[&[u8]], dst: &mut [u8]) -> usize {
+    let total: usize = rows.iter().map(|r| r.len()).sum();
+    assert!(dst.len() >= total, "copy destination too small");
+    let copy = |rows: &[&[u8]], dst: &mut [u8]| {
+        let mut offset = 0;
+        for row in rows {
+            dst[offset..offset + row.len()].copy_from_slice(row);
+            offset += row.len();
+        }
+    };
+    if total < PARALLEL_COPY_BYTES {
+        copy(rows, dst);
+        return total;
+    }
+    std::thread::scope(|scope| {
+        let per = rows.len().div_ceil(COPY_THREADS);
+        let mut rest = &mut dst[..total];
+        let mut parts = rows.chunks(per).peekable();
+        while let Some(part) = parts.next() {
+            let len: usize = part.iter().map(|r| r.len()).sum();
+            let (mine, after) = std::mem::take(&mut rest).split_at_mut(len);
+            rest = after;
+            if parts.peek().is_some() {
+                scope.spawn(move || copy(part, mine));
+            } else {
+                copy(part, mine);
+            }
+        }
+    });
+    total
+}
+
 impl Drop for Frame {
     fn drop(&mut self) {
         unsafe { jv_frame_release(self.raw.handle) };
@@ -963,6 +1018,20 @@ pub fn wait_for_decoders_closed(limit: std::time::Duration) -> bool {
 #[cfg(test)]
 mod seek_tests {
     use super::*;
+
+    #[test]
+    fn rows_copy_packed_alone_or_in_parallel() {
+        for (rows, width) in [(3usize, 5usize), (1200, 16 * 1024)] {
+            let data: Vec<Vec<u8>> = (0..rows)
+                .map(|r| (0..width).map(|i| ((r * 7 + i) % 251) as u8).collect())
+                .collect();
+            let refs: Vec<&[u8]> = data.iter().map(Vec::as_slice).collect();
+            let mut dst = vec![0u8; rows * width + 9];
+            assert_eq!(copy_rows(&refs, &mut dst), rows * width);
+            assert_eq!(&dst[..rows * width], data.concat().as_slice());
+            assert!(dst[rows * width..].iter().all(|&b| b == 0));
+        }
+    }
 
     fn info(codec: &str) -> Option<VideoInfo> {
         Some(VideoInfo {

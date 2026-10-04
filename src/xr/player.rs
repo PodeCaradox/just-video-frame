@@ -284,10 +284,14 @@ mod tests {
         s.key_before = Some(1171.17);
         s.key_after = Some(1181.2);
         assert_eq!(plan_seek(&s), SeekPlan::Keyframe(1181.2));
-        // Keyframes 2 s apart (6K): exact, ~0.7 s of decoding.
+        // Keyframes 2 s apart (6K): the one 0.4 s after the target, not
+        // ~0.7 s of decoding; exact when neither is within a second.
         s.speed = hardware_speed(&video(6144, 3072, 60.0));
         s.key_before = Some(1176.0);
         s.key_after = Some(1178.0);
+        assert_eq!(plan_seek(&s), SeekPlan::Keyframe(1178.0));
+        s.key_before = Some(1176.4);
+        s.key_after = Some(1178.7);
         assert_eq!(plan_seek(&s), SeekPlan::Exact);
         // 1080p: fast enough to stay exact.
         s = situation(110.0, 100.0);
@@ -313,6 +317,16 @@ mod tests {
         s.key_before = Some(99.9);
         s.key_after = Some(100.5);
         assert_ne!(plan_seek(&s), SeekPlan::Keyframe(99.9));
+        // One just after the target is close enough too.
+        let mut s = situation(110.0, 100.0);
+        s.key_before = Some(108.0);
+        s.key_after = Some(110.8);
+        assert_eq!(plan_seek(&s), SeekPlan::Keyframe(110.8));
+        // ...but not one past where a jump back started.
+        let mut s = situation(99.5, 100.0);
+        s.key_before = Some(97.0);
+        s.key_after = Some(100.2);
+        assert_ne!(plan_seek(&s), SeekPlan::Keyframe(100.2));
         // Continuing a video still goes through `resume`.
         let mut s = situation(600.0, 0.0);
         s.resume = true;
@@ -714,6 +728,15 @@ pub fn plan_seek(s: &SeekSituation) -> SeekPlan {
         } else {
             key < s.from
         })
+    {
+        return SeekPlan::Keyframe(key);
+    }
+    // So is one just after it: landing up to a second late beats decoding
+    // on to the target (~0.4 s even on the hardware at 6K).
+    if let (Some(_), Some(key)) = (s.key_before, s.key_after)
+        && !s.resume
+        && key - s.target <= KEYFRAME_NEAR
+        && (jump >= 0.0 || key < s.from)
     {
         return SeekPlan::Keyframe(key);
     }
