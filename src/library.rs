@@ -1054,6 +1054,7 @@ mod tests {
         let server = Server {
             name: "nas".into(),
             url: "smb://me@nas".into(),
+            writable: false,
         };
         let folder: Path = vec!["vr".into()];
         let video = |name: &str, size| ProbeVideo {

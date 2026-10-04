@@ -14,8 +14,7 @@ const ROW: f32 = 88.0;
 const PAD: f32 = 32.0;
 const CRUMB_SIZE: f32 = 40.0;
 const CRUMB_SEP: &str = "  ›  ";
-/// Unlock button and row actions, from the right edge of a row.
-const LOCK_W: f32 = 76.0;
+/// Row actions, from the right edge of a row.
 const ACTION_W: f32 = 150.0;
 const ICON_ACTION_W: f32 = 84.0;
 /// The scrollbar's grab zone at the right edge of the list.
@@ -114,8 +113,6 @@ pub struct Row {
     pub label: String,
     pub detail: String,
     pub right: String,
-    /// A lock toggle (servers): `Some(unlocked)`.
-    pub lock: Option<bool>,
     /// Buttons at the right end, left to right.
     pub actions: Vec<Action>,
     /// A checkbox in place of the icon (selecting what to delete).
@@ -133,7 +130,6 @@ impl Row {
             label: label.into(),
             detail: String::new(),
             right: String::new(),
-            lock: None,
             actions: Vec::new(),
             checked: None,
             dimmed: false,
@@ -219,7 +215,6 @@ pub struct View {
 pub enum Hit {
     Row(usize),
     Crumb(usize),
-    Lock(usize),
     RowAction(usize, Action),
     Tool(usize),
     /// The scrollbar: scroll with [`scroll_at`].
@@ -325,19 +320,10 @@ fn row_rect(view: &View, i: usize) -> Rect {
     (PAD, y + 4.0, WIDTH as f32 - 2.0 * PAD - SCROLL_W, ROW - 8.0)
 }
 
-fn lock_rect(view: &View, i: usize) -> Rect {
-    let (x, y, w, h) = row_rect(view, i);
-    (x + w - LOCK_W - 8.0, y + 6.0, LOCK_W, h - 12.0)
-}
-
-/// The `k`th action button of row `i` (buttons sit left of the lock, if any).
+/// The `k`th action button of row `i`.
 fn action_rect(view: &View, i: usize, k: usize) -> Rect {
     let (x, y, w, h) = row_rect(view, i);
-    let right = if view.rows[i].lock.is_some() {
-        lock_rect(view, i).0 - 10.0
-    } else {
-        x + w - 8.0
-    };
+    let right = x + w - 8.0;
     let actions = &view.rows[i].actions;
     let from_right: f32 = actions[k..].iter().map(|a| a.width() + 10.0).sum();
     (
@@ -377,7 +363,7 @@ pub fn fixed_targets(view: &View, fonts: &mut Fonts) -> Vec<(Hit, Rect)> {
     crumbs.chain(tools).collect()
 }
 
-/// Row `i`'s targets, left to right: the row itself, its actions, its lock.
+/// Row `i`'s targets, left to right: the row itself, then its actions.
 pub fn row_targets(view: &View, i: usize) -> Vec<(Hit, Rect)> {
     let Some(row) = view.rows.get(i) else {
         return Vec::new();
@@ -387,9 +373,6 @@ pub fn row_targets(view: &View, i: usize) -> Vec<(Hit, Rect)> {
     let mut out = vec![(Hit::Row(i), (x, y, 400.0, h))];
     for (k, action) in row.actions.iter().enumerate() {
         out.push((Hit::RowAction(i, *action), action_rect(view, i, k)));
-    }
-    if row.lock.is_some() {
-        out.push((Hit::Lock(i), lock_rect(view, i)));
     }
     out
 }
@@ -434,9 +417,6 @@ pub fn hit(view: &View, fonts: &mut Fonts, x: f32, y: f32) -> Hit {
     }
     let i = index as usize;
     let row = &view.rows[i];
-    if row.lock.is_some() && inside(lock_rect(view, i), x, y) {
-        return Hit::Lock(i);
-    }
     for (k, action) in row.actions.iter().enumerate() {
         if inside(action_rect(view, i, k), x, y) {
             return Hit::RowAction(i, *action);
@@ -546,9 +526,17 @@ fn draw_pencil(canvas: &mut Canvas, cx: f32, cy: f32, color: Rgb) {
     canvas.rect(cx - 19.0, cy + 13.0, 6.0, 6.0, 1.0, color);
 }
 
-fn draw_checkbox(canvas: &mut Canvas, cx: f32, cy: f32, checked: bool) {
+/// A checkbox, `fill` when ticked, cut out of `background` when not.
+pub(super) fn draw_checkbox(
+    canvas: &mut Canvas,
+    cx: f32,
+    cy: f32,
+    checked: bool,
+    fill: Rgb,
+    background: Rgb,
+) {
     if checked {
-        canvas.rect(cx - 18.0, cy - 18.0, 36.0, 36.0, 7.0, RED);
+        canvas.rect(cx - 18.0, cy - 18.0, 36.0, 36.0, 7.0, fill);
         // A tick from two strokes of small squares.
         for i in 0..8 {
             let t = i as f32;
@@ -560,26 +548,8 @@ fn draw_checkbox(canvas: &mut Canvas, cx: f32, cy: f32, checked: bool) {
         }
     } else {
         canvas.rect(cx - 18.0, cy - 18.0, 36.0, 36.0, 7.0, SUBTLE);
-        canvas.rect(cx - 14.0, cy - 14.0, 28.0, 28.0, 5.0, ROW_BG);
+        canvas.rect(cx - 14.0, cy - 14.0, 28.0, 28.0, 5.0, background);
     }
-}
-
-/// A padlock, open or closed.
-fn draw_lock(canvas: &mut Canvas, cx: f32, cy: f32, open: bool, color: Rgb) {
-    canvas.rect(cx - 16.0, cy - 2.0, 32.0, 24.0, 5.0, color);
-    let shackle_x = if open { cx + 2.0 } else { cx - 11.0 };
-    // Shackle: an arch from two posts and a top bar.
-    canvas.rect(shackle_x, cy - 20.0, 5.0, 20.0, 2.0, color);
-    canvas.rect(
-        shackle_x + 17.0,
-        cy - (if open { 26.0 } else { 20.0 }),
-        5.0,
-        if open { 14.0 } else { 20.0 },
-        2.0,
-        color,
-    );
-    canvas.rect(shackle_x, cy - 22.0, 22.0, 5.0, 2.0, color);
-    canvas.circle(cx, cy + 9.0, 3.5, BG);
 }
 
 /// Renders the panel; `pointer` highlights what it hovers and, with
@@ -636,33 +606,10 @@ pub fn render(
             canvas.rect(rx, ry, rw, rh, 14.0, bg);
             let (icon_x, icon_y) = (PAD + 48.0, ry - 4.0 + ROW / 2.0);
             match row.checked {
-                Some(checked) => draw_checkbox(&mut canvas, icon_x, icon_y, checked),
+                Some(checked) => draw_checkbox(&mut canvas, icon_x, icon_y, checked, RED, ROW_BG),
                 None => draw_icon(&mut canvas, &row.icon, icon_x, icon_y, bg),
             }
             let mut right_edge = rx + rw - 24.0;
-            if let Some(unlocked) = row.lock {
-                let lock = lock_rect(view, i);
-                let lock_hover = hover == Some(Hit::Lock(i));
-                if lock_hover || unlocked {
-                    let fill = if unlocked { [0x3a, 0x2c, 0x14] } else { HOVER };
-                    canvas.rect(lock.0, lock.1, lock.2, lock.3, 12.0, fill);
-                }
-                let color = if unlocked {
-                    ORANGE
-                } else if lock_hover {
-                    TEXT
-                } else {
-                    FAINT
-                };
-                draw_lock(
-                    &mut canvas,
-                    lock.0 + lock.2 / 2.0,
-                    lock.1 + lock.3 / 2.0 + 2.0,
-                    unlocked,
-                    color,
-                );
-                right_edge = lock.0 - 16.0;
-            }
             for (k, action) in row.actions.iter().enumerate() {
                 let (ax, ay, aw, ah) = action_rect(view, i, k);
                 let color = if matches!(action, Action::Remove | Action::Delete) {
@@ -697,8 +644,7 @@ pub fn render(
                     right_edge = ax - 16.0;
                 }
             }
-            let unlocked = !row.actions.is_empty();
-            let right_w = if row.right.is_empty() || unlocked {
+            let right_w = if row.right.is_empty() || !row.actions.is_empty() {
                 0.0
             } else {
                 fonts.measure(&row.right, 28.0) + 24.0
@@ -785,7 +731,7 @@ pub fn render(
                 Some(ToolIcon::Edit) => draw_pencil(&mut canvas, cx, cy, TEXT),
                 Some(ToolIcon::Select) => {
                     // A ticked box beside two list lines.
-                    draw_checkbox(&mut canvas, cx - 12.0, cy, true);
+                    draw_checkbox(&mut canvas, cx - 12.0, cy, true, RED, fill);
                     canvas.rect(cx + 12.0, cy - 12.0, 16.0, 5.0, 2.0, TEXT);
                     canvas.rect(cx + 12.0, cy + 7.0, 16.0, 5.0, 2.0, TEXT);
                 }
@@ -1009,17 +955,11 @@ mod tests {
     }
 
     #[test]
-    fn locks_actions_and_tools() {
+    fn actions_and_tools() {
         let mut view = view();
         let mut fonts = Fonts::load().expect("fonts");
-        // A server row: Edit and Remove beside its lock, locked or not.
-        view.rows[2].lock = Some(false);
+        // A server row: Edit and Remove at its right end.
         view.rows[2].actions = vec![Action::Edit, Action::Remove];
-        let (x, y, w, h) = lock_rect(&view, 2);
-        assert_eq!(
-            hit(&view, &mut fonts, x + w / 2.0, y + h / 2.0),
-            Hit::Lock(2)
-        );
         for (k, action) in [Action::Edit, Action::Remove].into_iter().enumerate() {
             let (ax, ay, aw, ah) = action_rect(&view, 2, k);
             assert_eq!(

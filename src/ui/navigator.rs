@@ -2,9 +2,9 @@
 //! [`Library`] workers and turns their results into a [`View`].
 //!
 //! Each saved server can always be edited or removed from the server list.
-//! Changing files is opt-in per server: its lock (on the server list) allows,
-//! inside it, Rename on every entry and a "Select" tool for deleting several
-//! entries at once.
+//! Changing files is opt-in per server, in its settings (Edit on the server
+//! list): "Allow changing files" offers, inside it, Rename on
+//! every entry and a "Select" tool for deleting several entries at once.
 //!
 //! The server list also leads to the Settings screen ([`super::settings`]).
 
@@ -131,11 +131,9 @@ pub struct Navigator {
     items: Vec<Item>,
     view: View,
     purpose: Option<Purpose>,
-    /// URLs of servers whose lock is open (this session only).
-    unlocked: HashSet<String>,
     /// Selecting entries to delete: their indexes.
     selecting: Option<HashSet<usize>>,
-    /// Edit mode (inside an unlocked server): rename/delete on each row.
+    /// Edit mode (inside a writable server): rename/delete on each row.
     edit_mode: bool,
     /// What each header tool does.
     tool_actions: Vec<ToolAction>,
@@ -180,7 +178,6 @@ impl Navigator {
             items: Vec::new(),
             view: View::default(),
             purpose: None,
-            unlocked: HashSet::new(),
             selecting: None,
             edit_mode: false,
             tool_actions: Vec::new(),
@@ -240,9 +237,9 @@ impl Navigator {
         self.next_id
     }
 
-    /// Changes are allowed here (the server's lock is open, inside a share).
+    /// Changes are allowed here (inside a share of a writable server).
     fn editing(&self) -> bool {
-        matches!(&self.location, Location::Folder { server, .. } if self.unlocked.contains(&server.url))
+        matches!(&self.location, Location::Folder { server, .. } if server.writable)
     }
 
     fn crumbs(&self) -> Vec<String> {
@@ -416,7 +413,6 @@ impl Navigator {
                 let mut row = match item {
                     Item::Server(s) => Row {
                         detail: s.url.clone(),
-                        lock: Some(self.unlocked.contains(&s.url)),
                         // Always offered: nothing on the server changes, and
                         // Remove asks first.
                         actions: vec![Action::Edit, Action::Remove],
@@ -662,13 +658,9 @@ impl Navigator {
                             // An edit that changed the address replaces the old entry.
                             if let Some(Purpose::EditServer(old)) = &self.purpose
                                 && *old != saved.url
+                                && let Err(e) = config::move_server(old, &saved.url)
                             {
-                                if let Err(e) = config::move_server(old, &saved.url) {
-                                    eprintln!("Can't move the old server's settings: {e:#}");
-                                }
-                                if self.unlocked.remove(old) {
-                                    self.unlocked.insert(saved.url.clone());
-                                }
+                                eprintln!("Can't move the old server's settings: {e:#}");
                             }
                             self.show_servers();
                         }
@@ -770,14 +762,6 @@ impl Navigator {
             Hit::Form(h) => self.click_form(h),
             Hit::DialogButton(i) => self.click_dialog(i),
             Hit::Crumb(i) => self.go_to_crumb(i),
-            Hit::Lock(i) => {
-                if let Some(Item::Server(s)) = self.items.get(i)
-                    && !self.unlocked.remove(&s.url)
-                {
-                    self.unlocked.insert(s.url.clone());
-                }
-                self.rebuild_rows();
-            }
             Hit::Tool(k) => self.click_tool(k),
             Hit::RowAction(i, Action::Rename) => self.start_rename(i),
             Hit::RowAction(i, Action::Delete) => self.confirm_delete(vec![i]),
@@ -851,8 +835,10 @@ impl Navigator {
             return;
         }
         if !self.editing() {
-            self.view.notice =
-                Some("To change files, unlock this server on the server list first.".into());
+            self.view.notice = Some(
+                "To change files, allow it in this server's settings (Edit on the server list)."
+                    .into(),
+            );
             self.dirty = true;
             return;
         }
@@ -1071,7 +1057,8 @@ impl Navigator {
             Some(s) => (format!("Edit {}", s.name), "Save"),
             None => ("Add server".to_string(), "Connect"),
         };
-        self.view.form = Some(Form::new(
+        let writable = existing.as_ref().is_some_and(|s| s.writable);
+        let mut form = Form::new(
             title,
             vec![
                 field("Address", address, "IP or name, e.g. 192.168.1.10", false),
@@ -1085,7 +1072,9 @@ impl Navigator {
                 ),
             ],
             submit,
-        ));
+        );
+        form.toggle = Some(("Allow changing files".into(), writable));
+        self.view.form = Some(form);
         self.purpose = Some(match existing {
             Some(s) => Purpose::EditServer(s.url),
             None => Purpose::AddServer,
@@ -1149,7 +1138,6 @@ impl Navigator {
             Some(Purpose::RemoveServer(index)) => {
                 if let Some(Item::Server(s)) = self.items.get(index) {
                     let url = s.url.clone();
-                    self.unlocked.remove(&url);
                     match config::remove_server(&url) {
                         Ok(_) => self.show_servers(),
                         Err(e) => self.dialog("Couldn't remove the server", vec![format!("{e:#}")]),
@@ -1197,6 +1185,11 @@ impl Navigator {
         self.dirty = true;
         match hit {
             form::Hit::Field(i, cursor) => f.focus(i, Some(cursor)),
+            form::Hit::Toggle => {
+                if let Some((_, on)) = &mut f.toggle {
+                    *on = !*on;
+                }
+            }
             form::Hit::Key(key) => match f.press(key) {
                 Some(Key::Cancel) => {
                     self.view.form = None;
@@ -1262,6 +1255,7 @@ impl Navigator {
                         name
                     },
                     url: url.server_url(),
+                    writable: f.toggle.as_ref().is_some_and(|t| t.1),
                 };
                 // Saving would replace that other entry, and its password.
                 if let Some(old) = &editing
@@ -1392,6 +1386,7 @@ mod tests {
         let server = Server {
             name: "nas".into(),
             url: "smb://me@nas".into(),
+            writable: false,
         };
         nav.show_entries_for_test(server, &[]);
         let names: Vec<String> = (0..2000).map(|i| format!("clip {i:04}.mp4")).collect();
@@ -1472,21 +1467,29 @@ mod tests {
     }
 
     #[test]
-    fn server_lock_enables_rename_and_multi_delete() {
+    fn writable_servers_offer_rename_and_multi_delete() {
         let mut nav = Navigator::new(Library::start(None));
         let server = Server {
             name: "NAS".into(),
             url: "smb://u@nas".into(),
+            writable: false,
         };
         nav.show_entries_for_test(server.clone(), &["a", "b", "c"]);
         assert!(
             nav.view().rows.iter().all(|r| r.actions.is_empty()),
-            "locked: read only"
+            "read only"
         );
         assert!(nav.view().tools.is_empty());
 
-        nav.unlocked.insert(server.url.clone());
-        nav.rebuild_rows();
+        nav.long_press(1);
+        assert!(nav.view().notice.is_some(), "says where to allow changes");
+        nav.show_entries_for_test(
+            Server {
+                writable: true,
+                ..server
+            },
+            &["a", "b", "c"],
+        );
         assert!(
             nav.view().rows[0].actions.is_empty(),
             "rename/delete wait for edit mode"
@@ -1520,18 +1523,18 @@ mod tests {
     }
 
     #[test]
-    fn servers_can_be_edited_without_unlocking() {
+    fn servers_can_always_be_edited() {
         let mut nav = Navigator::new(Library::start(None));
         nav.items = vec![
             Item::Server(Server {
                 name: "NAS".into(),
                 url: "smb://WORK;bob@nas:4455".into(),
+                writable: false,
             }),
             Item::AddServer,
         ];
         nav.rebuild_rows();
         let row = &nav.view().rows[0];
-        assert_eq!(row.lock, Some(false));
         assert_eq!(row.actions, vec![Action::Edit, Action::Remove]);
 
         nav.click(Hit::RowAction(0, Action::Remove));
@@ -1543,6 +1546,10 @@ mod tests {
         assert_eq!(form.title, "Edit NAS");
         let values: Vec<&str> = (0..4).map(|i| form.value(i)).collect();
         assert_eq!(values, ["nas:4455", "WORK;bob", "", "NAS"]);
+        assert_eq!(form.toggle.as_ref().map(|t| t.1), Some(false), "read only");
+        nav.click(Hit::Form(form::Hit::Toggle));
+        let form = nav.view().form.as_ref().unwrap();
+        assert_eq!(form.toggle.as_ref().map(|t| t.1), Some(true));
         assert!(
             matches!(&nav.purpose, Some(Purpose::EditServer(url)) if url == "smb://WORK;bob@nas:4455")
         );
@@ -1554,10 +1561,12 @@ mod tests {
         let pc = Server {
             name: "PC".into(),
             url: "smb://alice@pc".into(),
+            writable: false,
         };
         let nas = Server {
             name: "NAS".into(),
             url: "smb://bob@nas".into(),
+            writable: false,
         };
         config::save_server(pc.clone(), "a").unwrap();
         config::save_server(nas.clone(), "b").unwrap();
@@ -1581,6 +1590,7 @@ mod tests {
         let server = Server {
             name: "NAS".into(),
             url: "smb://u@nas".into(),
+            writable: false,
         };
         nav.show_entries_for_test(server, &[]);
         let a = crate::playability::assess(crate::playability::Platform::SteamFrame, None);
@@ -1618,6 +1628,7 @@ mod tests {
         let server = Server {
             name: "NAS".into(),
             url: "smb://u@nas".into(),
+            writable: false,
         };
         let names: Vec<String> = (0..40).map(|i| format!("f{i:02}")).collect();
         let names: Vec<&str> = names.iter().map(String::as_str).collect();
@@ -1642,6 +1653,7 @@ mod tests {
         let server = Server {
             name: "NAS".into(),
             url: "smb://u@nas".into(),
+            writable: false,
         };
         nav.show_entries_for_test(server, &["folder"]);
         let video = |name: &str, broken: bool| Item::Video {

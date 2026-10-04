@@ -439,6 +439,11 @@ fn main() -> anyhow::Result<()> {
                 just_video::config::Server {
                     name: name.unwrap_or_else(|| parsed.host.clone()),
                     url: parsed.server_url(),
+                    // Saving again keeps whether files may be changed.
+                    writable: just_video::config::servers()
+                        .unwrap_or_default()
+                        .iter()
+                        .any(|s| s.url == parsed.server_url() && s.writable),
                 },
                 &password,
             )?;
@@ -1043,7 +1048,6 @@ fn main() -> anyhow::Result<()> {
                 rows: vec![
                     Row {
                         detail: "smb://user@192.168.1.10".into(),
-                        lock: Some(true),
                         actions: vec![
                             just_video::ui::browser::Action::Edit,
                             just_video::ui::browser::Action::Remove,
@@ -1052,7 +1056,6 @@ fn main() -> anyhow::Result<()> {
                     },
                     Row {
                         detail: "smb://user@10.0.0.2".into(),
-                        lock: Some(false),
                         actions: vec![
                             just_video::ui::browser::Action::Edit,
                             just_video::ui::browser::Action::Remove,
@@ -1111,6 +1114,9 @@ fn main() -> anyhow::Result<()> {
                     .collect(),
                 "Connect",
             ));
+            if let Some(f) = &mut adding.form {
+                f.toggle = Some(("Allow changing files".into(), false));
+            }
             just_video::ui::save_png(
                 &render(&adding, &mut fonts, Some((700.0, 700.0)), true),
                 &dir.join("form.png"),
@@ -1131,6 +1137,9 @@ fn main() -> anyhow::Result<()> {
                     .collect(),
                 "Save",
             ));
+            if let Some(f) = &mut editing_server.form {
+                f.toggle = Some(("Allow changing files".into(), true));
+            }
             just_video::ui::save_png(
                 &render(&editing_server, &mut fonts, None, false),
                 &dir.join("form-edit.png"),

@@ -55,7 +55,7 @@ fn point(hit: Hit, (x, y, w, h): Rect) -> (f32, f32) {
 
 fn row_of(hit: Hit) -> Option<usize> {
     match hit {
-        Hit::Row(i) | Hit::Lock(i) | Hit::RowAction(i, _) => Some(i),
+        Hit::Row(i) | Hit::RowAction(i, _) => Some(i),
         _ => None,
     }
 }
@@ -148,7 +148,7 @@ pub fn opens_on_right(view: &View, focus: &Focus) -> Option<Hit> {
     };
     let row = view.rows.get(i).filter(|_| list_shown(view))?;
     let container = matches!(row.icon, Icon::Folder | Icon::Share | Icon::Server);
-    let plain = row.actions.is_empty() && row.lock.is_none() && row.checked.is_none();
+    let plain = row.actions.is_empty() && row.checked.is_none();
     (container && plain && !row.dimmed).then_some(focus.hit)
 }
 

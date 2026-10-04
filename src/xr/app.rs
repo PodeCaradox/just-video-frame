@@ -992,12 +992,8 @@ pub fn run(
                 if let Some(p) = &mut browser_press {
                     if buttons.select_held[p.hand] {
                         if let Some((_, y)) = point {
-                            let on_list = matches!(
-                                p.hit,
-                                browser::Hit::Row(_)
-                                    | browser::Hit::Lock(_)
-                                    | browser::Hit::RowAction(..)
-                            );
+                            let on_list =
+                                matches!(p.hit, browser::Hit::Row(_) | browser::Hit::RowAction(..));
                             if p.hit == browser::Hit::ScrollBar {
                                 nav.set_scroll(browser::scroll_at(nav.view(), y));
                             } else if on_list

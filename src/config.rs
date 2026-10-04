@@ -17,6 +17,9 @@ pub struct Server {
     pub name: String,
     /// `smb://[domain;]user@host[:port]`, no password.
     pub url: String,
+    /// Renaming and deleting files on it are allowed (off: read only).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub writable: bool,
 }
 
 #[cfg(test)]
@@ -489,6 +492,7 @@ mod tests {
         let server = Server {
             name: "PC".into(),
             url: "smb://alice@192.168.1.10".into(),
+            writable: false,
         };
         save_server(server.clone(), "secret").unwrap();
         assert_eq!(servers().unwrap(), vec![server.clone()]);
@@ -526,6 +530,7 @@ mod tests {
         let nas = Server {
             name: "NAS".into(),
             url: "smb://bob@nas".into(),
+            writable: false,
         };
         save_server(nas.clone(), "pw").unwrap();
         let renamed = Server {
@@ -537,6 +542,7 @@ mod tests {
         let moved = Server {
             name: "Office PC".into(),
             url: "smb://alice@192.168.1.20".into(),
+            writable: false,
         };
         save_server(moved.clone(), "secret").unwrap();
         save_resume_position("smb://alice@192.168.1.100/x.mp4", Some(60.0)).unwrap();

@@ -39,6 +39,8 @@ pub struct Form {
     pub error: Option<String>,
     pub busy: Option<String>,
     pub submit: String,
+    /// A checkbox beside the last field: its label, and whether it's ticked.
+    pub toggle: Option<(String, bool)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,6 +62,7 @@ pub enum Hit {
     /// A field, and the caret position under the pointer.
     Field(usize, usize),
     Key(Key),
+    Toggle,
     Nothing,
 }
 
@@ -75,6 +78,7 @@ impl Form {
             error: None,
             busy: None,
             submit: submit.into(),
+            toggle: None,
         }
     }
 
@@ -163,13 +167,23 @@ fn keyboard_top(form: &Form) -> f32 {
     FIELD_Y + form.fields.len() as f32 * (FIELD_H + FIELD_GAP) + 24.0
 }
 
-fn field_rect(i: usize) -> Rect {
+/// Room the toggle takes from the right of the last field.
+const TOGGLE_W: f32 = 520.0;
+
+fn field_rect(form: &Form, i: usize) -> Rect {
+    let beside_toggle = form.toggle.is_some() && i + 1 == form.fields.len();
     (
         X0 + 260.0,
         FIELD_Y + i as f32 * (FIELD_H + FIELD_GAP),
-        1600.0 - 2.0 * X0 - 260.0,
+        1600.0 - 2.0 * X0 - 260.0 - if beside_toggle { TOGGLE_W + 16.0 } else { 0.0 },
         FIELD_H,
     )
+}
+
+fn toggle_rect(form: &Form) -> Option<Rect> {
+    form.toggle.as_ref()?;
+    let (_, y, _, h) = field_rect(form, form.fields.len().checked_sub(1)?);
+    Some((1600.0 - X0 - TOGGLE_W, y, TOGGLE_W, h))
 }
 
 /// Every key with its rectangle.
@@ -231,7 +245,7 @@ const TEXT_SIZE: f32 = 34.0;
 /// from the caret. Clicking inside the shown text never scrolls it.
 fn first_shown(form: &Form, i: usize, fonts: &mut Fonts) -> usize {
     let chars = shown(&form.fields[i]);
-    let room = field_rect(i).2 - 60.0;
+    let room = field_rect(form, i).2 - 60.0;
     let mut start = 0;
     while start + 1 < chars.len()
         && fonts.measure(&chars[start..].iter().collect::<String>(), TEXT_SIZE) > room
@@ -249,7 +263,7 @@ fn first_shown(form: &Form, i: usize, fonts: &mut Fonts) -> usize {
 fn caret_at(form: &Form, i: usize, x: f32, fonts: &mut Fonts) -> usize {
     let chars = shown(&form.fields[i]);
     let start = first_shown(form, i, fonts);
-    let mut left = field_rect(i).0 + 20.0;
+    let mut left = field_rect(form, i).0 + 20.0;
     for (k, c) in chars.iter().enumerate().skip(start) {
         let w = fonts.measure(&c.to_string(), TEXT_SIZE);
         if x < left + w / 2.0 {
@@ -269,11 +283,12 @@ pub fn targets(form: &Form, panel_width: f32) -> Vec<(Hit, Rect)> {
         .fields
         .iter()
         .enumerate()
-        .map(|(i, f)| (Hit::Field(i, f.value.chars().count()), field_rect(i)));
+        .map(|(i, f)| (Hit::Field(i, f.value.chars().count()), field_rect(form, i)));
+    let toggle = toggle_rect(form).map(|r| (Hit::Toggle, r));
     let keys = keys(form, panel_width)
         .into_iter()
         .map(|(k, r)| (Hit::Key(k), r));
-    fields.chain(keys).collect()
+    fields.chain(toggle).chain(keys).collect()
 }
 
 pub fn hit(form: &Form, fonts: &mut Fonts, panel_width: f32, x: f32, y: f32) -> Hit {
@@ -281,9 +296,12 @@ pub fn hit(form: &Form, fonts: &mut Fonts, panel_width: f32, x: f32, y: f32) -> 
         return Hit::Nothing;
     }
     for i in 0..form.fields.len() {
-        if inside(field_rect(i), x, y) {
+        if inside(field_rect(form, i), x, y) {
             return Hit::Field(i, caret_at(form, i, x, fonts));
         }
+    }
+    if toggle_rect(form).is_some_and(|r| inside(r, x, y)) {
+        return Hit::Toggle;
     }
     keys(form, panel_width)
         .into_iter()
@@ -320,7 +338,7 @@ fn key_label(key: Key, form: &Form) -> String {
 pub fn render(canvas: &mut Canvas, fonts: &mut Fonts, form: &Form, hover: Hit) {
     let w = canvas.width as f32;
     for (i, field) in form.fields.iter().enumerate() {
-        let (fx, fy, fw, fh) = field_rect(i);
+        let (fx, fy, fw, fh) = field_rect(form, i);
         fonts.draw(canvas, &field.label, X0, fy + 47.0, 30.0, SUBTLE, 250.0);
         let focused = i == form.focused;
         let hovered = matches!(hover, Hit::Field(f, _) if f == i);
@@ -371,6 +389,17 @@ pub fn render(canvas: &mut Canvas, fonts: &mut Fonts, form: &Form, hover: Hit) {
             let x = fx + 20.0 + fonts.measure(&before, TEXT_SIZE);
             canvas.rect(x, fy + 16.0, 3.0, fh - 32.0, 1.0, ACCENT);
         }
+    }
+    if let (Some((label, on)), Some((x, y, tw, th))) = (&form.toggle, toggle_rect(form)) {
+        let fill = if hover == Hit::Toggle {
+            KEY_HOVER
+        } else {
+            FIELD
+        };
+        canvas.rect(x, y, tw, th, 12.0, fill);
+        let (cx, cy) = (x + 40.0, y + th / 2.0);
+        super::browser::draw_checkbox(canvas, cx, cy, *on, ACCENT, fill);
+        fonts.draw(canvas, label, x + 76.0, y + 46.0, 28.0, TEXT, tw - 90.0);
     }
     let status_y = keyboard_top(form) - 6.0;
     if let Some(busy) = &form.busy {
