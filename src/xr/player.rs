@@ -774,6 +774,36 @@ struct StaleFrames {
     key: Option<f64>,
 }
 
+/// Waits this long at most for the player to drop the old decoder's frames.
+const RELEASE_WAIT: Duration = Duration::from_millis(300);
+
+/// Replaces the hardware decoder with a new one (or the CPU's), closing the
+/// old session first: its frames are dropped (the player lets go of its
+/// pictures while `release` is set), then the old decoder is freed. The driver
+/// may have room for only one 6K or 8K session: Steam's web helper keeps one
+/// open, and then a flush or a second session at a jump runs out of memory.
+fn replace_decoder(
+    decoder: &mut VideoDecoder,
+    release: &AtomicBool,
+    stop: &AtomicBool,
+    try_hardware: bool,
+) -> anyhow::Result<()> {
+    release.store(true, Ordering::Relaxed);
+    let asked = Instant::now();
+    while decoder.frames_alive() > 0
+        && asked.elapsed() < RELEASE_WAIT
+        && !stop.load(Ordering::Relaxed)
+    {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    release.store(false, Ordering::Relaxed);
+    let alive = decoder.frames_alive();
+    if alive > 0 {
+        eprintln!("Decoder: {alive} frames still held; replacing it anyway");
+    }
+    decoder.reopen_video(try_hardware)
+}
+
 /// Restarts of the hardware decoder after it fails at a jump; the last one
 /// moves decoding to the CPU.
 const MAX_RESTARTS: u32 = 3;
@@ -859,6 +889,9 @@ struct DecodeThread {
     audio_track: mpsc::Sender<usize>,
     /// Set when the hardware decoder failed at a jump and the CPU took over.
     moved_to_cpu: Arc<AtomicBool>,
+    /// Set while the decode thread waits for every frame to be dropped, to
+    /// replace the decoder (see `replace_decoder`).
+    release_frames: Arc<AtomicBool>,
 }
 
 /// Media time on screen at an instant, for the current generation; `None`
@@ -932,6 +965,8 @@ fn spawn_decoder(
     let shared_report = report.clone();
     let moved_to_cpu = Arc::new(AtomicBool::new(false));
     let on_cpu = moved_to_cpu.clone();
+    let release_frames = Arc::new(AtomicBool::new(false));
+    let release = release_frames.clone();
     std::thread::Builder::new()
         .name("decode".into())
         .spawn(move || {
@@ -962,6 +997,8 @@ fn spawn_decoder(
             let mut aim = start;
             // Restarts tried after the hardware decoder failed to restart at a jump.
             let mut restarts = 0;
+            // Once a flush failed: a new hardware decoder at every jump.
+            let mut replace_at_jumps = false;
             // Skipping to catch up is set until this media time, and whether
             // it skips to a keyframe.
             let mut catching_up_until = f64::NEG_INFINITY;
@@ -1022,7 +1059,9 @@ fn spawn_decoder(
                         _ => request.target,
                     };
                     if plan != SeekPlan::Continue {
-                        stale = (hardware && !decoder.seek_replaces_decoder())
+                        let replace =
+                            hardware && (replace_at_jumps || decoder.flush_unreliable());
+                        stale = (hardware && !replace)
                             .then_some(decoded)
                             .flatten()
                             .map(|old| StaleFrames {
@@ -1033,11 +1072,16 @@ fn spawn_decoder(
                                 },
                             });
                         let began = Instant::now();
+                        if replace
+                            && let Err(e) = replace_decoder(&mut decoder, &release, &stop, true)
+                        {
+                            // No decoder left: the next frame fails.
+                            eprintln!("Replacing the decoder at a jump failed: {e:#}");
+                        }
                         if let Err(e) = decoder.seek(to) {
                             eprintln!("Seek to {to:.1}s failed: {e:#}");
                         }
-                        // A seek may replace the decoder (H.264 on the hardware),
-                        // with the CPU's if the device won't open.
+                        // The new decoder may be the CPU's, if the device won't open.
                         let was_hardware = std::mem::replace(
                             &mut hardware,
                             decoder.stats().hw_backend.is_some(),
@@ -1079,8 +1123,14 @@ fn spawn_decoder(
                     // the last time on the CPU rather than stop playing.
                     Err(e) if hardware && restarts < MAX_RESTARTS => {
                         restarts += 1;
+                        replace_at_jumps = true;
                         let began = Instant::now();
-                        let reopened = decoder.reopen_video(restarts < MAX_RESTARTS);
+                        let reopened = replace_decoder(
+                            &mut decoder,
+                            &release,
+                            &stop,
+                            restarts < MAX_RESTARTS,
+                        );
                         hardware = decoder.stats().hw_backend.is_some();
                         if reopened.is_ok() && !hardware {
                             on_cpu.store(true, Ordering::Relaxed);
@@ -1263,6 +1313,7 @@ fn spawn_decoder(
         subtitle_track,
         audio_track,
         moved_to_cpu,
+        release_frames,
     }
 }
 
@@ -1375,6 +1426,8 @@ pub struct Playback {
     stop: Arc<AtomicBool>,
     generation: u64,
     current: Option<Frame>,
+    /// A picture is on screen (it stays there after `current` is let go).
+    showing: bool,
     next: Option<Frame>,
     ended: bool,
     pub error: Option<String>,
@@ -1554,6 +1607,7 @@ impl Playback {
             stop,
             generation: 0,
             current: None,
+            showing: false,
             next: None,
             ended: false,
             error: None,
@@ -1706,8 +1760,22 @@ impl Playback {
         }
     }
 
+    /// The picture on screen, unless it was let go (see `release_frames`).
     pub fn current(&self) -> Option<&Frame> {
         self.current.as_ref()
+    }
+
+    /// Whether a picture is on screen; it stays after its frame is let go.
+    pub fn showing(&self) -> bool {
+        self.showing
+    }
+
+    /// Drops every decoded frame held here, so the decoder's session can
+    /// close. The renderer already copied the picture on screen.
+    fn release_frames(&mut self) {
+        self.current = None;
+        self.next = None;
+        while self.decode.frames.try_recv().is_ok() {}
     }
 
     pub fn paused(&self) -> bool {
@@ -1787,6 +1855,10 @@ impl Playback {
 
     /// Moves to the newest decoded frame due at `now`; true if it changed.
     pub fn advance(&mut self, now: i64) -> bool {
+        // Also while paused: the decoder is being replaced.
+        if self.decode.release_frames.load(Ordering::Relaxed) {
+            self.release_frames();
+        }
         if self.paused() && self.clock_start.is_some() {
             *self.shown.lock().expect("shown clock") = None;
             return false;
@@ -1809,6 +1881,7 @@ impl Playback {
                     Ok(Decoded::Preview(g, frame)) if g == self.generation => {
                         if self.clock_start.is_none() {
                             self.current = Some(frame);
+                            self.showing = true;
                             changed = true;
                         }
                         continue;
@@ -1845,6 +1918,7 @@ impl Playback {
             }
             self.last_pts = pts;
             self.current = self.next.take();
+            self.showing = true;
             changed = true;
             if self.paused() {
                 break; // paused after a seek: show just the target frame

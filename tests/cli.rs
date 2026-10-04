@@ -192,3 +192,29 @@ fn decoder_yields_frames_with_planes_and_pts() {
         assert!(decoder.next_frame().unwrap().is_some());
     }
 }
+
+/// Frames are counted while alive: a hardware decoder's session only closes
+/// once they are all dropped, which replacing it at a jump waits for.
+#[cfg(feature = "decode")]
+#[test]
+fn decoder_counts_frames_alive() {
+    use just_video::media::Media;
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/samples/h264-720p.mp4");
+    let Ok(file) = std::fs::File::open(path) else {
+        eprintln!("skipping: run scripts/make-samples.sh");
+        return;
+    };
+    let media = Media::open("h264-720p.mp4", file).unwrap();
+    let mut decoder = media.into_decoder(None, true, "").unwrap();
+    let held: Vec<_> = (0..3)
+        .map(|_| decoder.next_frame().unwrap().unwrap())
+        .collect();
+    assert_eq!(decoder.frames_alive(), 3);
+    let moved = std::thread::spawn(move || drop(held));
+    moved.join().unwrap();
+    assert_eq!(decoder.frames_alive(), 0);
+    let frame = decoder.next_frame().unwrap().unwrap();
+    assert_eq!(decoder.frames_alive(), 1);
+    drop(frame);
+    assert_eq!(decoder.frames_alive(), 0);
+}

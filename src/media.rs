@@ -2,6 +2,10 @@
 
 use anyhow::bail;
 use serde::{Deserialize, Serialize};
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::{
     ffi::{CStr, CString, c_char, c_int, c_void},
     io::{Read, Seek, SeekFrom},
@@ -578,6 +582,8 @@ pub enum Transfer {
 /// One decoded picture in CPU memory. Freed when dropped.
 pub struct Frame {
     raw: RawFrame,
+    /// The decoder's count of frames alive (see [`VideoDecoder::frames_alive`]).
+    alive: Arc<AtomicUsize>,
 }
 
 // SAFETY: the frame's buffers are reference counted by FFmpeg and immutable
@@ -672,6 +678,7 @@ impl Frame {
 impl Drop for Frame {
     fn drop(&mut self) {
         unsafe { jv_frame_release(self.raw.handle) };
+        self.alive.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -684,6 +691,9 @@ pub struct VideoDecoder {
     pub requested_at: Option<std::time::Instant>,
     /// Holds the hardware decoder (see `HARDWARE_DECODERS`).
     hardware: bool,
+    /// Frames handed out and not yet dropped. A V4L2 decoder session stays
+    /// open until all its frames are gone.
+    alive: Arc<AtomicUsize>,
 }
 
 // SAFETY: used from one thread at a time (the decode thread).
@@ -720,6 +730,7 @@ impl Media {
         }
         Ok(VideoDecoder {
             hardware,
+            alive: Arc::default(),
             raw: decoder,
             media: self,
             stats: DecodeStats {
@@ -780,9 +791,13 @@ impl VideoDecoder {
     pub fn next_frame(&mut self) -> anyhow::Result<Option<Frame>> {
         let mut raw = std::mem::MaybeUninit::<RawFrame>::zeroed();
         match unsafe { jv_decoder_next(self.raw, raw.as_mut_ptr()) } {
-            0 => Ok(Some(Frame {
-                raw: unsafe { raw.assume_init() },
-            })),
+            0 => {
+                self.alive.fetch_add(1, Ordering::SeqCst);
+                Ok(Some(Frame {
+                    raw: unsafe { raw.assume_init() },
+                    alive: self.alive.clone(),
+                }))
+            }
             AVERROR_EOF => Ok(None),
             AVERROR_PATCHWELCOME => bail!("Decoder produced an unsupported pixel format"),
             code => bail!("Decoding failed (FFmpeg error {code})"),
@@ -864,24 +879,26 @@ impl VideoDecoder {
     /// Jumps to the keyframe at or before `seconds`; frames before the target
     /// still arrive and should be skipped by the caller.
     pub fn seek(&mut self, seconds: f64) -> anyhow::Result<()> {
-        if self.seek_replaces_decoder() {
-            self.reopen_video(true)?;
-        }
         match unsafe { jv_decoder_seek(self.raw, seconds.max(0.0)) } {
             0 => Ok(()),
             code => bail!("Seek failed (FFmpeg error {code})"),
         }
     }
 
-    /// Whether [`Self::seek`] starts a new decoder, so no frames from before
-    /// the jump come out after it.
-    pub fn seek_replaces_decoder(&self) -> bool {
+    /// Whether a jump needs a new decoder: the hardware one can't be flushed.
+    pub fn flush_unreliable(&self) -> bool {
         self.hardware && reopen_to_seek(self.info().video.as_ref())
     }
 
-    /// Replaces a failed hardware video decoder with a new one, or with
-    /// software decoding if the device won't open (or at once without
-    /// `try_hardware`). Seek afterwards.
+    /// Frames from this decoder still alive anywhere.
+    pub fn frames_alive(&self) -> usize {
+        self.alive.load(Ordering::SeqCst)
+    }
+
+    /// Replaces the hardware video decoder with a new one, or with software
+    /// decoding if the device won't open (or at once without
+    /// `try_hardware`). The old session only closes once [`Self::frames_alive`]
+    /// is 0. Seek afterwards.
     pub fn reopen_video(&mut self, try_hardware: bool) -> anyhow::Result<()> {
         let code = unsafe { jv_decoder_reopen_video(self.raw, try_hardware as c_int) };
         if code < 0 {
@@ -900,7 +917,7 @@ impl VideoDecoder {
 /// The headset's hardware H.264 decoder (iris) stops for good after a jump
 /// flushes it: it returns one empty picture and never takes the next packet.
 /// A new decoder costs 14-26 ms at 1080p, like opening a video at a time.
-/// HEVC flushes fine (VP9 untested).
+/// HEVC flushes fine, while the driver has memory to spare (VP9 untested).
 fn reopen_to_seek(video: Option<&VideoInfo>) -> bool {
     video.is_some_and(|v| v.codec == "h264")
 }

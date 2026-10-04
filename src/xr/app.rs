@@ -1504,7 +1504,7 @@ pub fn run(
                     mark += Duration::from_secs_f64(renderer.copy_ms / 1e3);
                     playback.stats.uploaded_frames += 1;
                 }
-                let show = playback.current().is_some();
+                let show = playback.showing();
                 if show {
                     playback.stats.displayed_frames += 1;
                 }
