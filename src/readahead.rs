@@ -76,9 +76,10 @@ const CLOSE_WAIT: Duration = Duration::from_secs(10);
 /// index at its end, a seek) would delay the new position until all of it
 /// arrived: ~0.25 s for 32 MiB over the headset's link.
 const INITIAL_WINDOW: usize = 4;
-/// Finished blocks kept after the reader moved away, for demuxers that come
-/// back (an MP4 index at the end of the file, then the start of the data).
-const CACHED_BLOCKS: usize = 8;
+/// Bytes of finished blocks kept after the reader moved away: for demuxers
+/// that come back (an MP4 index at the end of the file, then the start of the
+/// data), and for jumps back into what was just played (~15 s of 6K60).
+const KEPT_BYTES: usize = 192 << 20;
 /// Reads in flight at most, however large the window: they can't be
 /// cancelled, so after a jump the new position's data arrives only after
 /// them. Over the headset's Wi-Fi 3 keep 8K (~50 Mbit/s) fed with no stall,
@@ -93,7 +94,7 @@ pub struct ReadAheadReader<S: BlockSource> {
     pos: u64,
     options: ReadAhead,
     blocks: BTreeMap<u64, Block>,
-    /// Recently left finished blocks, oldest first (see `CACHED_BLOCKS`).
+    /// Recently left finished blocks, oldest first (see `KEPT_BYTES`).
     cache: VecDeque<(u64, Vec<u8>)>,
     /// Blocks to keep requested ahead now (grows to `blocks_ahead`).
     window: usize,
@@ -137,6 +138,10 @@ impl<S: BlockSource> ReadAheadReader<S> {
 
     pub fn stats(&self) -> ReadStats {
         self.stats
+    }
+
+    fn kept_blocks(&self) -> usize {
+        (KEPT_BYTES / self.options.block_size).max(1)
     }
 
     fn spawn(&mut self, index: u64) {
@@ -189,7 +194,7 @@ impl<S: BlockSource> ReadAheadReader<S> {
             match self.blocks.remove(&index) {
                 Some(Block::Pending(handle)) => self.detached.push(handle),
                 Some(Block::Ready(data)) => {
-                    if self.cache.len() == CACHED_BLOCKS {
+                    if self.cache.len() >= self.kept_blocks() {
                         self.cache.pop_front();
                     }
                     self.cache.push_back((index, data));
@@ -439,6 +444,27 @@ mod tests {
         assert!(requests <= 16 + 1, "in-flight cap exceeded: {requests}");
         drop(r);
         assert_eq!(completed.load(Ordering::SeqCst) as u64, requests);
+    }
+
+    #[test]
+    fn jumping_back_into_what_was_played_reads_nothing_again() {
+        // 64 KiB blocks: 200 of them played (12.5 MiB), well within what's kept.
+        let options = ReadAhead {
+            block_size: 64 * 1024,
+            blocks_ahead: 4,
+        };
+        let (mut r, data) = reader(220 * 64 * 1024, 0, options);
+        let mut buf = vec![0u8; 200 * 64 * 1024];
+        r.read_exact(&mut buf).unwrap();
+        let requests = r.stats().requests;
+        // Back to the start, and to the middle: no new reads.
+        for at in [0usize, 100 * 64 * 1024 + 5] {
+            r.seek(SeekFrom::Start(at as u64)).unwrap();
+            let mut part = [0u8; 1000];
+            r.read_exact(&mut part).unwrap();
+            assert_eq!(&part[..], &data[at..at + 1000]);
+        }
+        assert_eq!(r.stats().requests, requests);
     }
 
     /// Fails every block's first request.

@@ -92,8 +92,9 @@ pub struct Options {
     /// renderer's upload does.
     pub play: Option<f64>,
     pub hz: f64,
-    /// While playing: jump +5 s this often (seconds), like D-pad presses.
+    /// While playing: jump `jump_by` seconds this often (seconds), like D-pad presses.
     pub jump_every: Option<f64>,
+    pub jump_by: f64,
 }
 
 /// Steady playback, as the headset's frame loop sees it.
@@ -120,7 +121,7 @@ pub struct PlayReport {
     /// `advance` (frame selection), excluding the copy.
     pub advance_ms_mean: f64,
     pub advance_ms_max: f64,
-    /// +5 s jumps made while playing (`jump_every`).
+    /// Jumps made while playing (`jump_every`).
     pub jumps: u64,
     /// Why playback stopped early.
     pub error: Option<String>,
@@ -175,6 +176,7 @@ fn play_steady(
     seconds: f64,
     hz: f64,
     jump_every: Option<f64>,
+    jump_by: f64,
 ) -> PlayReport {
     let period = Duration::from_secs_f64(1.0 / hz);
     let clock = Instant::now();
@@ -193,7 +195,7 @@ fn play_steady(
         if let (Some(at), Some(every)) = (next_jump, jump_every)
             && Instant::now() >= at
         {
-            playback.seek(playback.position() + 5.0);
+            playback.seek((playback.position() + jump_by).max(0.0));
             r.jumps += 1;
             next_jump = Some(at + Duration::from_secs_f64(every));
         }
@@ -376,6 +378,7 @@ pub fn run(input: Input, options: &Options) -> anyhow::Result<Report> {
             seconds,
             options.hz,
             options.jump_every,
+            options.jump_by,
         ));
     } else if first_frame_ms.is_some() && options.resume.is_none() {
         let from = options.from.min(duration * 0.5);

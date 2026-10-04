@@ -1,6 +1,7 @@
 #include "media.h"
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
@@ -86,7 +87,12 @@ static void describe_vr(const AVCodecParameters *par, JVMediaInfo *info) {
 JVMedia *jv_media_open(const char *name, jv_read_fn read, jv_seek_fn seek, void *opaque,
                        JVMediaInfo *info, char *error, int error_size) {
     memset(info, 0, sizeof(*info));
-    av_log_set_level(AV_LOG_ERROR);
+    // JUST_VIDEO_FFMPEG_LOG=debug (or verbose, info…) shows more of FFmpeg's log.
+    const char *level = getenv("JUST_VIDEO_FFMPEG_LOG");
+    av_log_set_level(level && !strcmp(level, "debug")     ? AV_LOG_DEBUG
+                     : level && !strcmp(level, "verbose") ? AV_LOG_VERBOSE
+                     : level && !strcmp(level, "info")    ? AV_LOG_INFO
+                                                          : AV_LOG_ERROR);
     JVMedia *media = av_mallocz(sizeof(*media));
     Callbacks *cb = av_malloc(sizeof(*cb));
     uint8_t *buffer = av_malloc(IO_BUFFER_SIZE);

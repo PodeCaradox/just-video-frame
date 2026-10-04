@@ -12,3 +12,9 @@ Patches applied to FFmpeg by `scripts/build-frame-media.sh` (Steam Frame build o
   position still come out first. The callback stops and restarts the OUTPUT
   queue (the stateful decoder interface's seek sequence). Steam Frame, 6K60
   HEVC over SMB: keyframe seeks 0.4–1.7 s → 0.07–0.5 s, no stale frames.
+- `0003-v4l2m2m-requeue-empty-capture-buffers.patch`: a capture buffer the
+  driver returns empty (no bytes used, not the last) holds no picture; FFmpeg
+  passed it on as a frame time stamped 0. It now goes back to the driver.
+  Defensive: a frame stamped 0 s after a jump once set the player's clock back
+  to the start (the player now also drops such frames); this patch's log line
+  (`empty buffer … returned to the driver`, a warning) has not been seen yet.

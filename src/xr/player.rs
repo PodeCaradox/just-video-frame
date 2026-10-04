@@ -276,7 +276,22 @@ mod tests {
         s.decoded = Some(101.0);
         s.key_before = Some(98.0);
         assert_eq!(plan_seek(&s), SeekPlan::Keyframe(114.0));
+        // +5 s, its keyframe 6.5 s back: the next one, 3.6 s past the
+        // target, beats ~4 s of a still picture.
+        s = situation(1177.6, 1172.6);
+        s.hardware = true;
+        s.speed = Some(speed_8k);
+        s.key_before = Some(1171.17);
+        s.key_after = Some(1181.2);
+        assert_eq!(plan_seek(&s), SeekPlan::Keyframe(1181.2));
+        // Keyframes 2 s apart (6K): exact, ~0.7 s of decoding.
+        s.speed = hardware_speed(&video(6144, 3072, 60.0));
+        s.key_before = Some(1176.0);
+        s.key_after = Some(1178.0);
+        assert_eq!(plan_seek(&s), SeekPlan::Exact);
         // 1080p: fast enough to stay exact.
+        s = situation(110.0, 100.0);
+        s.hardware = true;
         s.speed = hardware_speed(&video(1920, 1080, 30.0));
         s.decoded = None;
         s.key_before = Some(105.0);
@@ -734,21 +749,32 @@ pub fn plan_seek(s: &SeekSituation) -> SeekPlan {
     } else {
         [before, after]
     };
-    nearest
-        .into_iter()
-        .find(|&key| {
-            if jump >= 0.0 {
-                key > s.from
-            } else {
-                key < s.from
-            }
-        })
-        // A short jump must still feel like the jump asked for: +5 s may
-        // not land at +12 s.
-        .filter(|&key| {
-            jump.abs() >= KEYFRAME_SEEK_FROM || (key - s.target).abs() <= jump.abs() / 2.0
-        })
-        .map_or(SeekPlan::Exact, SeekPlan::Keyframe)
+    let toward = nearest.into_iter().find(|&key| {
+        if jump >= 0.0 {
+            key > s.from
+        } else {
+            key < s.from
+        }
+    });
+    // A short jump must still feel like the jump asked for: +5 s may
+    // not land at +12 s...
+    if let Some(key) = toward.filter(|&key| {
+        jump.abs() >= KEYFRAME_SEEK_FROM || (key - s.target).abs() <= jump.abs() / 2.0
+    }) {
+        return SeekPlan::Keyframe(key);
+    }
+    // ...unless getting there exactly means seconds of a still picture on
+    // the hardware (+5 s in 8K with keyframes 10 s apart: ~4.5 s).
+    let exact_seconds = s
+        .speed
+        .filter(|_| s.hardware)
+        .map(|x| (s.target - before) / x);
+    match toward {
+        Some(key) if exact_seconds.is_some_and(|t| t > 2.0 * DECODE_BUDGET) => {
+            SeekPlan::Keyframe(key)
+        }
+        _ => SeekPlan::Exact,
+    }
 }
 
 /// A seek whose keyframe is at least this far before the target shows the
@@ -791,19 +817,17 @@ struct StaleFrames {
     key: Option<f64>,
 }
 
-/// Set once a jump failed to restart the hardware decoder: from then on every
-/// jump replaces it (see `replace_decoder`), in every video. What causes it,
-/// another app's decoder session (Steam's), usually lasts until a restart.
-static FLUSH_FAILED: AtomicBool = AtomicBool::new(false);
-
 /// Waits this long at most for the player to drop the old decoder's frames.
 const RELEASE_WAIT: Duration = Duration::from_millis(300);
 
 /// Replaces the hardware decoder with a new one (or the CPU's), closing the
 /// old session first: its frames are dropped (the player lets go of its
-/// pictures while `release` is set), then the old decoder is freed. The driver
-/// may have room for only one 6K or 8K session: Steam's web helper keeps one
-/// open, and then a flush or a second session at a jump runs out of memory.
+/// pictures while `release` is set), then the old decoder is freed. The iris
+/// driver checks the load of all open sessions when a decoder (re)starts
+/// ("current session not supported"): with another session open (Steam's web
+/// helper keeps one), restarting a flushed 6K or 8K decoder is refused, and so
+/// is a second session. A new session passes (probably counted small until
+/// it has decoded a picture).
 fn replace_decoder(
     decoder: &mut VideoDecoder,
     release: &AtomicBool,
@@ -1017,6 +1041,10 @@ fn spawn_decoder(
             let mut stale: Option<StaleFrames> = None;
             // Where the last jump went (the start, until the first frame, of a keyframe jump).
             let mut aim = start;
+            // After a jump, frames from well before its keyframe are bogus: a
+            // new hardware decoder may first return a frame stamped 0 s,
+            // which would set the clock back to the start of the video.
+            let mut floor: Option<f64> = None;
             // Restarts tried after the hardware decoder failed to restart at a jump.
             let mut restarts = 0;
             // Skipping to catch up is set until this media time, and whether
@@ -1079,8 +1107,10 @@ fn spawn_decoder(
                         _ => request.target,
                     };
                     if plan != SeekPlan::Continue {
-                        let replace = hardware
-                            && (FLUSH_FAILED.load(Ordering::Relaxed) || decoder.flush_unreliable());
+                        // A flush that fails (another session's load, see
+                        // `replace_decoder`) costs about what replacing up
+                        // front does, and one that works saves ~120 ms.
+                        let replace = hardware && decoder.flush_unreliable();
                         stale = (hardware && !replace)
                             .then_some(decoded)
                             .flatten()
@@ -1122,6 +1152,10 @@ fn spawn_decoder(
                     // A keyframe jump starts at the first frame, whatever its time.
                     start = if keyframe { f64::NEG_INFINITY } else { to };
                     aim = to;
+                    floor = (plan != SeekPlan::Continue)
+                        .then(|| decoder.keyframe(to, false))
+                        .flatten()
+                        .map(|key| key - 1.0);
                     restarts = 0;
                 }
                 while let Ok(track) = subtitle_changes.try_recv() {
@@ -1143,7 +1177,6 @@ fn spawn_decoder(
                     // the last time on the CPU rather than stop playing.
                     Err(e) if hardware && restarts < MAX_RESTARTS => {
                         restarts += 1;
-                        FLUSH_FAILED.store(true, Ordering::Relaxed);
                         let began = Instant::now();
                         let reopened = replace_decoder(
                             &mut decoder,
@@ -1175,6 +1208,7 @@ fn spawn_decoder(
                         if decoded.is_some() {
                             start = at + 1e-3;
                         }
+                        floor = decoder.keyframe(at, false).map(|key| key - 1.0);
                         stale = None;
                         decoded = None;
                         continue 'decode;
@@ -1192,6 +1226,17 @@ fn spawn_decoder(
                             continue;
                         }
                         stale = None;
+                    }
+                    if let (Some(f), Some(pts)) = (floor, frame.pts()) {
+                        let dropped = catchup.as_ref().map_or(0, |c| c.report.stale);
+                        if pts < f && dropped < MAX_STALE {
+                            eprintln!("Decoder: dropped a frame at {pts:.2}s, before {f:.2}s");
+                            if let Some(c) = &mut catchup {
+                                c.report.stale += 1;
+                            }
+                            continue;
+                        }
+                        floor = None;
                     }
                     if let Some(c) = &mut catchup
                         && c.report.first_ms.is_none()
