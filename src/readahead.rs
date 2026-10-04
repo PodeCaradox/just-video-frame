@@ -81,9 +81,10 @@ const INITIAL_WINDOW: usize = 4;
 const CACHED_BLOCKS: usize = 8;
 /// Reads in flight at most, however large the window: they can't be
 /// cancelled, so after a jump the new position's data arrives only after
-/// them. Over the headset's Wi-Fi 4 already reach full speed (~150 Mbit/s),
-/// while 32 made a jump right after another wait up to 1.5 s.
-const MAX_IN_FLIGHT: usize = 6;
+/// them. Over the headset's Wi-Fi 3 keep 8K (~50 Mbit/s) fed with no stall,
+/// and a jump waits about half as long as with 6 (8K: ~145 vs ~260 ms);
+/// 32 made a jump right after another wait up to 1.5 s.
+const MAX_IN_FLIGHT: usize = 3;
 
 pub struct ReadAheadReader<S: BlockSource> {
     runtime: Arc<Runtime>,
@@ -562,8 +563,7 @@ mod tests {
     }
 
     /// A demuxer alternating between streams stored a few blocks apart must
-    /// keep the full window: over a 20 ms round trip, `MAX_IN_FLIGHT` (6)
-    /// reads in flight read 200 blocks in ~0.8 s, the initial 4 in ~1.2 s.
+    /// keep the full window (reading ahead), not start it over each time.
     #[test]
     fn interleaved_reads_keep_the_window() {
         let options = ReadAhead {
@@ -580,7 +580,9 @@ mod tests {
             }
         }
         let elapsed = started.elapsed();
-        assert!(elapsed < Duration::from_millis(1000), "took {elapsed:?}");
+        assert_eq!(r.window, 32);
+        // 3 reads per 20 ms round trip: ~1.3 s.
+        assert!(elapsed < Duration::from_millis(2000), "took {elapsed:?}");
     }
 
     /// Probing an MP4 with its index at the end: header, the end, then back.
