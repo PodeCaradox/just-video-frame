@@ -863,11 +863,13 @@ const RELEASE_WAIT: Duration = Duration::from_millis(300);
 /// Replaces the hardware decoder with a new one (or the CPU's), closing the
 /// old session first: its frames are dropped (the player lets go of its
 /// pictures while `release` is set), then the old decoder is freed. The iris
-/// driver checks the load of all open sessions when a decoder (re)starts
-/// ("current session not supported"): with another session open (Steam's web
-/// helper keeps one), restarting a flushed 6K or 8K decoder is refused, and so
-/// is a second session. A new session passes (probably counted small until
-/// it has decoded a picture).
+/// driver checks the load when a decoder (re)starts ("current session not
+/// supported"), but counts every open session as the one starting (its own
+/// macroblocks per frame, at its rate): sessions x size <= 2 8K pictures, and
+/// sessions x size x fps <= 8K at 68 fps. The rate is how fast input buffers
+/// were queued (the last 30), and at least 30. So with Steam's web helper
+/// holding a session, a flushed 6K60 or 8K60 decoder (measured at 60) is
+/// refused, and a new one (30) passes; with two, 8K doesn't open at all.
 fn replace_decoder(
     decoder: &mut VideoDecoder,
     release: &AtomicBool,
