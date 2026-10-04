@@ -429,6 +429,10 @@ struct AudioShared {
     volume: AtomicU32,
     /// Media time heard at an instant, for the current generation.
     clock: Mutex<Option<(u64, f64, Instant)>>,
+    /// The generation whose first picture is on screen: its sound starts
+    /// then. Started earlier, it runs ahead of a picture that then skips
+    /// frames to catch up (up to 0.5 s on 6K and 8K), and runs dry meanwhile.
+    pictured: AtomicU64,
 }
 
 impl AudioShared {
@@ -466,9 +470,10 @@ impl AudioWatch {
         }
     }
 
-    fn wrote(&mut self, queued: f64) {
+    /// `starting`: the first writes after a start or jump, into an empty buffer.
+    fn wrote(&mut self, queued: f64, starting: bool) {
         self.writes += 1;
-        self.dry += (queued < Self::DRY) as u32;
+        self.dry += (queued < Self::DRY && !starting) as u32;
         self.min_queued = self.min_queued.min(queued);
         self.queued_sum += queued;
     }
@@ -516,7 +521,10 @@ fn spawn_audio(
             };
             let channels = crate::audio::CHANNELS as usize;
             let rate = crate::audio::RATE as f64;
-            let mut played_generation = 0;
+            // None yet: the first generation (0) waits for its picture too.
+            let mut played_generation = u64::MAX;
+            // Slices written since the generation started.
+            let mut fresh_slices = 0;
             let gain = crate::audio::Gain;
             let mut watch = AudioWatch::new();
             while !stop.load(Ordering::Relaxed) {
@@ -542,6 +550,14 @@ fn spawn_audio(
                 if chunk.generation != played_generation {
                     out.flush();
                     played_generation = chunk.generation;
+                    fresh_slices = 0;
+                    // Queued meanwhile, its sound starts with the picture.
+                    while shared.pictured.load(Ordering::Relaxed) != chunk.generation
+                        && chunk.generation == shared.generation.load(Ordering::Relaxed)
+                        && !stop.load(Ordering::Relaxed)
+                    {
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
                 }
                 // ~10 ms slices keep pause and seek responsive.
                 let slice = (rate as usize / 100) * channels;
@@ -558,7 +574,8 @@ fn spawn_audio(
                         continue;
                     }
                     let end = (offset + slice).min(chunk.samples.len());
-                    watch.wrote(out.latency());
+                    watch.wrote(out.latency(), fresh_slices < 3);
+                    fresh_slices += 1;
                     let level = f32::from_bits(shared.volume.load(Ordering::Relaxed));
                     let scaled = gain.apply(&chunk.samples[offset..end], level);
                     if let Err(e) = out.write(&scaled) {
@@ -1577,6 +1594,7 @@ impl Playback {
                 paused: AtomicBool::new(false),
                 volume: AtomicU32::new(volume.clamp(0.0, 1.0).to_bits()),
                 clock: Mutex::new(None),
+                pictured: AtomicU64::new(u64::MAX),
             })
         });
         let audio_tx = audio.as_ref().map(|shared| {
@@ -1907,6 +1925,9 @@ impl Playback {
             if self.clock_start.is_none() {
                 // The first frame starts the clock: it is due exactly now.
                 self.clock_start = Some(now - (pts * 1e9) as i64);
+                if let Some(audio) = &self.audio {
+                    audio.pictured.store(self.generation, Ordering::Relaxed);
+                }
                 self.sync.restart(now);
                 if let Some(at) = &mut self.paused_at {
                     *at = now;
