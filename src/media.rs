@@ -522,6 +522,7 @@ unsafe extern "C" {
     fn jv_decoder_next(decoder: *mut RawDecoder, frame: *mut RawFrame) -> c_int;
     fn jv_decoder_seek(decoder: *mut RawDecoder, seconds: f64) -> c_int;
     fn jv_decoder_reopen_video(decoder: *mut RawDecoder, try_hardware: c_int) -> c_int;
+    fn jv_decoder_return_to_hardware(decoder: *mut RawDecoder) -> c_int;
     fn jv_decoder_skip_nonref_until(decoder: *mut RawDecoder, seconds: f64);
     fn jv_decoder_skip_to_keyframe_after(decoder: *mut RawDecoder, seconds: f64);
     fn jv_decoder_keyframe(decoder: *mut RawDecoder, seconds: f64, after: c_int) -> f64;
@@ -967,6 +968,48 @@ impl VideoDecoder {
         }
         Ok(())
     }
+
+    /// Decoding on the CPU only because the hardware decoder failed (to open,
+    /// or at a jump), so [`Self::return_to_hardware`] may work later.
+    pub fn hardware_lost(&self) -> bool {
+        !self.hardware
+            && self
+                .stats
+                .note
+                .as_deref()
+                .is_some_and(|n| n.starts_with("Hardware decoder failed"))
+    }
+
+    /// Moves decoding back to the hardware decoder after [`Self::hardware_lost`],
+    /// if its device opens again; on failure the CPU decoder carries on
+    /// untouched. Seek afterwards.
+    pub fn return_to_hardware(&mut self) -> anyhow::Result<()> {
+        // It has buffers for one 8K stream: another video may still hold it.
+        if HARDWARE_DECODERS.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+            bail!("another video holds the hardware decoder");
+        }
+        let code = unsafe { jv_decoder_return_to_hardware(self.raw) };
+        if code < 0 {
+            bail!("FFmpeg error {code}");
+        }
+        self.hardware = true;
+        HARDWARE_DECODERS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.stats.hw_backend = Some("v4l2m2m".into());
+        self.stats.note = None;
+        Ok(())
+    }
+}
+
+/// Whether the headset's hardware decoder looks usable: its firmware isn't
+/// down (`CORE_DEINIT` after a crash, until `iris-driver-rebind` restarts the
+/// driver, ~15 s; the file is gone meanwhile). True where there's no such file.
+pub fn hardware_decoder_ready() -> bool {
+    const IRIS: &str = "/sys/bus/platform/drivers/qcom-iris";
+    if !std::path::Path::new(IRIS).exists() {
+        return true;
+    }
+    std::fs::read_to_string(format!("{IRIS}/aa00000.video-codec/core_state"))
+        .is_ok_and(|state| state.trim() != "CORE_DEINIT")
 }
 
 /// The headset's hardware H.264 decoder (iris) stops for good after a jump

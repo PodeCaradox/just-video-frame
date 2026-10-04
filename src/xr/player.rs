@@ -243,6 +243,23 @@ mod tests {
     }
 
     #[test]
+    fn hardware_tries_back_off_and_stop_after_three_returns() {
+        let mut r = HardwareRetry::new();
+        assert!(!r.due(), "the first try waits for the firmware");
+        let mut waits = Vec::new();
+        for _ in 0..6 {
+            r.next = Instant::now();
+            assert!(r.due());
+            assert!(!r.due());
+            waits.push(r.wait.as_secs());
+        }
+        assert_eq!(waits, [4, 8, 16, 30, 30, 30]);
+        r.returns = HardwareRetry::MAX_RETURNS;
+        r.next = Instant::now();
+        assert!(!r.due());
+    }
+
+    #[test]
     fn slow_hardware_decoding_lands_on_keyframes() {
         let video = |width, height, fps| crate::media::VideoInfo {
             codec: "hevc".into(),
@@ -881,6 +898,84 @@ const MAX_RESTARTS: u32 = 3;
 pub const ON_CPU_NOTICE: &str = "Hardware video decoder unavailable: playing on the CPU. \
                                  If this keeps happening, restart the headset.";
 
+/// Where to seek to land on the keyframe at `key`. Index times may be decode
+/// times (MP4), off from the presentation times a seek takes by a frame or
+/// two: aim between this keyframe and the next.
+fn keyframe_seek(decoder: &mut VideoDecoder, key: f64) -> f64 {
+    decoder
+        .keyframe(key + 1e-3, true)
+        .map_or(key + 0.5, |next| (key + next) / 2.0)
+}
+
+/// When to try the hardware decoder again after falling back to the CPU:
+/// soon (its firmware restarts in ~15 s), then less often, as each try that
+/// fails costs a decoder open (tens of ms) on the decode thread. A decoder
+/// that keeps failing after it opened isn't tried again for this video.
+struct HardwareRetry {
+    next: Instant,
+    wait: Duration,
+    /// Times decoding moved back to the hardware.
+    returns: u32,
+    /// Since when it's waiting for a keyframe to switch at.
+    armed: Option<Instant>,
+}
+
+impl HardwareRetry {
+    const FIRST: Duration = Duration::from_secs(2);
+    const MAX: Duration = Duration::from_secs(30);
+    const MAX_RETURNS: u32 = 3;
+    /// Switch within this of a keyframe (seconds)...
+    const KEY_GAP: f64 = 0.2;
+    /// ...or after waiting this long for one, wherever it is.
+    const KEY_WAIT: Duration = Duration::from_secs(15);
+
+    fn new() -> Self {
+        Self {
+            next: Instant::now() + Self::FIRST,
+            wait: Self::FIRST,
+            returns: 0,
+            armed: None,
+        }
+    }
+
+    /// Tries the hardware decoder; true if decoding moved there (seek next).
+    fn try_return(&mut self, decoder: &mut VideoDecoder, moved: &AtomicBool, at: &str) -> bool {
+        self.armed = None;
+        let began = Instant::now();
+        let result = decoder.return_to_hardware();
+        let ms = began.elapsed().as_secs_f64() * 1e3;
+        match result {
+            Ok(()) => {
+                self.returns += 1;
+                moved.store(true, Ordering::Relaxed);
+                eprintln!("Decoder: back on the hardware in {ms:.0} ms, {at}");
+                true
+            }
+            Err(e) => {
+                eprintln!(
+                    "Decoder: still on the CPU ({e:#}, {ms:.0} ms); next try in {:.0} s",
+                    self.wait.as_secs_f64()
+                );
+                false
+            }
+        }
+    }
+
+    /// True when a try is due; the next one is then twice as far off.
+    fn due(&mut self) -> bool {
+        let now = Instant::now();
+        if now < self.next || self.returns >= Self::MAX_RETURNS {
+            return false;
+        }
+        self.wait = (self.wait * 2).min(Self::MAX);
+        self.next = now + self.wait;
+        true
+    }
+}
+
+/// Shown when decoding moves back to the hardware decoder.
+const BACK_ON_HARDWARE_NOTICE: &str = "Hardware video decoder back";
+
 /// Never drop more than this many frames as stale (the decoder holds ~20).
 const MAX_STALE: u32 = 64;
 
@@ -958,6 +1053,8 @@ struct DecodeThread {
     audio_track: mpsc::Sender<usize>,
     /// Set when the hardware decoder failed at a jump and the CPU took over.
     moved_to_cpu: Arc<AtomicBool>,
+    /// Set when decoding moved back to the hardware decoder (see `HardwareRetry`).
+    back_on_hardware: Arc<AtomicBool>,
     /// Set while the decode thread waits for every frame to be dropped, to
     /// replace the decoder (see `replace_decoder`).
     release_frames: Arc<AtomicBool>,
@@ -1034,6 +1131,8 @@ fn spawn_decoder(
     let shared_report = report.clone();
     let moved_to_cpu = Arc::new(AtomicBool::new(false));
     let on_cpu = moved_to_cpu.clone();
+    let back_on_hardware = Arc::new(AtomicBool::new(false));
+    let on_hardware = back_on_hardware.clone();
     let release_frames = Arc::new(AtomicBool::new(false));
     let release = release_frames.clone();
     std::thread::Builder::new()
@@ -1064,9 +1163,10 @@ fn spawn_decoder(
             let mut stale: Option<StaleFrames> = None;
             // Where the last jump went (the start, until the first frame, of a keyframe jump).
             let mut aim = start;
-            // After a jump, frames from well before its keyframe are bogus: a
-            // new hardware decoder may first return a frame stamped 0 s,
-            // which would set the clock back to the start of the video.
+            // After a jump, frames from well before its keyframe are from
+            // before it, left in a flushed hardware decoder past the `stale`
+            // check (frames from 0.03 s after a first jump to 300 s set the
+            // clock back to the start, and the picture stood still).
             let mut floor: Option<f64> = None;
             // Restarts tried after the hardware decoder failed to restart at a jump.
             let mut restarts = 0;
@@ -1075,6 +1175,10 @@ fn spawn_decoder(
             let mut catching_up_until = f64::NEG_INFINITY;
             let mut to_keyframe = false;
             let mut behind = Behind::new();
+            let mut hardware_retry = HardwareRetry::new();
+            // End of the sound sent for this generation: a decoder replaced
+            // in place (`restarts`, `HardwareRetry`) decodes some of it again.
+            let mut sound_until = f64::NEG_INFINITY;
             'decode: loop {
                 // Before seeks: the seek that follows a switch restarts the new track.
                 while let Ok(track) = audio_changes.try_recv() {
@@ -1090,6 +1194,22 @@ fn spawn_decoder(
                     latest = Some(request);
                 }
                 if let Some(request) = latest {
+                    sound_until = f64::NEG_INFINITY;
+                    // On the CPU after the hardware decoder failed: a jump
+                    // seeks anyway, so it's the place to try the hardware.
+                    if !hardware
+                        && decoder.hardware_lost()
+                        && (hardware_retry.armed.is_some() || hardware_retry.due())
+                        && crate::media::hardware_decoder_ready()
+                    {
+                        if hardware_retry.try_return(&mut decoder, &on_hardware, "at a jump") {
+                            hardware = true;
+                            // Nothing decoded on the new one: the jump seeks.
+                            decoded = None;
+                            catching_up_until = f64::NEG_INFINITY;
+                            to_keyframe = false;
+                        }
+                    }
                     let plan = plan_seek(&SeekSituation {
                         target: request.target,
                         from: request.from,
@@ -1120,13 +1240,8 @@ fn spawn_decoder(
                             .filter(|c| c.report.generation != request.generation)
                             .map_or(0, |c| c.report.coalesced + 1);
                     let to = match plan {
-                        // Index times may be decode times (MP4), off from the
-                        // presentation times a seek takes by a frame or two:
-                        // aim between this keyframe and the next, and take
-                        // whatever frame comes first.
-                        SeekPlan::Keyframe(key) => decoder
-                            .keyframe(key + 1e-3, true)
-                            .map_or(key + 0.5, |next| (key + next) / 2.0),
+                        // Take whatever frame comes first.
+                        SeekPlan::Keyframe(key) => keyframe_seek(&mut decoder, key),
                         _ => request.target,
                     };
                     if plan != SeekPlan::Continue {
@@ -1190,6 +1305,46 @@ fn spawn_decoder(
                 if stop.load(Ordering::Relaxed) {
                     return;
                 }
+                // On the CPU since the hardware decoder failed (its firmware
+                // crashed, or another session took it): back once it opens,
+                // at a keyframe, so the new decoder starts there without
+                // decoding again what the CPU already did (up to 10 s of 8K).
+                if !hardware
+                    && decoder.hardware_lost()
+                    && (hardware_retry.armed.is_some()
+                        || (hardware_retry.due() && crate::media::hardware_decoder_ready()))
+                {
+                    let armed = *hardware_retry.armed.get_or_insert_with(Instant::now);
+                    let key = decoded.and_then(|t| {
+                        [decoder.keyframe(t, false), decoder.keyframe(t + 1e-3, true)]
+                            .into_iter()
+                            .flatten()
+                            .find(|k| (k - t).abs() <= HardwareRetry::KEY_GAP)
+                    });
+                    let waited = armed.elapsed() > HardwareRetry::KEY_WAIT;
+                    if let Some(at) = decoded.filter(|_| key.is_some() || waited)
+                        && hardware_retry.try_return(
+                            &mut decoder,
+                            &on_hardware,
+                            &format!("at {at:.2}s (keyframe {key:.2?})"),
+                        )
+                    {
+                        hardware = true;
+                        restarts = 0;
+                        let to = key.map_or(at, |key| keyframe_seek(&mut decoder, key));
+                        if let Err(e) = decoder.seek(to) {
+                            eprintln!("Seek to {to:.1}s failed: {e:#}");
+                        }
+                        decoder.skip_nonref_until(at);
+                        // Frames up to `at` were already shown.
+                        start = at + 1e-3;
+                        floor = decoder.keyframe(to, false).map(|key| key - 1.0);
+                        stale = None;
+                        decoded = None;
+                        catching_up_until = f64::NEG_INFINITY;
+                        to_keyframe = false;
+                    }
+                }
                 let mut message = 'failed: {
                     match decoder.next_frame() {
                     Ok(Some(frame)) => Decoded::Frame(generation, frame),
@@ -1248,7 +1403,12 @@ fn spawn_decoder(
                             }
                             continue;
                         }
-                        stale = None;
+                        // A frame without a time says nothing: keep filtering.
+                        if frame.pts().is_some() {
+                            stale = None;
+                        } else {
+                            eprintln!("Decoder: a frame without a time after a jump");
+                        }
                     }
                     if let (Some(f), Some(pts)) = (floor, frame.pts()) {
                         let dropped = catchup.as_ref().map_or(0, |c| c.report.stale);
@@ -1288,13 +1448,20 @@ fn spawn_decoder(
                 if let Some(audio) = &audio {
                     while let Some((samples, pts)) = decoder.take_audio(crate::audio::CHANNELS) {
                         let pts = pts.unwrap_or(start);
-                        // After a seek, skip sound from before the target.
-                        let skip = (((start - pts) * crate::audio::RATE as f64).max(0.0) as usize
+                        // After a seek, skip sound from before the target,
+                        // and any already sent (more than timestamp rounding).
+                        let resent = sound_until - pts > 0.01;
+                        let from = if resent { start.max(sound_until) } else { start };
+                        let skip = (((from - pts) * crate::audio::RATE as f64).max(0.0) as usize
                             * crate::audio::CHANNELS as usize)
                             .min(samples.len());
                         if skip < samples.len() {
                             let pts = pts
                                 + (skip / crate::audio::CHANNELS as usize) as f64
+                                    / crate::audio::RATE as f64;
+                            sound_until = pts
+                                + (samples.len() - skip) as f64
+                                    / crate::audio::CHANNELS as f64
                                     / crate::audio::RATE as f64;
                             let _ = audio.send(AudioChunk {
                                 generation,
@@ -1401,6 +1568,7 @@ fn spawn_decoder(
         subtitle_track,
         audio_track,
         moved_to_cpu,
+        back_on_hardware,
         release_frames,
     }
 }
@@ -1507,6 +1675,8 @@ pub struct Playback {
     subtitle_notice: Option<(String, Instant)>,
     /// The hardware decoder failed at a jump and the CPU took over.
     pub moved_to_cpu: bool,
+    /// Decoding moved back to the hardware decoder after the CPU took over.
+    pub back_on_hardware: bool,
     audio_labels: Vec<String>,
     audio_track: Option<usize>,
     decode: DecodeThread,
@@ -1690,6 +1860,7 @@ impl Playback {
             embedded_cues,
             subtitle_notice: None,
             moved_to_cpu: false,
+            back_on_hardware: false,
             audio_labels,
             audio_track,
             audio,
@@ -1956,6 +2127,10 @@ impl Playback {
             eprintln!("Playing on the CPU: the hardware decoder failed at a jump");
             self.moved_to_cpu = true;
             self.notice(ON_CPU_NOTICE.into(), Duration::from_secs(6));
+        }
+        if self.decode.back_on_hardware.swap(false, Ordering::Relaxed) {
+            self.back_on_hardware = true;
+            self.notice(BACK_ON_HARDWARE_NOTICE.into(), Duration::from_secs(4));
         }
         self.sync_to_audio(now);
         let mut media_time = self.media_time(now);

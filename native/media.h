@@ -93,6 +93,8 @@ JVDecoder *jv_decoder_open(JVMedia *media, const char *hw_backend, int allow_sof
 int jv_decoder_next(JVDecoder *decoder, JVFrame *frame);
 int jv_decoder_seek(JVDecoder *decoder, double seconds);
 int jv_decoder_reopen_video(JVDecoder *decoder, int try_hardware);
+// After falling back to the CPU: 0 once on the V4L2 device again, < 0 if it won't open.
+int jv_decoder_return_to_hardware(JVDecoder *decoder);
 // While catching up after a seek, skip non-reference frames of packets before
 // `seconds` (they would be discarded anyway); <= 0 turns it off.
 void jv_decoder_skip_nonref_until(JVDecoder *decoder, double seconds);

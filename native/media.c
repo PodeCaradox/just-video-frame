@@ -230,6 +230,9 @@ struct JVDecoder {
     AVPacket *packet;
     AVFrame *transfer;  // scratch for hwaccel -> CPU transfers
     FormatChoice choice;
+    // The V4L2 decoder for this stream, kept after falling back to the CPU
+    // so `jv_decoder_return_to_hardware` can try it again.
+    const AVCodec *hw_codec;
     int flushing;
     // While catching up to a seek target: video packets before this time (stream
     // time base) skip non-reference frames, which nothing else needs.
@@ -536,6 +539,7 @@ JVDecoder *jv_decoder_open(JVMedia *media, const char *hw_backend, int allow_sof
         hw_backend = NULL;  // no hwdevice context: the wrapper talks to /dev/video* itself
         if (wrapper) {
             codec = wrapper;
+            d->hw_codec = wrapper;
             d->choice.hardware_wrapper = 1;
             copy_name(s->hw_backend, sizeof(s->hw_backend), "v4l2m2m");
             // FFmpeg's default of 20 capture buffers fails to allocate at 8K.
@@ -661,6 +665,42 @@ int jv_decoder_reopen_video(JVDecoder *d, int try_hardware) {
         if (!hardware) return ret;
     }
     return AVERROR_BUG;
+}
+
+// Moves a decoder that fell back to the CPU back to the V4L2 device, once it
+// opens again (its firmware restarted). The CPU decoder is only freed when the
+// new one opened, so a failed try costs nothing else. Seek afterwards.
+// Returns 0 on success, < 0 when the device still won't open.
+int jv_decoder_return_to_hardware(JVDecoder *d) {
+    if (!d->hw_codec || d->choice.hardware_wrapper) return AVERROR(ENOSYS);
+    AVStream *video = d->media->format->streams[d->media->video_stream];
+    FormatChoice software = d->choice;
+    AVCodecContext *ctx = avcodec_alloc_context3(d->hw_codec);
+    if (!ctx) return AVERROR(ENOMEM);
+    int ret = avcodec_parameters_to_context(ctx, video->codecpar);
+    if (ret < 0) { avcodec_free_context(&ctx); return ret; }
+    ctx->pkt_timebase = video->time_base;
+    ctx->opaque = &d->choice;
+    ctx->get_format = choose_format;
+    ctx->thread_count = 0;
+    d->choice = (FormatChoice){ AV_PIX_FMT_NONE, 1, 1 };
+    AVDictionary *options = NULL;
+    int64_t pixels = (int64_t)video->codecpar->width * video->codecpar->height;
+    av_dict_set_int(&options, "num_capture_buffers", pixels > 4096 * 2304 ? 6 : 12, 0);
+    av_dict_set_int(&options, "num_output_buffers", 16, 0);
+    ret = avcodec_open2(ctx, d->hw_codec, &options);
+    av_dict_free(&options);
+    if (ret < 0) {
+        avcodec_free_context(&ctx);
+        d->choice = software;
+        return ret;
+    }
+    avcodec_free_context(&d->ctx);
+    d->ctx = ctx;
+    d->skip_until = AV_NOPTS_VALUE;
+    d->skip_to_key = 0;
+    d->flushing = 0;
+    return 0;
 }
 
 static int describe_frame(JVDecoder *d, AVFrame *frame, JVFrame *out) {
