@@ -9,6 +9,8 @@
 # Library art (assets/steam, made by `just-video steam-art`) goes into each
 # Steam user's config/grid on every run; the shortcut's icon field is only
 # edited while Steam is stopped, for the same reason as the VR flag.
+# A SteamVR manifest (justvideo.vrmanifest) is registered too: it gives the
+# "Now Playing" panel its picture, which Steam's own manifest entry cannot.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 binary=target/aarch64-unknown-linux-gnu/release/just-video

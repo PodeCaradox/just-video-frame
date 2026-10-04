@@ -10,6 +10,12 @@ shortcuts.vdf has the Just Video entry, copies the art (made by
   hero.png     -> <id>_hero.png  (banner on the game page)
   icon.png     -> <id>_icon.png
 
+It also writes ART_DIR/../justvideo.vrmanifest and lists it in SteamVR's
+appconfig.json. Steam's own steamapps.vrmanifest entry for a shortcut has only
+binary_path_linux, which SteamVR on the Frame (arm64) skips ("must specify
+binary_path"), so the app has no picture in SteamVR's "Now Playing" panel
+(/app/image 404s). Ours has binary_path_linux_arm and the art as image_path.
+
   steam-shortcut.py ART_DIR              copy the grid art (safe while Steam runs)
   steam-shortcut.py ART_DIR --set-icon   also point the entry's icon at ART_DIR/icon.png
   steam-shortcut.py ART_DIR --icon-ok    exit 1 if the icon isn't set yet
@@ -20,6 +26,7 @@ Steam keeps shortcuts.vdf in memory and rewrites it while running, so
 """
 
 import glob
+import json
 import os
 import re
 import shutil
@@ -33,6 +40,41 @@ GRID_NAMES = {
     "hero.png": "{}_hero.png",
     "icon.png": "{}_icon.png",
 }
+
+
+def write_vr_manifest(art, app_id):
+    """SteamVR app manifest giving app `steam.app.<id>` its picture and launcher."""
+    base = os.path.dirname(art)
+    launcher = os.path.join(base, "Just Video")
+    manifest = os.path.join(base, "justvideo.vrmanifest")
+    app = {
+        "app_key": f"steam.app.{app_id}",
+        "launch_type": "binary",
+        "binary_path_linux": launcher,
+        "binary_path_linux_arm": launcher,
+        "working_directory": base,
+        "is_openxr": 1,
+        "image_path": os.path.join(art, "capsule.png"),
+        "image_path_capsule": os.path.join(art, "portrait.png"),
+        "strings": {"en_us": {"name": "Just Video"}},
+    }
+    with open(manifest, "w") as f:
+        json.dump({"source": "user", "applications": [app]}, f, indent=2)
+    config = os.environ.get("OPENVR_CONFIG") or os.path.expanduser("~/.config/openvr/config")
+    path = os.path.join(config, "appconfig.json")
+    try:
+        with open(path) as f:
+            conf = json.load(f)
+    except (OSError, ValueError):
+        conf = {}
+    paths = conf.setdefault("manifest_paths", [])
+    if manifest not in paths:
+        paths.append(manifest)
+        os.makedirs(config, exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(conf, f, indent=3)
+    print(f"SteamVR manifest for app id {app_id} ({manifest}).")
+
 
 # Binary VDF: each field is <type byte><key>\0<value>; a map ends with 0x08.
 MAP, STRING, INT32, END = 0, 1, 2, 8
@@ -197,6 +239,7 @@ def main():
             for src, name in GRID_NAMES.items():
                 shutil.copyfile(os.path.join(art, src), os.path.join(grid, name.format(gid)))
             print(f"Steam art installed for app id {gid} ({grid}).")
+        write_vr_manifest(art, sorted(set(ids))[0])
         if mode == "--set-icon" and entries and not icon_ok:
             set_icon(path, items, entries, icon)
     if mode == "--icon-ok":
