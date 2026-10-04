@@ -108,6 +108,23 @@ pub fn initial(view: &View, fonts: &mut Fonts) -> Option<Focus> {
     fixed.last().copied().map(make)
 }
 
+/// The item the pointer is over, as a focus (the copy nearest `point` if the
+/// hit has several); None over nothing or the scroll bar.
+pub fn at_hit(view: &View, fonts: &mut Fonts, hit: Hit, point: (f32, f32)) -> Option<Focus> {
+    let targets = match (hit, row_of(hit)) {
+        (Hit::Nothing | Hit::ScrollBar, _) => return None,
+        (_, Some(i)) if list_shown(view) => browser::row_targets(view, i),
+        (_, Some(_)) => return None,
+        _ => browser::fixed_targets(view, fonts),
+    };
+    let distance = |f: &Focus| (f.at.0 - point.0).powi(2) + (f.at.1 - point.1).powi(2);
+    targets
+        .into_iter()
+        .filter(|(h, _)| *h == hit)
+        .map(make)
+        .min_by(|a, b| distance(a).total_cmp(&distance(b)))
+}
+
 /// Whether `focus` still names something on this view.
 pub fn valid(view: &View, fonts: &mut Fonts, focus: &Focus) -> bool {
     match row_of(focus.hit) {
@@ -290,6 +307,29 @@ mod tests {
         assert!(matches!(left.hit, Hit::Crumb(_)), "{left:?}");
         round_trips(&v, &mut fonts, &left);
         assert_eq!(step(&v, &mut fonts, top, Dir::Down).hit, Hit::Row(0));
+    }
+
+    #[test]
+    fn pointed_at_item_is_where_the_dpad_starts() {
+        let mut fonts = Fonts::load().expect("fonts");
+        let v = view(30);
+        let p = |hit| {
+            let (_, r) = browser::row_targets(&v, 3)
+                .into_iter()
+                .chain(browser::row_targets(&v, 1))
+                .find(|(h, _)| *h == hit)
+                .unwrap();
+            point(hit, r)
+        };
+        let at = at_hit(&v, &mut fonts, Hit::Row(3), p(Hit::Row(3))).unwrap();
+        assert_eq!(at.hit, Hit::Row(3));
+        assert_eq!(step(&v, &mut fonts, at, Dir::Down).hit, Hit::Row(4));
+        let action = Hit::RowAction(1, Action::Delete);
+        let f = at_hit(&v, &mut fonts, action, p(action)).unwrap();
+        assert_eq!(f.hit, action);
+        round_trips(&v, &mut fonts, &f);
+        assert!(at_hit(&v, &mut fonts, Hit::Nothing, (0.0, 0.0)).is_none());
+        assert!(at_hit(&v, &mut fonts, Hit::ScrollBar, (0.0, 0.0)).is_none());
     }
 
     #[test]

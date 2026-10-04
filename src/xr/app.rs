@@ -881,24 +881,30 @@ pub fn run(
                     view.form.is_some() || view.status.is_some(),
                 );
                 let dir = focus::Dir::from_steps(buttons.seek, buttons.volume);
-                // Right on a folder opens it (the new place then gets focus).
-                let opened = focus
-                    .filter(|f| {
-                        dir == Some(focus::Dir::Right)
-                            && place == focus_place
-                            && focus::valid(view, &mut fonts, f)
+                // Pointing at something counts as having it focused.
+                let pointed = point
+                    .filter(|_| {
+                        dir.is_some() && (focus.is_none() || pointer_moved(point, focus_pointer))
                     })
+                    .and_then(|p| focus::at_hit(view, &mut fonts, hit, p));
+                // Right on a folder opens it (the new place then gets focus).
+                let opened = pointed
+                    .or(focus.filter(|f| place == focus_place && focus::valid(view, &mut fonts, f)))
+                    .filter(|_| dir == Some(focus::Dir::Right))
                     .and_then(|f| focus::opens_on_right(view, &f));
                 if let Some(hit) = opened {
                     nav.click(hit);
                     // Holding right must not keep going down into subfolders.
                     input.wait_for_dpad_release();
                 } else if let Some(dir) = dir {
-                    focus = match focus {
-                        Some(f) if place == focus_place && focus::valid(view, &mut fonts, &f) => {
+                    focus = match (pointed, focus) {
+                        (Some(from), _) => Some(focus::step(view, &mut fonts, from, dir)),
+                        (_, Some(f))
+                            if place == focus_place && focus::valid(view, &mut fonts, &f) =>
+                        {
                             Some(focus::step(view, &mut fonts, f, dir))
                         }
-                        Some(f) if place == focus_place => focus::refind(view, &mut fonts, &f),
+                        (_, Some(f)) if place == focus_place => focus::refind(view, &mut fonts, &f),
                         _ => focus::initial(view, &mut fonts),
                     };
                     focus_pointer = point;
@@ -1072,10 +1078,17 @@ pub fn run(
                         dialog_focus = focus::closest_point(&points, at).map(|i| targets[i]);
                     }
                     if let Some(dir) = focus::Dir::from_steps(buttons.seek, buttons.volume) {
-                        let next = match dialog_focus {
-                            Some((_, at)) => focus::nearest_point(&points, at, dir),
+                        // Pointing at a button counts as having it focused.
+                        let pointed = targets.iter().position(|t| t.0 == dialog_hit).filter(|_| {
+                            dialog_focus.is_none() || pointer_moved(pointer, dialog_focus_pointer)
+                        });
+                        let next = match (pointed, dialog_focus) {
+                            (Some(i), _) => {
+                                focus::nearest_point(&points, points[i], dir).or(Some(i))
+                            }
+                            (_, Some((_, at))) => focus::nearest_point(&points, at, dir),
                             // First press: the first button after Close.
-                            None => targets.iter().position(|t| t.0 != controls::Hit::Close),
+                            _ => targets.iter().position(|t| t.0 != controls::Hit::Close),
                         };
                         if let Some(i) = next {
                             dialog_focus = Some(targets[i]);
