@@ -875,6 +875,7 @@ fn replace_decoder(
     release: &AtomicBool,
     stop: &AtomicBool,
     try_hardware: bool,
+    free_behind: bool,
 ) -> anyhow::Result<()> {
     release.store(true, Ordering::Relaxed);
     let asked = Instant::now();
@@ -889,7 +890,7 @@ fn replace_decoder(
     if alive > 0 {
         eprintln!("Decoder: {alive} frames still held; replacing it anyway");
     }
-    decoder.reopen_video(try_hardware)
+    decoder.reopen_video(try_hardware, free_behind)
 }
 
 /// Restarts of the hardware decoder after it fails at a jump; the last one
@@ -1262,8 +1263,10 @@ fn spawn_decoder(
                                 },
                             });
                         let began = Instant::now();
+                        let free_behind = replace && decoder.can_free_behind();
                         if replace
-                            && let Err(e) = replace_decoder(&mut decoder, &release, &stop, true)
+                            && let Err(e) =
+                                replace_decoder(&mut decoder, &release, &stop, true, free_behind)
                         {
                             // No decoder left: the next frame fails.
                             eprintln!("Replacing the decoder at a jump failed: {e:#}");
@@ -1358,11 +1361,14 @@ fn spawn_decoder(
                     Err(e) if hardware && restarts < MAX_RESTARTS => {
                         restarts += 1;
                         let began = Instant::now();
+                        // Retries free the old one first: it may be why this failed.
+                        let free_behind = restarts == 1 && decoder.can_free_behind();
                         let reopened = replace_decoder(
                             &mut decoder,
                             &release,
                             &stop,
                             restarts < MAX_RESTARTS,
+                            free_behind,
                         );
                         hardware = decoder.stats().hw_backend.is_some();
                         if reopened.is_ok() && !hardware {
@@ -1370,8 +1376,9 @@ fn spawn_decoder(
                         }
                         let at = decoded.unwrap_or(aim);
                         eprintln!(
-                            "Decoder failed ({e:#}); replaced in {:.0} ms ({}), continuing at {at:.1}s",
+                            "Decoder failed ({e:#}); replaced in {:.0} ms ({}{}), continuing at {at:.1}s",
                             began.elapsed().as_secs_f64() * 1e3,
+                            if free_behind { "old one freed meanwhile, " } else { "" },
                             match &reopened {
                                 Ok(()) if hardware => "hardware".to_string(),
                                 Ok(()) => "software".to_string(),

@@ -92,7 +92,8 @@ JVDecoder *jv_decoder_open(JVMedia *media, const char *hw_backend, int allow_sof
 // unsupported pixel format, other negative AVERROR on failure.
 int jv_decoder_next(JVDecoder *decoder, JVFrame *frame);
 int jv_decoder_seek(JVDecoder *decoder, double seconds);
-int jv_decoder_reopen_video(JVDecoder *decoder, int try_hardware);
+// `free_behind`: free the old decoder on a thread meanwhile (see media.c).
+int jv_decoder_reopen_video(JVDecoder *decoder, int try_hardware, int free_behind);
 // After falling back to the CPU: 0 once on the V4L2 device again, < 0 if it won't open.
 int jv_decoder_return_to_hardware(JVDecoder *decoder);
 // While catching up after a seek, skip non-reference frames of packets before

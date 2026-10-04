@@ -1,5 +1,6 @@
 #include "media.h"
 #include <math.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -233,6 +234,10 @@ struct JVDecoder {
     // The V4L2 decoder for this stream, kept after falling back to the CPU
     // so `jv_decoder_return_to_hardware` can try it again.
     const AVCodec *hw_codec;
+    // A replaced V4L2 decoder still being freed (closing its session takes
+    // ~50 ms): joined before this decoder next decodes or closes.
+    pthread_t closer;
+    int closing;
     int flushing;
     // While catching up to a seek target: video packets before this time (stream
     // time base) skip non-reference frames, which nothing else needs.
@@ -486,8 +491,20 @@ static void drop_video_packets(JVDecoder *d) {
     d->awaiting_picture = 1;
 }
 
+static void *free_context(void *ctx) {
+    avcodec_free_context((AVCodecContext **)&ctx);
+    return NULL;
+}
+
+static void finish_closing(JVDecoder *d) {
+    if (!d->closing) return;
+    pthread_join(d->closer, NULL);
+    d->closing = 0;
+}
+
 void jv_decoder_close(JVDecoder *d) {
     if (!d) return;
+    finish_closing(d);
     drop_cues(d);
     avcodec_free_context(&d->subtitle);
     avcodec_free_context(&d->audio);
@@ -630,12 +647,20 @@ fail:
 // subtitle state stay); falls back to the CPU if the device won't open, or
 // goes straight there without `try_hardware`.
 // Returns 1 when the new decoder is the hardware one, 0 for software, < 0 on failure.
-int jv_decoder_reopen_video(JVDecoder *d, int try_hardware) {
+int jv_decoder_reopen_video(JVDecoder *d, int try_hardware, int free_behind) {
     if (!d->choice.hardware_wrapper) return AVERROR(ENOSYS);
     AVStream *video = d->media->format->streams[d->media->video_stream];
     const AVCodec *codec = d->ctx->codec;
-    // The old instance goes first: the driver counts every open session's load.
-    avcodec_free_context(&d->ctx);
+    finish_closing(d);
+    // The old instance goes first, as the driver counts every open session's
+    // load when one starts; with `free_behind`, while the new one opens, and
+    // before it starts (`jv_decoder_next`).
+    if (free_behind && pthread_create(&d->closer, NULL, free_context, d->ctx) == 0) {
+        d->closing = 1;
+        d->ctx = NULL;
+    } else {
+        avcodec_free_context(&d->ctx);
+    }
     for (int hardware = !!try_hardware; hardware >= 0; --hardware) {
         if (!hardware) codec = avcodec_find_decoder(video->codecpar->codec_id);
         if (!codec) return AVERROR_DECODER_NOT_FOUND;
@@ -662,6 +687,12 @@ int jv_decoder_reopen_video(JVDecoder *d, int try_hardware) {
             return hardware;
         }
         avcodec_free_context(&d->ctx);
+        // Perhaps short of memory while the old one closes: wait, try again.
+        if (hardware && d->closing) {
+            finish_closing(d);
+            ++hardware;
+            continue;
+        }
         if (!hardware) return ret;
     }
     return AVERROR_BUG;
@@ -673,6 +704,7 @@ int jv_decoder_reopen_video(JVDecoder *d, int try_hardware) {
 // Returns 0 on success, < 0 when the device still won't open.
 int jv_decoder_return_to_hardware(JVDecoder *d) {
     if (!d->hw_codec || d->choice.hardware_wrapper) return AVERROR(ENOSYS);
+    finish_closing(d);
     AVStream *video = d->media->format->streams[d->media->video_stream];
     FormatChoice software = d->choice;
     AVCodecContext *ctx = avcodec_alloc_context3(d->hw_codec);
@@ -874,6 +906,7 @@ static int read_ahead(JVDecoder *d) {
 }
 
 int jv_decoder_next(JVDecoder *d, JVFrame *out) {
+    finish_closing(d);
     if (!d->ctx) return AVERROR(EINVAL);  // a failed reopen left no decoder
     AVFrame *frame = av_frame_alloc();
     if (!frame) return AVERROR(ENOMEM);

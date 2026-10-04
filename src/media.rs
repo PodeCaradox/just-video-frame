@@ -521,7 +521,11 @@ unsafe extern "C" {
     ) -> *mut RawDecoder;
     fn jv_decoder_next(decoder: *mut RawDecoder, frame: *mut RawFrame) -> c_int;
     fn jv_decoder_seek(decoder: *mut RawDecoder, seconds: f64) -> c_int;
-    fn jv_decoder_reopen_video(decoder: *mut RawDecoder, try_hardware: c_int) -> c_int;
+    fn jv_decoder_reopen_video(
+        decoder: *mut RawDecoder,
+        try_hardware: c_int,
+        free_behind: c_int,
+    ) -> c_int;
     fn jv_decoder_return_to_hardware(decoder: *mut RawDecoder) -> c_int;
     fn jv_decoder_skip_nonref_until(decoder: *mut RawDecoder, seconds: f64);
     fn jv_decoder_skip_to_keyframe_after(decoder: *mut RawDecoder, seconds: f64);
@@ -954,9 +958,12 @@ impl VideoDecoder {
     /// Replaces the hardware video decoder with a new one, or with software
     /// decoding if the device won't open (or at once without
     /// `try_hardware`). The old session only closes once [`Self::frames_alive`]
-    /// is 0. Seek afterwards.
-    pub fn reopen_video(&mut self, try_hardware: bool) -> anyhow::Result<()> {
-        let code = unsafe { jv_decoder_reopen_video(self.raw, try_hardware as c_int) };
+    /// is 0. With `free_behind`, it's freed on a thread while the new one
+    /// opens (see [`Self::can_free_behind`]). Seek afterwards.
+    pub fn reopen_video(&mut self, try_hardware: bool, free_behind: bool) -> anyhow::Result<()> {
+        let code = unsafe {
+            jv_decoder_reopen_video(self.raw, try_hardware as c_int, free_behind as c_int)
+        };
         if code < 0 {
             bail!("Reopening the decoder failed (FFmpeg error {code})");
         }
@@ -967,6 +974,22 @@ impl VideoDecoder {
             self.stats.note = Some("Hardware decoder failed; decoding on the CPU".into());
         }
         Ok(())
+    }
+
+    /// Whether a new hardware session can start while this one is still
+    /// being freed (~50 ms saved at each jump that replaces the decoder). The
+    /// iris driver counts every open session as the one starting, a new one
+    /// at 30 fps: with Steam's sessions and both of ours, it must still fit.
+    pub fn can_free_behind(&self) -> bool {
+        let Some(video) = self.info().video.as_ref().filter(|_| self.hardware) else {
+            return false;
+        };
+        let Some(others) = other_decoder_sessions() else {
+            return false;
+        };
+        let mbpf = video.width.div_ceil(16) as u64 * video.height.div_ceil(16) as u64;
+        let sessions = others as u64 + 2;
+        sessions * mbpf <= IRIS_MAX_MBPF && sessions * mbpf * 30 <= IRIS_MAX_MBPS
     }
 
     /// Decoding on the CPU only because the hardware decoder failed (to open,
@@ -998,6 +1021,33 @@ impl VideoDecoder {
         self.stats.note = None;
         Ok(())
     }
+}
+
+/// The iris core's limits: macroblocks (16x16) per frame and per second.
+const IRIS_MAX_MBPF: u64 = 278_528;
+const IRIS_MAX_MBPS: u64 = 7_833_600;
+
+/// Sessions other processes hold on the headset's hardware decoder (Steam's
+/// web helper keeps one or two), or `None` without one.
+fn other_decoder_sessions() -> Option<usize> {
+    let device = std::fs::canonicalize("/dev/video-dec0").ok()?;
+    let me = std::process::id().to_string();
+    let mut count = 0;
+    for process in std::fs::read_dir("/proc").ok()?.flatten() {
+        let name = process.file_name();
+        let name = name.to_string_lossy();
+        if name == me || !name.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let Ok(fds) = std::fs::read_dir(process.path().join("fd")) else {
+            continue;
+        };
+        count += fds
+            .flatten()
+            .filter(|fd| std::fs::read_link(fd.path()).is_ok_and(|target| target == device))
+            .count();
+    }
+    Some(count)
 }
 
 /// Whether the headset's hardware decoder looks usable: its firmware isn't
