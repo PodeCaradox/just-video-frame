@@ -520,6 +520,15 @@ void jv_decoder_close(JVDecoder *d) {
     av_free(d);
 }
 
+// Capture buffers for the V4L2 decoder: those held by the player (queue,
+// picture on screen and the next one) and the decoder's reference pictures
+// all come out of them, so a small picture gets more. Too few and the driver
+// has nothing to decode into. 8K takes all the memory it can have (see the
+// notes on FFmpeg's default of 20 failing there).
+static int capture_buffer_count(int64_t pixels) {
+    return pixels > 4096 * 2304 ? 6 : pixels > 1920 * 1088 ? 12 : 20;
+}
+
 JVDecoder *jv_decoder_open(JVMedia *media, const char *hw_backend, int allow_software,
                            const char *decoder_options, JVDecodeStats *s) {
     memset(s, 0, sizeof(*s));
@@ -561,7 +570,7 @@ JVDecoder *jv_decoder_open(JVMedia *media, const char *hw_backend, int allow_sof
             copy_name(s->hw_backend, sizeof(s->hw_backend), "v4l2m2m");
             // FFmpeg's default of 20 capture buffers fails to allocate at 8K.
             int64_t pixels = (int64_t)video->codecpar->width * video->codecpar->height;
-            av_dict_set_int(&open_options, "num_capture_buffers", pixels > 4096 * 2304 ? 6 : 12, 0);
+            av_dict_set_int(&open_options, "num_capture_buffers", capture_buffer_count(pixels), 0);
             av_dict_set_int(&open_options, "num_output_buffers", 16, 0);
         } else if (!allow_software) {
             ret = AVERROR(ENOSYS);
@@ -619,7 +628,7 @@ reopen:
         av_usleep(250000 * hw_retries);
         av_dict_free(&open_options);
         int64_t pixels = (int64_t)video->codecpar->width * video->codecpar->height;
-        av_dict_set_int(&open_options, "num_capture_buffers", pixels > 4096 * 2304 ? 6 : 12, 0);
+        av_dict_set_int(&open_options, "num_capture_buffers", capture_buffer_count(pixels), 0);
         av_dict_set_int(&open_options, "num_output_buffers", 16, 0);
         goto reopen;
     }
@@ -676,7 +685,7 @@ int jv_decoder_reopen_video(JVDecoder *d, int try_hardware, int free_behind) {
         AVDictionary *options = NULL;
         if (hardware) {
             int64_t pixels = (int64_t)video->codecpar->width * video->codecpar->height;
-            av_dict_set_int(&options, "num_capture_buffers", pixels > 4096 * 2304 ? 6 : 12, 0);
+            av_dict_set_int(&options, "num_capture_buffers", capture_buffer_count(pixels), 0);
             av_dict_set_int(&options, "num_output_buffers", 16, 0);
         }
         ret = avcodec_open2(d->ctx, codec, &options);
@@ -718,7 +727,7 @@ int jv_decoder_return_to_hardware(JVDecoder *d) {
     d->choice = (FormatChoice){ AV_PIX_FMT_NONE, 1, 1 };
     AVDictionary *options = NULL;
     int64_t pixels = (int64_t)video->codecpar->width * video->codecpar->height;
-    av_dict_set_int(&options, "num_capture_buffers", pixels > 4096 * 2304 ? 6 : 12, 0);
+    av_dict_set_int(&options, "num_capture_buffers", capture_buffer_count(pixels), 0);
     av_dict_set_int(&options, "num_output_buffers", 16, 0);
     ret = avcodec_open2(ctx, d->hw_codec, &options);
     av_dict_free(&options);
@@ -905,13 +914,31 @@ static int read_ahead(JVDecoder *d) {
     }
 }
 
+// How long one call to jv_decoder_next may wait for the hardware decoder
+// (it returns an error then, and the player replaces the decoder).
+#define HARDWARE_STALL_US 3000000
+
 int jv_decoder_next(JVDecoder *d, JVFrame *out) {
     finish_closing(d);
     if (!d->ctx) return AVERROR(EINVAL);  // a failed reopen left no decoder
     AVFrame *frame = av_frame_alloc();
     if (!frame) return AVERROR(ENOMEM);
+    // Time spent waiting in the hardware decoder for a picture (reading and
+    // other work don't count): it blocks only when the driver is slow, or has
+    // stopped (every buffer it can decode into held elsewhere, a lost session).
+    int64_t waited = 0;
     for (;;) {
+        int64_t began = av_gettime_relative();
         int ret = avcodec_receive_frame(d->ctx, frame);
+        if (ret == AVERROR(EAGAIN) && (d->ctx->codec->capabilities & AV_CODEC_CAP_HARDWARE)) {
+            waited += av_gettime_relative() - began;
+            if (waited > HARDWARE_STALL_US) {
+                av_log(NULL, AV_LOG_ERROR, "Hardware decoder returned no picture for %lld ms\n",
+                       (long long)(waited / 1000));
+                av_frame_free(&frame);
+                return AVERROR(ETIMEDOUT);
+            }
+        }
         if (ret == 0) {
             d->awaiting_picture = 0;
             ret = describe_frame(d, frame, out);
