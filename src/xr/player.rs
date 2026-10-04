@@ -791,6 +791,11 @@ struct StaleFrames {
     key: Option<f64>,
 }
 
+/// Set once a jump failed to restart the hardware decoder: from then on every
+/// jump replaces it (see `replace_decoder`), in every video. What causes it,
+/// another app's decoder session (Steam's), usually lasts until a restart.
+static FLUSH_FAILED: AtomicBool = AtomicBool::new(false);
+
 /// Waits this long at most for the player to drop the old decoder's frames.
 const RELEASE_WAIT: Duration = Duration::from_millis(300);
 
@@ -1014,8 +1019,6 @@ fn spawn_decoder(
             let mut aim = start;
             // Restarts tried after the hardware decoder failed to restart at a jump.
             let mut restarts = 0;
-            // Once a flush failed: a new hardware decoder at every jump.
-            let mut replace_at_jumps = false;
             // Skipping to catch up is set until this media time, and whether
             // it skips to a keyframe.
             let mut catching_up_until = f64::NEG_INFINITY;
@@ -1076,8 +1079,8 @@ fn spawn_decoder(
                         _ => request.target,
                     };
                     if plan != SeekPlan::Continue {
-                        let replace =
-                            hardware && (replace_at_jumps || decoder.flush_unreliable());
+                        let replace = hardware
+                            && (FLUSH_FAILED.load(Ordering::Relaxed) || decoder.flush_unreliable());
                         stale = (hardware && !replace)
                             .then_some(decoded)
                             .flatten()
@@ -1140,7 +1143,7 @@ fn spawn_decoder(
                     // the last time on the CPU rather than stop playing.
                     Err(e) if hardware && restarts < MAX_RESTARTS => {
                         restarts += 1;
-                        replace_at_jumps = true;
+                        FLUSH_FAILED.store(true, Ordering::Relaxed);
                         let began = Instant::now();
                         let reopened = replace_decoder(
                             &mut decoder,

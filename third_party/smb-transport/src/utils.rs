@@ -1,4 +1,7 @@
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr, ToSocketAddrs};
+use std::sync::Mutex;
+use std::time::Duration;
 
 pub struct TransportUtils;
 use crate::TransportError;
@@ -42,11 +45,32 @@ impl TransportUtils {
             format!("{endpoint}:0")
         };
 
-        endpoint
-            .to_socket_addrs()
-            .map_err(|_| invalid())?
-            .next()
-            .ok_or_else(invalid)
+        Self::resolve(&endpoint, |e| e.to_socket_addrs().ok()?.next()).ok_or_else(invalid)
+    }
+
+    /// Resolves a host name, retrying: mDNS names (`nas.local`) sometimes fail
+    /// to resolve for a moment on a busy Wi-Fi link. If it still fails, the
+    /// address that last worked for the name in this process is used.
+    fn resolve(
+        endpoint: &str,
+        lookup: impl Fn(&str) -> Option<SocketAddr>,
+    ) -> Option<SocketAddr> {
+        static RESOLVED: Mutex<Option<HashMap<String, SocketAddr>>> = Mutex::new(None);
+        const ATTEMPTS: u32 = 3;
+        for attempt in 1..=ATTEMPTS {
+            if let Some(address) = lookup(endpoint) {
+                let mut known = RESOLVED.lock().unwrap_or_else(|e| e.into_inner());
+                known
+                    .get_or_insert_with(HashMap::new)
+                    .insert(endpoint.to_owned(), address);
+                return Some(address);
+            }
+            if attempt < ATTEMPTS {
+                std::thread::sleep(Duration::from_millis(100 * attempt as u64));
+            }
+        }
+        let known = RESOLVED.lock().unwrap_or_else(|e| e.into_inner());
+        known.as_ref()?.get(endpoint).copied()
     }
 }
 
@@ -54,6 +78,36 @@ impl TransportUtils {
 mod tests {
     use super::*;
     use std::net::{Ipv4Addr, SocketAddrV4, SocketAddrV6};
+
+    #[test]
+    fn a_name_that_stops_resolving_keeps_its_last_address() {
+        use std::cell::Cell;
+        let address: SocketAddr = "10.0.0.5:445".parse().unwrap();
+        let calls = Cell::new(0);
+        // Fails once, then resolves: retried.
+        let flaky = |_: &str| {
+            calls.set(calls.get() + 1);
+            (calls.get() > 1).then_some(address)
+        };
+        assert_eq!(
+            TransportUtils::resolve("flaky-nas.local:445", flaky),
+            Some(address)
+        );
+        assert_eq!(calls.get(), 2);
+        // Then fails every time: the address that worked.
+        calls.set(0);
+        let down = |_: &str| {
+            calls.set(calls.get() + 1);
+            None
+        };
+        assert_eq!(
+            TransportUtils::resolve("flaky-nas.local:445", down),
+            Some(address)
+        );
+        assert_eq!(calls.get(), 3);
+        // Never resolved: nothing.
+        assert_eq!(TransportUtils::resolve("never.local:445", |_| None), None);
+    }
 
     fn parse(endpoint: &str) -> SocketAddr {
         TransportUtils::parse_socket_address(endpoint)
