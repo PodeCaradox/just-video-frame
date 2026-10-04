@@ -1182,6 +1182,8 @@ fn spawn_decoder(
             // End of the sound sent for this generation: a decoder replaced
             // in place (`restarts`, `HardwareRetry`) decodes some of it again.
             let mut sound_until = f64::NEG_INFINITY;
+            // A frame without a time after this jump was logged.
+            let mut untimed_logged = false;
             'decode: loop {
                 // Before seeks: the seek that follows a switch restarts the new track.
                 while let Ok(track) = audio_changes.try_recv() {
@@ -1198,6 +1200,7 @@ fn spawn_decoder(
                 }
                 if let Some(request) = latest {
                     sound_until = f64::NEG_INFINITY;
+                    untimed_logged = false;
                     // On the CPU after the hardware decoder failed: a jump
                     // seeks anyway, so it's the place to try the hardware.
                     if !hardware
@@ -1415,7 +1418,7 @@ fn spawn_decoder(
                         // A frame without a time says nothing: keep filtering.
                         if frame.pts().is_some() {
                             stale = None;
-                        } else {
+                        } else if !std::mem::replace(&mut untimed_logged, true) {
                             eprintln!("Decoder: a frame without a time after a jump");
                         }
                     }

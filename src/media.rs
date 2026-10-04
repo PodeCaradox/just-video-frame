@@ -797,6 +797,8 @@ impl Media {
         let hardware = optional(&s.hw_backend).is_some();
         if hardware {
             HARDWARE_DECODERS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // Counted by the first jump (see `VideoDecoder::can_free_behind`).
+            other_decoder_sessions();
         }
         Ok(VideoDecoder {
             hardware,
@@ -1039,8 +1041,28 @@ const IRIS_MAX_MBPF: u64 = 278_528;
 const IRIS_MAX_MBPS: u64 = 7_833_600;
 
 /// Sessions other processes hold on the headset's hardware decoder (Steam's
-/// web helper keeps one or two), or `None` without one.
+/// web helper keeps one or two), or `None` without one or before the first
+/// count. Counting reads every process's open files (~4000, several ms), so
+/// it's done on a thread, at most every `SESSIONS_STALE`; this returns the
+/// last count at once.
 fn other_decoder_sessions() -> Option<usize> {
+    static COUNT: std::sync::Mutex<(Option<usize>, Option<std::time::Instant>, bool)> =
+        std::sync::Mutex::new((None, None, false));
+    const SESSIONS_STALE: std::time::Duration = std::time::Duration::from_secs(5);
+    let mut count = COUNT.lock().expect("session count");
+    let (last, counted_at, counting) = *count;
+    if !counting && counted_at.is_none_or(|at| at.elapsed() >= SESSIONS_STALE) {
+        count.2 = true;
+        std::thread::spawn(|| {
+            let sessions = count_other_decoder_sessions();
+            *COUNT.lock().expect("session count") =
+                (sessions, Some(std::time::Instant::now()), false);
+        });
+    }
+    last
+}
+
+fn count_other_decoder_sessions() -> Option<usize> {
     let device = std::fs::canonicalize("/dev/video-dec0").ok()?;
     let me = std::process::id().to_string();
     let mut count = 0;
