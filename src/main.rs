@@ -91,6 +91,27 @@ enum Command {
         #[command(flatten)]
         read_ahead: ReadAheadArgs,
     },
+    /// Write the list-view thumbnail of a video as a PNG (software decode).
+    Thumbnail {
+        input: String,
+        out: std::path::PathBuf,
+        /// Override the detected projection.
+        #[arg(long, value_enum)]
+        projection: Option<ProjectionArg>,
+        /// Override the detected stereo packing.
+        #[arg(long, value_enum)]
+        stereo: Option<StereoArg>,
+        /// Swap left and right eye images.
+        #[arg(long)]
+        swap_eyes: bool,
+        /// Position in the video, as a fraction of its duration.
+        #[arg(long, default_value_t = 0.1)]
+        at: f64,
+        #[arg(long, default_value_t = 220)]
+        width: u32,
+        #[arg(long, default_value_t = 124)]
+        height: u32,
+    },
     /// Create an OpenXR session and report the headset, GPU and swapchain formats.
     XrProbe,
     /// Exercise the headset library workers without XR: open, play briefly,
@@ -244,6 +265,30 @@ enum StereoArg {
     Mono,
     Sbs,
     Tb,
+}
+
+fn override_layout(
+    layout: &mut vr::Layout,
+    projection: Option<ProjectionArg>,
+    stereo: Option<StereoArg>,
+    swap_eyes: bool,
+) {
+    if let Some(p) = projection {
+        layout.projection = match p {
+            ProjectionArg::Flat => vr::Projection::Flat,
+            ProjectionArg::Vr180 => vr::Projection::Equirect180,
+            ProjectionArg::Vr360 => vr::Projection::Equirect360,
+            ProjectionArg::Fisheye => vr::Projection::Fisheye180,
+        };
+    }
+    if let Some(s) = stereo {
+        layout.stereo = match s {
+            StereoArg::Mono => vr::Stereo::Mono,
+            StereoArg::Sbs => vr::Stereo::SideBySide,
+            StereoArg::Tb => vr::Stereo::TopBottom,
+        };
+    }
+    layout.swap_eyes ^= swap_eyes;
 }
 
 fn hw_backend(hw: Hw) -> Option<&'static str> {
@@ -542,22 +587,7 @@ fn main() -> anyhow::Result<()> {
                 anyhow::bail!("Not playing: {}", assessment.title);
             }
             let mut layout = vr::detect(&input, video.as_ref());
-            if let Some(p) = projection {
-                layout.projection = match p {
-                    ProjectionArg::Flat => vr::Projection::Flat,
-                    ProjectionArg::Vr180 => vr::Projection::Equirect180,
-                    ProjectionArg::Vr360 => vr::Projection::Equirect360,
-                    ProjectionArg::Fisheye => vr::Projection::Fisheye180,
-                };
-            }
-            if let Some(s) = stereo {
-                layout.stereo = match s {
-                    StereoArg::Mono => vr::Stereo::Mono,
-                    StereoArg::Sbs => vr::Stereo::SideBySide,
-                    StereoArg::Tb => vr::Stereo::TopBottom,
-                };
-            }
-            layout.swap_eyes ^= swap_eyes;
+            override_layout(&mut layout, projection, stereo, swap_eyes);
             eprintln!(
                 "Layout: {:?} / {:?}{}",
                 layout.projection,
@@ -1251,6 +1281,50 @@ fn main() -> anyhow::Result<()> {
                 &mut fonts,
             );
             just_video::ui::save_png(&caption, &dir.join("caption.png"))?;
+        }
+        Command::Thumbnail {
+            input,
+            out,
+            projection,
+            stereo,
+            swap_eyes,
+            at,
+            width,
+            height,
+        } => {
+            let (source, _session) = open_input(&input, ReadAhead::default())?;
+            // Detection needs the probed video, so open once for it.
+            let video = Media::open(
+                file_name(&input),
+                open_input(&input, ReadAhead::default())?.0,
+            )?
+            .info()
+            .video
+            .clone();
+            let mut layout = vr::detect(&input, video.as_ref());
+            override_layout(&mut layout, projection, stereo, swap_eyes);
+            let started = std::time::Instant::now();
+            let thumb = just_video::media::thumbnail(
+                file_name(&input),
+                source,
+                at,
+                &layout,
+                width,
+                height,
+            )?;
+            let file = std::fs::File::create(&out)?;
+            let mut encoder = png::Encoder::new(file, thumb.width, thumb.height);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder.write_header()?.write_image_data(&thumb.rgba)?;
+            eprintln!(
+                "Thumbnail {}x{} ({:?} / {:?}) in {:.0} ms",
+                thumb.width,
+                thumb.height,
+                layout.projection,
+                layout.stereo,
+                started.elapsed().as_secs_f64() * 1e3
+            );
         }
         Command::XrProbe => {
             let xr = just_video::xr::context::XrContext::new()?;

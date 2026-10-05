@@ -1,5 +1,6 @@
 //! Safe wrapper over `native/media.c`: FFmpeg demux/decode over any `Read + Seek`.
 
+use crate::vr::{Layout, Projection, Stereo};
 use anyhow::bail;
 use serde::{Deserialize, Serialize};
 use std::sync::{
@@ -527,6 +528,7 @@ unsafe extern "C" {
         free_behind: c_int,
     ) -> c_int;
     fn jv_decoder_return_to_hardware(decoder: *mut RawDecoder) -> c_int;
+    fn jv_decoder_first_picture(decoder: *mut RawDecoder);
     fn jv_decoder_skip_nonref_until(decoder: *mut RawDecoder, seconds: f64);
     fn jv_decoder_skip_to_keyframe_after(decoder: *mut RawDecoder, seconds: f64);
     fn jv_decoder_keyframe(decoder: *mut RawDecoder, seconds: f64, after: c_int) -> f64;
@@ -672,6 +674,20 @@ impl Frame {
         }
     }
 
+    /// One plane as a slice from its first row to the end of its last, and
+    /// the row stride in bytes.
+    fn plane(&self, plane: usize) -> (&[u8], usize) {
+        let (w, h, c) = self.plane_size(plane);
+        let row_bytes = (w * c) as usize * self.bytes_per_sample();
+        let stride = self.raw.linesize[plane].max(0) as usize;
+        assert!(stride >= row_bytes, "negative or short stride");
+        // SAFETY: as in `rows`; the rows are contiguous at `stride`.
+        let data = unsafe {
+            std::slice::from_raw_parts(self.raw.data[plane], stride * (h as usize - 1) + row_bytes)
+        };
+        (data, stride)
+    }
+
     pub fn plane_count(&self) -> usize {
         self.raw.plane_count as usize
     }
@@ -761,6 +777,8 @@ pub struct VideoDecoder {
     pub requested_at: Option<std::time::Instant>,
     /// Holds the hardware decoder (see `HARDWARE_DECODERS`).
     hardware: bool,
+    /// Counts in `OPEN_DECODERS` (thumbnail decoders don't).
+    counted: bool,
     /// Frames handed out and not yet dropped. A V4L2 decoder session stays
     /// open until all its frames are gone.
     alive: Arc<AtomicUsize>,
@@ -776,6 +794,17 @@ impl Media {
         hw_backend: Option<&str>,
         allow_software: bool,
         decoder_options: &str,
+    ) -> anyhow::Result<VideoDecoder> {
+        self.open_decoder(hw_backend, allow_software, decoder_options, true)
+    }
+
+    /// `counted`: whether the decoder counts as playback (`open_decoders`).
+    fn open_decoder(
+        self,
+        hw_backend: Option<&str>,
+        allow_software: bool,
+        decoder_options: &str,
+        counted: bool,
     ) -> anyhow::Result<VideoDecoder> {
         let backend = hw_backend.map(CString::new).transpose()?;
         let options = CString::new(decoder_options)?;
@@ -793,7 +822,9 @@ impl Media {
         if decoder.is_null() {
             bail!("{}", text(&s.error));
         }
-        OPEN_DECODERS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if counted {
+            OPEN_DECODERS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
         let hardware = optional(&s.hw_backend).is_some();
         if hardware {
             HARDWARE_DECODERS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -802,6 +833,7 @@ impl Media {
         }
         Ok(VideoDecoder {
             hardware,
+            counted,
             alive: Arc::default(),
             raw: decoder,
             media: self,
@@ -1114,7 +1146,9 @@ impl Drop for VideoDecoder {
             );
             HARDWARE_DECODERS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         }
-        OPEN_DECODERS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        if self.counted {
+            OPEN_DECODERS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 }
 
@@ -1139,6 +1173,302 @@ pub fn wait_for_decoders_closed(limit: std::time::Duration) -> bool {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     true
+}
+
+/// A small picture for file lists: sRGB-encoded RGBA, alpha 255.
+#[derive(Clone, Debug)]
+pub struct Thumb {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
+/// A region of a frame, in fractions of its width and height.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Crop {
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+}
+
+impl Crop {
+    pub const FULL: Crop = Crop {
+        x: 0.0,
+        y: 0.0,
+        w: 1.0,
+        h: 1.0,
+    };
+
+    /// The largest centred part of `self` (of a `width` x `height` frame)
+    /// with the given width / height ratio.
+    fn fit(self, width: u32, height: u32, aspect: f64) -> Crop {
+        let (pw, ph) = (self.w * width as f64, self.h * height as f64);
+        if pw / ph > aspect {
+            let w = ph * aspect / width as f64;
+            Crop {
+                x: self.x + (self.w - w) / 2.0,
+                w,
+                ..self
+            }
+        } else {
+            let h = pw / aspect / height as f64;
+            Crop {
+                y: self.y + (self.h - h) / 2.0,
+                h,
+                ..self
+            }
+        }
+    }
+
+    /// What to show of a `width` x `height` frame in an `out_w` x `out_h`
+    /// thumbnail: the left eye of stereo video, and for VR180/360 and fisheye
+    /// a 16:9 centre of it (the rest is a distorted panorama). Never stretches.
+    pub fn for_layout(layout: &Layout, width: u32, height: u32, out_w: u32, out_h: u32) -> Crop {
+        // Which half holds the left eye.
+        let second = if layout.swap_eyes { 0.5 } else { 0.0 };
+        let eye = match layout.stereo {
+            Stereo::Mono => Crop::FULL,
+            Stereo::SideBySide => Crop {
+                x: second,
+                w: 0.5,
+                ..Crop::FULL
+            },
+            Stereo::TopBottom => Crop {
+                y: second,
+                h: 0.5,
+                ..Crop::FULL
+            },
+        };
+        let eye = if layout.projection == Projection::Flat {
+            eye
+        } else {
+            eye.fit(width, height, 16.0 / 9.0)
+        };
+        eye.fit(width, height, out_w as f64 / out_h as f64)
+    }
+}
+
+/// One plane's samples and its row stride in bytes.
+#[derive(Clone, Copy)]
+pub struct PlaneData<'a> {
+    pub data: &'a [u8],
+    pub stride: usize,
+}
+
+/// A decoded picture's planes, as [`Frame`] describes them.
+pub struct YuvImage<'a> {
+    pub width: u32,
+    pub height: u32,
+    pub layout: PlaneLayout,
+    /// 8 or 10.
+    pub bits: u32,
+    pub matrix: Matrix,
+    pub full_range: bool,
+    pub y: PlaneData<'a>,
+    /// U, or interleaved UV.
+    pub u: PlaneData<'a>,
+    /// V (unused when semi-planar).
+    pub v: PlaneData<'a>,
+}
+
+/// Points sampled per output pixel along each axis, at most (8K sources
+/// have 30 or more source pixels per thumbnail pixel).
+const THUMB_GRID: usize = 4;
+
+impl YuvImage<'_> {
+    /// The sample at `index` (in samples) of a plane, as its code value.
+    fn code(&self, plane: PlaneData, index: usize) -> u32 {
+        if self.bits <= 8 {
+            return plane.data[index] as u32;
+        }
+        let raw = u16::from_le_bytes([plane.data[2 * index], plane.data[2 * index + 1]]) as u32;
+        // Planar is LSB-aligned; semi-planar (P010) MSB-aligned.
+        if self.layout == PlaneLayout::Planar {
+            raw
+        } else {
+            raw >> (16 - self.bits)
+        }
+    }
+
+    /// R'G'B' (0 to 255) of the pixel at (`x`, `y`).
+    fn rgb(&self, x: usize, y: usize, m: &Conversion) -> [f32; 3] {
+        let bytes = if self.bits > 8 { 2 } else { 1 };
+        let luma = self.code(self.y, y * self.y.stride / bytes + x);
+        let (cx, cy) = (x / 2, y / 2);
+        let (cb, cr) = if self.layout == PlaneLayout::Planar {
+            let at = cy * self.u.stride / bytes + cx;
+            let at_v = cy * self.v.stride / bytes + cx;
+            (self.code(self.u, at), self.code(self.v, at_v))
+        } else {
+            let at = cy * self.u.stride / bytes + 2 * cx;
+            (self.code(self.u, at), self.code(self.u, at + 1))
+        };
+        let y = (luma as f32 - m.y_offset) * m.y_scale;
+        let cb = (cb as f32 - m.c_offset) * m.c_scale;
+        let cr = (cr as f32 - m.c_offset) * m.c_scale;
+        [
+            y + m.r_cr * cr,
+            y - m.g_cb * cb - m.g_cr * cr,
+            y + m.b_cb * cb,
+        ]
+    }
+}
+
+/// Code values to R'G'B' in 0 to 255 (see `color_params` in the renderer).
+struct Conversion {
+    y_offset: f32,
+    y_scale: f32,
+    c_offset: f32,
+    c_scale: f32,
+    r_cr: f32,
+    g_cb: f32,
+    g_cr: f32,
+    b_cb: f32,
+}
+
+impl Conversion {
+    fn new(bits: u32, matrix: Matrix, full_range: bool) -> Self {
+        let (kr, kb) = match matrix {
+            Matrix::Bt709 => (0.2126, 0.0722),
+            Matrix::Bt601 => (0.299, 0.114),
+            Matrix::Bt2020 => (0.2627, 0.0593),
+        };
+        let kg = 1.0 - kr - kb;
+        let k = (1u32 << (bits - 8)) as f32;
+        let max = ((1u32 << bits) - 1) as f32;
+        let (y_offset, y_scale, c_scale) = if full_range {
+            (0.0, 255.0 / max, 255.0 / max)
+        } else {
+            (16.0 * k, 255.0 / (219.0 * k), 255.0 / (224.0 * k))
+        };
+        Conversion {
+            y_offset,
+            y_scale,
+            c_offset: 128.0 * k,
+            c_scale,
+            r_cr: 2.0 * (1.0 - kr),
+            g_cb: 2.0 * kb * (1.0 - kb) / kg,
+            g_cr: 2.0 * kr * (1.0 - kr) / kg,
+            b_cb: 2.0 * (1.0 - kb),
+        }
+    }
+}
+
+/// Box-downscales `crop` of the picture to `out_w` x `out_h`. A fixed grid of
+/// points in each output pixel's source cell stands in for every pixel in it.
+/// Video is gamma-encoded already, so R'G'B' goes out as sRGB. HDR (PQ/HLG)
+/// is not tone mapped and will look flat.
+pub fn yuv_to_thumb(img: &YuvImage, crop: Crop, out_w: u32, out_h: u32) -> Thumb {
+    let m = Conversion::new(img.bits, img.matrix, img.full_range);
+    let (fw, fh) = (img.width as f64, img.height as f64);
+    let (x0, y0) = (crop.x * fw, crop.y * fh);
+    let (cell_w, cell_h) = (crop.w * fw / out_w as f64, crop.h * fh / out_h as f64);
+    let nx = (cell_w.ceil() as usize).clamp(1, THUMB_GRID);
+    let ny = (cell_h.ceil() as usize).clamp(1, THUMB_GRID);
+    let (max_x, max_y) = (img.width as usize - 1, img.height as usize - 1);
+    let xs: Vec<usize> = (0..out_w as usize * nx)
+        .map(|i| ((x0 + (i as f64 + 0.5) * cell_w / nx as f64) as usize).min(max_x))
+        .collect();
+    let mut rgba = Vec::with_capacity(out_w as usize * out_h as usize * 4);
+    for oy in 0..out_h as usize {
+        for ox in 0..out_w as usize {
+            let mut sum = [0.0f32; 3];
+            for j in 0..ny {
+                let y =
+                    ((y0 + ((oy * ny + j) as f64 + 0.5) * cell_h / ny as f64) as usize).min(max_y);
+                for &x in &xs[ox * nx..(ox + 1) * nx] {
+                    let c = img.rgb(x, y, &m);
+                    sum.iter_mut().zip(c).for_each(|(s, c)| *s += c);
+                }
+            }
+            let n = (nx * ny) as f32;
+            rgba.extend(sum.map(|s| (s / n + 0.5).clamp(0.0, 255.0) as u8));
+            rgba.push(255);
+        }
+    }
+    Thumb {
+        width: out_w,
+        height: out_h,
+        rgba,
+    }
+}
+
+/// [`yuv_to_thumb`] for a decoded frame.
+pub fn frame_to_rgba(frame: &Frame, crop: Crop, out_w: u32, out_h: u32) -> Thumb {
+    let plane = |i| {
+        if i < frame.plane_count() {
+            let (data, stride) = frame.plane(i);
+            PlaneData { data, stride }
+        } else {
+            PlaneData {
+                data: &[],
+                stride: 0,
+            }
+        }
+    };
+    let img = YuvImage {
+        width: frame.width(),
+        height: frame.height(),
+        layout: frame.layout(),
+        bits: frame.bits(),
+        matrix: frame.matrix(),
+        full_range: frame.full_range(),
+        y: plane(0),
+        u: plane(1),
+        v: plane(2),
+    };
+    yuv_to_thumb(&img, crop, out_w, out_h)
+}
+
+/// [`thumbnail_unless`] without a way out.
+pub fn thumbnail(
+    name: &str,
+    source: impl Source + 'static,
+    at_fraction: f64,
+    layout: &Layout,
+    out_w: u32,
+    out_h: u32,
+) -> anyhow::Result<Thumb> {
+    thumbnail_unless(name, source, at_fraction, layout, out_w, out_h, &|| false)?
+        .ok_or_else(|| anyhow::anyhow!("Thumbnail stopped"))
+}
+
+/// A thumbnail from the keyframe at or before `at_fraction` of the video (no
+/// seek when the duration is unknown). Software decoding on two threads, and
+/// the decoder doesn't count as playback (`open_decoders`). `stop` is asked
+/// after opening, after the seek and after decoding; `Ok(None)` when it said so.
+pub fn thumbnail_unless(
+    name: &str,
+    source: impl Source + 'static,
+    at_fraction: f64,
+    layout: &Layout,
+    out_w: u32,
+    out_h: u32,
+    stop: &dyn Fn() -> bool,
+) -> anyhow::Result<Option<Thumb>> {
+    let media = Media::open(name, source)?;
+    if stop() {
+        return Ok(None);
+    }
+    let duration = media.info().duration_seconds;
+    let mut decoder = media.open_decoder(None, true, "threads=2", false)?;
+    if duration > 0.0 {
+        // A file that can't seek gives its first picture.
+        decoder.seek(duration * at_fraction.clamp(0.0, 1.0)).ok();
+        if stop() {
+            return Ok(None);
+        }
+    }
+    unsafe { jv_decoder_first_picture(decoder.raw) };
+    let Some(frame) = decoder.next_frame()? else {
+        bail!("No picture to show");
+    };
+    if stop() {
+        return Ok(None);
+    }
+    let crop = Crop::for_layout(layout, frame.width(), frame.height(), out_w, out_h);
+    Ok(Some(frame_to_rgba(&frame, crop, out_w, out_h)))
 }
 
 #[cfg(test)]
@@ -1181,5 +1511,387 @@ mod seek_tests {
         assert!(!reopen_to_seek(info("hevc").as_ref()));
         assert!(!reopen_to_seek(info("vp9").as_ref()));
         assert!(!reopen_to_seek(None));
+    }
+}
+
+#[cfg(test)]
+mod thumb_tests {
+    use super::*;
+    use crate::vr::Evidence;
+
+    fn plane(data: &[u8], stride: usize) -> PlaneData<'_> {
+        PlaneData { data, stride }
+    }
+
+    fn layout(projection: Projection, stereo: Stereo, swap_eyes: bool) -> Layout {
+        Layout {
+            projection,
+            stereo,
+            swap_eyes,
+            projection_from: Evidence::Default,
+            stereo_from: Evidence::Default,
+        }
+    }
+
+    /// A `w` x `h` picture of one colour, stored as `layout` with `bits`.
+    fn solid(
+        (w, h): (u32, u32),
+        layout: PlaneLayout,
+        bits: u32,
+        matrix: Matrix,
+        full_range: bool,
+        (y, u, v): (u32, u32, u32),
+    ) -> Thumb {
+        let put = |out: &mut Vec<u8>, code: u32| {
+            if bits <= 8 {
+                out.push(code as u8);
+            } else {
+                let shifted = if layout == PlaneLayout::Planar {
+                    code
+                } else {
+                    code << (16 - bits)
+                };
+                out.extend((shifted as u16).to_le_bytes());
+            }
+        };
+        let (cw, ch) = ((w / 2) as usize, (h / 2) as usize);
+        let (mut py, mut pu, mut pv) = (vec![], vec![], vec![]);
+        (0..w * h).for_each(|_| put(&mut py, y));
+        for _ in 0..cw * ch {
+            put(&mut pu, u);
+            if layout == PlaneLayout::Planar {
+                put(&mut pv, v);
+            } else {
+                put(&mut pu, v);
+            }
+        }
+        let bytes = if bits > 8 { 2 } else { 1 };
+        let img = YuvImage {
+            width: w,
+            height: h,
+            layout,
+            bits,
+            matrix,
+            full_range,
+            y: plane(&py, w as usize * bytes),
+            u: plane(
+                &pu,
+                cw * bytes * if layout == PlaneLayout::Planar { 1 } else { 2 },
+            ),
+            v: plane(&pv, cw * bytes),
+        };
+        yuv_to_thumb(&img, Crop::FULL, 1, 1)
+    }
+
+    fn near(thumb: &Thumb, want: [u8; 3]) {
+        assert_eq!(thumb.rgba[3], 255);
+        for (got, want) in thumb.rgba[..3].iter().zip(want) {
+            assert!(
+                got.abs_diff(want) <= 2,
+                "{:?} vs {want:?}",
+                &thumb.rgba[..3]
+            );
+        }
+    }
+
+    const ALL: [(PlaneLayout, u32); 4] = [
+        (PlaneLayout::Planar, 8),
+        (PlaneLayout::SemiPlanar, 8),
+        (PlaneLayout::Planar, 10),
+        (PlaneLayout::SemiPlanarMsb, 10),
+    ];
+
+    #[test]
+    fn limited_range_red_in_every_layout() {
+        for (layout, bits) in ALL {
+            let k = 1 << (bits - 8);
+            // Studio-swing codes of pure red.
+            let red = |c: (u32, u32, u32)| (c.0 * k, c.1 * k, c.2 * k);
+            let t = solid(
+                (4, 4),
+                layout,
+                bits,
+                Matrix::Bt709,
+                false,
+                red((63, 102, 240)),
+            );
+            near(&t, [255, 0, 0]);
+            let t = solid(
+                (4, 4),
+                layout,
+                bits,
+                Matrix::Bt601,
+                false,
+                red((81, 90, 240)),
+            );
+            near(&t, [255, 0, 0]);
+            let t = solid(
+                (4, 4),
+                layout,
+                bits,
+                Matrix::Bt2020,
+                false,
+                red((74, 97, 240)),
+            );
+            near(&t, [255, 0, 0]);
+        }
+    }
+
+    #[test]
+    fn limited_range_black_and_white() {
+        for (layout, bits) in ALL {
+            let k = 1 << (bits - 8);
+            let grey = |y: u32| (y * k, 128 * k, 128 * k);
+            near(
+                &solid((2, 2), layout, bits, Matrix::Bt709, false, grey(16)),
+                [0, 0, 0],
+            );
+            near(
+                &solid((2, 2), layout, bits, Matrix::Bt709, false, grey(235)),
+                [255; 3],
+            );
+            // Below black and above white clamp.
+            near(
+                &solid((2, 2), layout, bits, Matrix::Bt709, false, grey(0)),
+                [0, 0, 0],
+            );
+            near(
+                &solid((2, 2), layout, bits, Matrix::Bt709, false, grey(255)),
+                [255; 3],
+            );
+        }
+    }
+
+    #[test]
+    fn full_range_red_and_grey() {
+        for (layout, bits) in ALL {
+            let k = 1 << (bits - 8);
+            let max = (1 << bits) - 1;
+            // Full-swing pure red: Y = 255 * Kr, Cb = 128 - 255 * Kr / (2 * (1 - Kb)), Cr = 255.
+            let t = solid(
+                (4, 4),
+                layout,
+                bits,
+                Matrix::Bt709,
+                true,
+                (54 * k, 99 * k, max),
+            );
+            near(&t, [255, 0, 0]);
+            let t = solid(
+                (4, 4),
+                layout,
+                bits,
+                Matrix::Bt601,
+                true,
+                (76 * k, 85 * k, max),
+            );
+            near(&t, [255, 0, 0]);
+            // Mid grey: 128 of 255.
+            let t = solid(
+                (2, 2),
+                layout,
+                bits,
+                Matrix::Bt709,
+                true,
+                (128 * k, 128 * k, 128 * k),
+            );
+            near(&t, [128; 3]);
+            near(
+                &solid(
+                    (2, 2),
+                    layout,
+                    bits,
+                    Matrix::Bt709,
+                    true,
+                    (max, 128 * k, 128 * k),
+                ),
+                [255; 3],
+            );
+        }
+    }
+
+    #[test]
+    fn downscale_averages_cells_and_honours_stride() {
+        // 8x4 luma, 4 bytes of padding per row: black left half, white right.
+        let mut y = vec![99u8; 12 * 4];
+        for row in 0..4 {
+            for x in 0..8 {
+                y[row * 12 + x] = if x < 4 { 16 } else { 235 };
+            }
+        }
+        let chroma = vec![128u8; 4 * 2];
+        let img = YuvImage {
+            width: 8,
+            height: 4,
+            layout: PlaneLayout::Planar,
+            bits: 8,
+            matrix: Matrix::Bt709,
+            full_range: false,
+            y: plane(&y, 12),
+            u: plane(&chroma, 4),
+            v: plane(&chroma, 4),
+        };
+        let t = yuv_to_thumb(&img, Crop::FULL, 2, 1);
+        assert_eq!((t.width, t.height, t.rgba.len()), (2, 1, 8));
+        near(
+            &Thumb {
+                rgba: t.rgba[..4].to_vec(),
+                ..t.clone()
+            },
+            [0, 0, 0],
+        );
+        near(
+            &Thumb {
+                rgba: t.rgba[4..].to_vec(),
+                ..t.clone()
+            },
+            [255; 3],
+        );
+        // One output pixel over both halves: the average, 50 % grey-ish.
+        let mid = yuv_to_thumb(&img, Crop::FULL, 1, 1);
+        near(&mid, [128, 128, 128]);
+        // Cropping to the right half only.
+        let right = Crop {
+            x: 0.5,
+            w: 0.5,
+            ..Crop::FULL
+        };
+        near(&yuv_to_thumb(&img, right, 3, 3), [255; 3]);
+    }
+
+    fn close(a: Crop, b: Crop) {
+        let ok = |x: f64, y: f64| (x - y).abs() < 1e-9;
+        assert!(
+            ok(a.x, b.x) && ok(a.y, b.y) && ok(a.w, b.w) && ok(a.h, b.h),
+            "{a:?} vs {b:?}"
+        );
+    }
+
+    #[test]
+    fn flat_mono_is_centre_cropped_to_the_output_shape() {
+        let flat = layout(Projection::Flat, Stereo::Mono, false);
+        // 16:9 source into a (nearly) 16:9 slot: almost everything.
+        let c = Crop::for_layout(&flat, 1920, 1080, 160, 90);
+        close(c, Crop::FULL);
+        // 21:9 source: crop the sides.
+        let c = Crop::for_layout(&flat, 2520, 1080, 160, 90);
+        close(
+            c,
+            Crop {
+                x: (1.0 - 1920.0 / 2520.0) / 2.0,
+                w: 1920.0 / 2520.0,
+                ..Crop::FULL
+            },
+        );
+        // 4:3 source: crop top and bottom.
+        let c = Crop::for_layout(&flat, 1440, 1080, 160, 90);
+        let h = 1440.0 * 9.0 / 16.0 / 1080.0;
+        close(
+            c,
+            Crop {
+                y: (1.0 - h) / 2.0,
+                h,
+                ..Crop::FULL
+            },
+        );
+    }
+
+    #[test]
+    fn stereo_takes_the_left_eye() {
+        // Flat 3D, 16:9 eyes in a 32:9 side-by-side frame.
+        let sbs = layout(Projection::Flat, Stereo::SideBySide, false);
+        close(
+            Crop::for_layout(&sbs, 3840, 1080, 160, 90),
+            Crop {
+                w: 0.5,
+                ..Crop::FULL
+            },
+        );
+        let swapped = layout(Projection::Flat, Stereo::SideBySide, true);
+        close(
+            Crop::for_layout(&swapped, 3840, 1080, 160, 90),
+            Crop {
+                x: 0.5,
+                w: 0.5,
+                ..Crop::FULL
+            },
+        );
+        let tb = layout(Projection::Flat, Stereo::TopBottom, false);
+        close(
+            Crop::for_layout(&tb, 1920, 2160, 160, 90),
+            Crop {
+                h: 0.5,
+                ..Crop::FULL
+            },
+        );
+        let swapped = layout(Projection::Flat, Stereo::TopBottom, true);
+        close(
+            Crop::for_layout(&swapped, 1920, 2160, 160, 90),
+            Crop {
+                y: 0.5,
+                h: 0.5,
+                ..Crop::FULL
+            },
+        );
+    }
+
+    #[test]
+    fn vr_takes_a_16_9_centre_of_the_eye() {
+        // VR180 side-by-side, square eyes of 4096 px.
+        let vr = layout(Projection::Equirect180, Stereo::SideBySide, false);
+        let c = Crop::for_layout(&vr, 8192, 4096, 160, 90);
+        let h = 9.0 / 16.0;
+        close(
+            c,
+            Crop {
+                x: 0.0,
+                y: (1.0 - h) / 2.0,
+                w: 0.5,
+                h,
+            },
+        );
+        // Its pixel shape is 16:9.
+        assert!((c.w * 8192.0 / (c.h * 4096.0) - 16.0 / 9.0).abs() < 1e-9);
+        // VR360 top/bottom, 2:1 eyes with the left on the bottom (swapped):
+        // the sides are cropped.
+        let vr = layout(Projection::Equirect360, Stereo::TopBottom, true);
+        let c = Crop::for_layout(&vr, 4096, 4096, 160, 90);
+        let w = 8.0 / 9.0;
+        close(
+            c,
+            Crop {
+                x: (1.0 - w) / 2.0,
+                y: 0.5,
+                w,
+                h: 0.5,
+            },
+        );
+        // Mono fisheye 2:1: the centre, again 16:9.
+        let fish = layout(Projection::Fisheye180, Stereo::Mono, false);
+        let c = Crop::for_layout(&fish, 4000, 2000, 160, 90);
+        assert!((c.w * 4000.0 / (c.h * 2000.0) - 16.0 / 9.0).abs() < 1e-9);
+        assert!((c.x + c.w / 2.0 - 0.5).abs() < 1e-9 && (c.y + c.h / 2.0 - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn output_has_the_requested_size() {
+        let y = vec![100u8; 64 * 36];
+        let c = vec![128u8; 32 * 18];
+        let img = YuvImage {
+            width: 64,
+            height: 36,
+            layout: PlaneLayout::Planar,
+            bits: 8,
+            matrix: Matrix::Bt709,
+            full_range: true,
+            y: plane(&y, 64),
+            u: plane(&c, 32),
+            v: plane(&c, 32),
+        };
+        for (w, h) in [(220, 124), (16, 9), (1, 1), (100, 10)] {
+            let t = yuv_to_thumb(&img, Crop::FULL, w, h);
+            assert_eq!((t.width, t.height), (w, h));
+            assert_eq!(t.rgba.len(), (w * h * 4) as usize);
+        }
     }
 }

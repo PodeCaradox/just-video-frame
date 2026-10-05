@@ -100,6 +100,9 @@ int jv_decoder_return_to_hardware(JVDecoder *decoder);
 // `seconds` (they would be discarded anyway); <= 0 turns it off.
 void jv_decoder_skip_nonref_until(JVDecoder *decoder, double seconds);
 // Decodes only keyframes until one at or after `seconds` (falling far behind).
+// Makes the next jv_decoder_next return the first keyframe's picture without
+// reading further (thumbnails). Call after a seek.
+void jv_decoder_first_picture(JVDecoder *decoder);
 void jv_decoder_skip_to_keyframe_after(JVDecoder *decoder, double seconds);
 // The indexed keyframe at or before (`after` = 0) or at or after `seconds`, in
 // seconds from the video start; < 0 when the index has none.
