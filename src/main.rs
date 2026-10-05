@@ -139,6 +139,47 @@ enum Command {
         #[arg(long)]
         click_at_once: bool,
     },
+    /// Time the list-thumbnail worker over a saved server's folder: how long
+    /// each thumbnail takes to arrive, the disk cache on later passes, and
+    /// (with --open) opening and playing a video while it works.
+    #[command(hide = true)]
+    BenchThumbnails {
+        /// Saved server name.
+        server: String,
+        share: String,
+        /// Folder inside the share, `/`-separated.
+        #[arg(default_value = "")]
+        folder: String,
+        /// Only videos whose name contains this.
+        #[arg(long)]
+        only: Option<String>,
+        /// Use at most this many videos.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Index of the first video on screen.
+        #[arg(long, default_value_t = 0)]
+        first_visible: usize,
+        /// Passes over the folder (later ones should hit the disk cache).
+        #[arg(long, default_value_t = 1)]
+        passes: u64,
+        /// Give up on a pass after this long without a thumbnail.
+        #[arg(long, default_value_t = 60)]
+        idle_secs: u64,
+        /// Don't queue thumbnails at all (the baseline for --open).
+        #[arg(long)]
+        no_thumbs: bool,
+        /// Open (and play) the video whose name contains this, while thumbnails are made.
+        #[arg(long)]
+        open: Option<String>,
+        /// Open this long after queueing thumbnails.
+        #[arg(long, default_value_t = 3000)]
+        open_after_ms: u64,
+        #[arg(long, default_value_t = 8)]
+        play_secs: u64,
+        /// Leave the folder (bump the generation) this long after queueing.
+        #[arg(long)]
+        cancel_after_ms: Option<u64>,
+    },
     /// Print the subtitles decoded while playing through a stretch of video.
     #[command(hide = true)]
     Subtitles {
@@ -453,6 +494,285 @@ fn run_app(quit: std::sync::Arc<std::sync::atomic::AtomicBool>) -> anyhow::Resul
         },
     )?;
     eprintln!("Just Video stopped");
+    Ok(())
+}
+
+struct BenchThumbnailsArgs {
+    server: String,
+    share: String,
+    folder: String,
+    only: Option<String>,
+    limit: Option<usize>,
+    first_visible: usize,
+    passes: u64,
+    idle_secs: u64,
+    no_thumbs: bool,
+    open: Option<String>,
+    open_after_ms: u64,
+    play_secs: u64,
+    cancel_after_ms: Option<u64>,
+}
+
+fn rss_mb() -> f64 {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines().find_map(|l| {
+                l.strip_prefix("VmRSS:")?
+                    .trim()
+                    .trim_end_matches("kB")
+                    .trim()
+                    .parse::<f64>()
+                    .ok()
+            })
+        })
+        .map_or(0.0, |kb| kb / 1024.0)
+}
+
+/// See [`Command::BenchThumbnails`]. Lines starting `BT` are for scripts.
+fn bench_thumbnails(a: BenchThumbnailsArgs) -> anyhow::Result<()> {
+    use just_video::library::{Library, ProbeVideo, Request, Response, ThumbVideo};
+    use std::time::{Duration, Instant};
+    let server = just_video::config::servers()?
+        .into_iter()
+        .find(|s| s.name == a.server)
+        .ok_or_else(|| anyhow::anyhow!("No saved server {}", a.server))?;
+    let library = Library::start(just_video::media::default_hw_backend());
+    let path: Vec<String> = a
+        .folder
+        .split('/')
+        .filter(|p| !p.is_empty())
+        .map(String::from)
+        .collect();
+    let recv = |timeout: Duration| -> Option<Response> {
+        let started = Instant::now();
+        while started.elapsed() < timeout {
+            if let Some(r) = library.try_recv() {
+                return Some(r);
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        None
+    };
+    eprintln!("BT rss start {:.0} MB", rss_mb());
+    library.send(Request::List {
+        id: 1,
+        server: server.clone(),
+        share: a.share.clone(),
+        path: path.clone(),
+    });
+    let listed: Vec<ProbeVideo> = loop {
+        match recv(Duration::from_secs(30)) {
+            Some(Response::List { result, .. }) => {
+                break result
+                    .map_err(anyhow::Error::msg)?
+                    .into_iter()
+                    .filter(|e| !e.is_dir && just_video::ui::navigator::is_video(&e.name))
+                    .filter(|e| a.only.as_ref().is_none_or(|o| e.name.contains(o.as_str())))
+                    .map(|e| ProbeVideo {
+                        name: e.name,
+                        size: e.size,
+                        modified: e.modified,
+                    })
+                    .take(a.limit.unwrap_or(usize::MAX))
+                    .collect();
+            }
+            Some(_) => {}
+            None => anyhow::bail!("list timed out"),
+        }
+    };
+    anyhow::ensure!(!listed.is_empty(), "No videos");
+    library.set_probe_generation(0);
+    library.send(Request::ProbeFolder {
+        generation: 0,
+        server: server.clone(),
+        share: a.share.clone(),
+        folder: path.clone(),
+        videos: listed.clone(),
+    });
+    let started = Instant::now();
+    let mut layouts = std::collections::HashMap::new();
+    while layouts.len() < listed.len() {
+        match recv(Duration::from_secs(60)) {
+            Some(Response::Probe { name, result, .. }) => {
+                if let Ok(p) = result {
+                    layouts.insert(name, p.layout);
+                } else {
+                    let l = just_video::vr::detect(&name, None);
+                    layouts.insert(name, l);
+                }
+            }
+            Some(_) => {}
+            None => anyhow::bail!("probe timed out"),
+        }
+    }
+    eprintln!(
+        "BT probed {} videos in {:.0} ms, rss {:.0} MB",
+        listed.len(),
+        started.elapsed().as_secs_f64() * 1e3,
+        rss_mb()
+    );
+    let videos: Vec<ThumbVideo> = listed
+        .iter()
+        .enumerate()
+        .map(|(index, v)| ThumbVideo {
+            index,
+            name: v.name.clone(),
+            size: v.size,
+            modified: v.modified,
+            layout: layouts[&v.name],
+        })
+        .collect();
+    let mut held: Vec<std::sync::Arc<just_video::media::Thumb>> = Vec::new();
+    for pass in 1..=a.passes {
+        library.set_thumbnail_generation(pass);
+        let sent = Instant::now();
+        if !a.no_thumbs {
+            library.send(Request::ThumbnailFolder {
+                generation: pass,
+                server: server.clone(),
+                share: a.share.clone(),
+                folder: path.clone(),
+                videos: videos.clone(),
+                first_visible: a.first_visible,
+            });
+        }
+        eprintln!(
+            "BT pass {pass} queued {} (first_visible {})",
+            videos.len(),
+            a.first_visible
+        );
+        let mut got = 0usize;
+        let mut last = sent;
+        let mut opened_done = a.open.is_none();
+        loop {
+            let now = sent.elapsed();
+            if let Some(ms) = a.cancel_after_ms
+                && now >= Duration::from_millis(ms)
+            {
+                eprintln!("BT CANCEL set generation");
+                library.set_thumbnail_generation(1000 + pass);
+                // Let the worker settle, then finish the pass.
+                std::thread::sleep(Duration::from_secs(a.idle_secs.min(8)));
+                break;
+            }
+            if !opened_done && now >= Duration::from_millis(a.open_after_ms) {
+                opened_done = true;
+                let want = a.open.as_deref().unwrap_or_default();
+                let target = listed
+                    .iter()
+                    .find(|v| v.name.contains(want))
+                    .ok_or_else(|| anyhow::anyhow!("no such video"))?;
+                let mut file = path.clone();
+                file.push(target.name.clone());
+                let t0 = Instant::now();
+                library.send(Request::Open {
+                    id: 100,
+                    server: server.clone(),
+                    share: a.share.clone(),
+                    path: file,
+                });
+                let opened = loop {
+                    match recv(Duration::from_secs(60)) {
+                        Some(Response::Opened { result, .. }) => {
+                            break result.map_err(anyhow::Error::msg)?;
+                        }
+                        Some(Response::Thumbnail { .. }) => got += 1,
+                        Some(_) => {}
+                        None => anyhow::bail!("open timed out"),
+                    }
+                };
+                eprintln!(
+                    "BT opened in {:.0} ms (thumbnails so far {got}), rss {:.0} MB",
+                    t0.elapsed().as_secs_f64() * 1e3,
+                    rss_mb()
+                );
+                let mut playback = just_video::xr::player::Playback::start(
+                    opened.decoder,
+                    opened.layout,
+                    0.0,
+                    0.0,
+                );
+                let began = Instant::now();
+                let (mut shown, mut worst_gap, mut last_shown) = (0u32, 0.0f64, Instant::now());
+                let (mut first_at, mut thumbs_in_play) = (None::<f64>, 0usize);
+                while began.elapsed() < Duration::from_secs(a.play_secs) {
+                    let t = began.elapsed().as_nanos() as i64 + 1_000_000_000;
+                    if playback.advance(t) {
+                        let gap = last_shown.elapsed().as_secs_f64() * 1e3;
+                        if shown > 0 {
+                            worst_gap = worst_gap.max(gap);
+                        } else {
+                            first_at = Some(began.elapsed().as_secs_f64() * 1e3);
+                        }
+                        shown += 1;
+                        last_shown = Instant::now();
+                    }
+                    while let Some(r) = library.try_recv() {
+                        if let Response::Thumbnail { .. } = r {
+                            thumbs_in_play += 1;
+                        }
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                let secs = began.elapsed().as_secs_f64();
+                eprintln!(
+                    "BT played {shown} frames in {secs:.1} s ({:.1} fps), first frame {:.0} ms, worst gap {worst_gap:.0} ms, thumbnails arrived during playback {thumbs_in_play}, rss {:.0} MB",
+                    shown as f64 / secs,
+                    first_at.unwrap_or(0.0),
+                    rss_mb()
+                );
+                got += thumbs_in_play;
+                just_video::xr::app::drop_in_background(playback);
+                eprintln!("BT playback closed");
+                last = Instant::now();
+                continue;
+            }
+            match recv(Duration::from_millis(20)) {
+                Some(Response::Thumbnail {
+                    name,
+                    image,
+                    generation,
+                }) if generation == pass => {
+                    got += 1;
+                    let at = sent.elapsed().as_secs_f64() * 1e3;
+                    let index = listed.iter().position(|v| v.name == name).unwrap_or(0);
+                    eprintln!(
+                        "BT arrival pass {pass} #{got} index {index} at {at:.0} ms delta {:.0} ms ({}x{}) rss {:.0} MB",
+                        last.elapsed().as_secs_f64() * 1e3,
+                        image.width,
+                        image.height,
+                        rss_mb()
+                    );
+                    last = Instant::now();
+                    if pass == 1 {
+                        held.push(image);
+                    }
+                }
+                Some(_) => {}
+                None => {}
+            }
+            if got >= videos.len() || a.no_thumbs && opened_done && now > Duration::from_millis(500)
+            {
+                break;
+            }
+            if last.elapsed() > Duration::from_secs(a.idle_secs) {
+                eprintln!(
+                    "BT pass {pass} idle {} s with {got}/{} thumbnails",
+                    a.idle_secs,
+                    videos.len()
+                );
+                break;
+            }
+        }
+        eprintln!(
+            "BT pass {pass} done: {got}/{} in {:.0} ms, rss {:.0} MB, held {}",
+            videos.len(),
+            sent.elapsed().as_secs_f64() * 1e3,
+            rss_mb(),
+            held.len()
+        );
+    }
     Ok(())
 }
 
@@ -816,6 +1136,37 @@ fn main() -> anyhow::Result<()> {
                 }
             }
             eprintln!("no hang in {rounds} rounds");
+        }
+        Command::BenchThumbnails {
+            server,
+            share,
+            folder,
+            only,
+            limit,
+            first_visible,
+            passes,
+            idle_secs,
+            no_thumbs,
+            open,
+            open_after_ms,
+            play_secs,
+            cancel_after_ms,
+        } => {
+            bench_thumbnails(BenchThumbnailsArgs {
+                server,
+                share,
+                folder,
+                only,
+                limit,
+                first_visible,
+                passes,
+                idle_secs,
+                no_thumbs,
+                open,
+                open_after_ms,
+                play_secs,
+                cancel_after_ms,
+            })?;
         }
         Command::Subtitles {
             input,

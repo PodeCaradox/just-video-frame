@@ -1447,12 +1447,15 @@ pub fn thumbnail_unless(
     out_h: u32,
     stop: &dyn Fn() -> bool,
 ) -> anyhow::Result<Option<Thumb>> {
+    let started = std::time::Instant::now();
     let media = Media::open(name, source)?;
+    let opened = started.elapsed();
     if stop() {
         return Ok(None);
     }
     let duration = media.info().duration_seconds;
     let mut decoder = media.open_decoder(None, true, "threads=2", false)?;
+    let decoder_ready = started.elapsed();
     if duration > 0.0 {
         // A file that can't seek gives its first picture.
         decoder.seek(duration * at_fraction.clamp(0.0, 1.0)).ok();
@@ -1460,15 +1463,27 @@ pub fn thumbnail_unless(
             return Ok(None);
         }
     }
+    let sought = started.elapsed();
     unsafe { jv_decoder_first_picture(decoder.raw) };
     let Some(frame) = decoder.next_frame()? else {
         bail!("No picture to show");
     };
+    let decoded = started.elapsed();
     if stop() {
         return Ok(None);
     }
     let crop = Crop::for_layout(layout, frame.width(), frame.height(), out_w, out_h);
-    Ok(Some(frame_to_rgba(&frame, crop, out_w, out_h)))
+    let thumb = frame_to_rgba(&frame, crop, out_w, out_h);
+    let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
+    eprintln!(
+        "Timing: thumbnail {name}: open {:.0}, decoder {:.0}, seek {:.0}, decode {:.0}, convert {:.0} ms",
+        ms(opened),
+        ms(decoder_ready - opened),
+        ms(sought - decoder_ready),
+        ms(decoded - sought),
+        ms(started.elapsed() - decoded),
+    );
+    Ok(Some(thumb))
 }
 
 #[cfg(test)]

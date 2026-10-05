@@ -1197,7 +1197,9 @@ fn thumbnail_worker(
             // is dropped at the top of the loop).
             Ok(None) => {
                 let stale = queue.generation != current.load(Ordering::Relaxed);
-                if !stale {
+                if stale {
+                    eprintln!("Thumbnails: {} stopped, folder left", video.name);
+                } else {
                     eprintln!("Thumbnails: {} paused for playback", video.name);
                 }
             }
