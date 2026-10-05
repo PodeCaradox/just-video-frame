@@ -887,14 +887,25 @@ pub fn run(
                         dir.is_some() && (focus.is_none() || pointer_moved(point, focus_pointer))
                     })
                     .and_then(|p| focus::at_hit(view, &mut fonts, hit, p));
-                // Right on a folder opens it (the new place then gets focus).
-                let opened = pointed
-                    .or(focus.filter(|f| place == focus_place && focus::valid(view, &mut fonts, f)))
+                let current =
+                    pointed
+                        .or(focus
+                            .filter(|f| place == focus_place && focus::valid(view, &mut fonts, f)));
+                // Right on a folder opens it (the new place then gets focus);
+                // left on a row goes up a level.
+                let opened = current
                     .filter(|_| dir == Some(focus::Dir::Right))
                     .and_then(|f| focus::opens_on_right(view, &f));
+                let backed_out = current.is_some_and(|f| {
+                    dir == Some(focus::Dir::Left) && focus::backs_out_on_left(view, &f)
+                });
                 if let Some(hit) = opened {
                     nav.click(hit);
                     // Holding right must not keep going down into subfolders.
+                    input.wait_for_dpad_release();
+                } else if backed_out {
+                    nav.back();
+                    // Nor holding left up past the folder above.
                     input.wait_for_dpad_release();
                 } else if let Some(dir) = dir {
                     focus = match (pointed, focus) {

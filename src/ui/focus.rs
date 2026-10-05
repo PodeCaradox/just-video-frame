@@ -152,6 +152,20 @@ pub fn opens_on_right(view: &View, focus: &Focus) -> Option<Hit> {
     (container && plain && !row.dimmed).then_some(focus.hit)
 }
 
+/// Left on a row (not on its buttons) goes up a level, as B does: out of a
+/// folder, a share or Settings. Not on the server list, nor while selecting.
+pub fn backs_out_on_left(view: &View, focus: &Focus) -> bool {
+    let Hit::Row(i) = focus.hit else {
+        return false;
+    };
+    view.crumbs.len() > 1
+        && view
+            .rows
+            .get(i)
+            .filter(|_| list_shown(view))
+            .is_some_and(|row| row.checked.is_none())
+}
+
 /// After the view changed under the focus (e.g. Shift relabels the keys, a
 /// row went away): the item now nearest to where it was.
 pub fn refind(view: &View, fonts: &mut Fonts, old: &Focus) -> Option<Focus> {
@@ -343,6 +357,25 @@ mod tests {
         assert_eq!(opens_on_right(&v, &second), None);
         v.rows[0].icon = Icon::Video(None);
         assert_eq!(opens_on_right(&v, &first), None, "videos open with A");
+    }
+
+    #[test]
+    fn left_on_a_row_goes_up_a_level() {
+        let mut fonts = Fonts::load().expect("fonts");
+        let mut v = view(5);
+        let first = initial(&v, &mut fonts).unwrap();
+        assert!(backs_out_on_left(&v, &first));
+        let second = step(&v, &mut fonts, first, Dir::Down);
+        let rename = step(&v, &mut fonts, second, Dir::Right);
+        assert!(
+            !backs_out_on_left(&v, &rename),
+            "left from a button: back to the row"
+        );
+        v.rows[0].checked = Some(false);
+        assert!(!backs_out_on_left(&v, &first), "not while selecting");
+        v.rows[0].checked = None;
+        v.crumbs.truncate(1);
+        assert!(!backs_out_on_left(&v, &first), "the server list is the top");
     }
 
     #[test]
