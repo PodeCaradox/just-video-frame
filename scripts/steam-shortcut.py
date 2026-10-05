@@ -54,8 +54,9 @@ def write_vr_manifest(art, app_id):
         "binary_path_linux_arm": launcher,
         "working_directory": base,
         "is_openxr": 1,
-        "image_path": os.path.join(art, "capsule.png"),
-        "image_path_capsule": os.path.join(art, "portrait.png"),
+        # Poster only: the dashboard asks /app/image for the portrait, and
+        # vrserver answers an empty redirect when image_path_capsule is a file.
+        "image_path": os.path.join(art, "portrait.png"),
         "strings": {"en_us": {"name": "Just Video"}},
     }
     with open(manifest, "w") as f:
