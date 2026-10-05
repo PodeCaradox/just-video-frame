@@ -216,6 +216,9 @@ enum Command {
     /// Render sample browser screens to PNG files (UI development).
     #[command(hide = true)]
     UiPreview { dir: std::path::PathBuf },
+    /// Render the Steam library artwork to PNG files (assets/steam).
+    #[command(hide = true)]
+    SteamArt { dir: std::path::PathBuf },
     /// Measure raw sequential SMB read throughput through the read-ahead reader.
     ReadBench {
         url: String,
@@ -1738,6 +1741,15 @@ fn main() -> anyhow::Result<()> {
                 layout.stereo,
                 started.elapsed().as_secs_f64() * 1e3
             );
+        }
+        Command::SteamArt { dir } => {
+            use just_video::ui::steam_art;
+            let mut fonts = just_video::ui::canvas::Fonts::load()?;
+            std::fs::create_dir_all(&dir)?;
+            for &(name, w, h) in steam_art::PIECES {
+                let art = steam_art::render(name, w, h, &mut fonts);
+                just_video::ui::save_png(&art, &dir.join(name))?;
+            }
         }
         Command::XrProbe => {
             let xr = just_video::xr::context::XrContext::new()?;
