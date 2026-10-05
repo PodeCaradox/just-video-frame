@@ -784,31 +784,6 @@ fn wait_for_quiet(current: &AtomicU64, generation: u64, opening: &AtomicU64) -> 
     }
 }
 
-/// A probe's reads, which stop as soon as a video starts opening; the
-/// probe then runs again later. FFmpeg sees only a read error (and might
-/// even succeed with what it read), so `paused` tells the probe.
-struct Yielding<R> {
-    inner: R,
-    opening: Arc<AtomicU64>,
-    paused: Arc<std::sync::atomic::AtomicBool>,
-}
-
-impl<R: std::io::Read> std::io::Read for Yielding<R> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if video_busy(&self.opening) {
-            self.paused.store(true, Ordering::SeqCst);
-            return Err(std::io::Error::other("Probe paused for playback"));
-        }
-        self.inner.read(buf)
-    }
-}
-
-impl<R: std::io::Seek> std::io::Seek for Yielding<R> {
-    fn seek(&mut self, from: std::io::SeekFrom) -> std::io::Result<u64> {
-        self.inner.seek(from)
-    }
-}
-
 /// How a folder marks a video, from what its header says.
 fn probed(name: &str, video: Option<&VideoInfo>, saved: Option<&LayoutOverride>) -> Probed {
     // Marked as it will play: a format the user picked wins.
@@ -874,11 +849,13 @@ fn dispatch_probes(
     }
 }
 
-/// Reads one video's header. `None` when the probe paused for playback.
+/// Reads one video's header. `None` when the probe stopped for playback or
+/// because its folder was left (it is queued again, and dropped if stale).
 fn probe(
     job: &ProbeJob,
     sessions: &Sessions,
     opening: &Arc<AtomicU64>,
+    current: &Arc<AtomicU64>,
 ) -> Option<Result<Option<VideoInfo>, String>> {
     let err = |e: anyhow::Error| format!("{e:#}");
     // Header probes read little: small blocks, shallow read-ahead.
@@ -891,20 +868,22 @@ fn probe(
         Ok(s) => s,
         Err(e) => return Some(Err(e)),
     };
-    let paused = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let generation = job.generation;
+    let stop = || video_busy(opening) || current.load(Ordering::Relaxed) != generation;
+    // The reads give up the moment a video starts or the folder is left, also
+    // while waiting for data: a probe never holds up playback.
+    let cancel: crate::readahead::Cancel = {
+        let (opening, current) = (opening.clone(), current.clone());
+        Arc::new(move || video_busy(&opening) || current.load(Ordering::Relaxed) != generation)
+    };
     let result = session
         .open_in(&job.share, &smb_path(&job.path), small)
         .map_err(err)
-        .and_then(|reader| {
-            let reader = Yielding {
-                inner: reader,
-                opening: opening.clone(),
-                paused: paused.clone(),
-            };
-            Media::open(&name, reader).map_err(err)
-        })
+        .and_then(|reader| Media::open(&name, reader.with_cancel(cancel)).map_err(err))
         .map(|media| media.info().video.clone());
-    if paused.load(Ordering::SeqCst) {
+    // Stopped by `cancel` (FFmpeg only sees a read error, and might even
+    // succeed with what it read): not a result.
+    if stop() {
         return None;
     }
     match result {
@@ -1308,8 +1287,14 @@ impl Library {
                             return;
                         };
                         if wait_for_quiet(&current, job.generation, &opening) {
-                            let Some(result) = probe(&job, &sessions, &opening) else {
+                            let Some(result) = probe(&job, &sessions, &opening, &current) else {
                                 // Paused: again once the video is closed.
+                                if current.load(Ordering::Relaxed) == job.generation {
+                                    eprintln!(
+                                        "Library: probe of {} paused for playback",
+                                        job.path.last().map_or("", |n| n.as_str())
+                                    );
+                                }
                                 let _ = requeue.send(job);
                                 continue;
                             };

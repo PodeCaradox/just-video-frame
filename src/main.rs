@@ -138,6 +138,10 @@ enum Command {
         /// Open the first video while the folder is still being probed.
         #[arg(long)]
         click_at_once: bool,
+        /// With --click-at-once: wait this long (ms) after asking for the
+        /// marks first, so some probes are mid-read when the video opens.
+        #[arg(long, default_value_t = 0)]
+        click_delay_ms: u64,
     },
     /// Time the list-thumbnail worker over a saved server's folder: how long
     /// each thumbnail takes to arrive, the disk cache on later passes, and
@@ -955,6 +959,7 @@ fn main() -> anyhow::Result<()> {
             cold,
             warm,
             click_at_once,
+            click_delay_ms,
         } => {
             use just_video::library::{Library, Request, Response};
             use std::time::{Duration, Instant};
@@ -1043,6 +1048,9 @@ fn main() -> anyhow::Result<()> {
                         "Marked {marked} videos in {:.0} ms ({cached} from cache)",
                         started.elapsed().as_secs_f64() * 1e3
                     );
+                }
+                if click_at_once {
+                    std::thread::sleep(Duration::from_millis(click_delay_ms));
                 }
                 let mut file = path.clone();
                 file.push(name.clone());
