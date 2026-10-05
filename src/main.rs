@@ -567,6 +567,7 @@ fn bench_thumbnails(a: BenchThumbnailsArgs) -> anyhow::Result<()> {
         server: server.clone(),
         share: a.share.clone(),
         path: path.clone(),
+        recursive: false,
     });
     let listed: Vec<ProbeVideo> = loop {
         match recv(Duration::from_secs(30)) {
@@ -1002,6 +1003,7 @@ fn main() -> anyhow::Result<()> {
                 server: index.clone(),
                 share: share.clone(),
                 path: path.clone(),
+                recursive: false,
             });
             let Response::List { result, .. } = wait("list")? else {
                 anyhow::bail!("unexpected")
@@ -1130,6 +1132,7 @@ fn main() -> anyhow::Result<()> {
                     server: index.clone(),
                     share: share.clone(),
                     path: path.clone(),
+                    recursive: false,
                 });
                 loop {
                     if let Response::List { .. } = wait("list after stop")? {

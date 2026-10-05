@@ -13,7 +13,7 @@ use super::form::{self, Field, Form, Key};
 use super::settings::{self, Setting};
 use crate::config::{self, Server};
 use crate::library::{
-    Library, Opened, Path, ProbeVideo, Probed, Request, Response, ThumbVideo, file_key,
+    Library, Opened, Path, ProbeVideo, Probed, Request, Response, ThumbVideo, file_key, join,
 };
 use crate::local;
 use crate::media::Thumb;
@@ -117,6 +117,7 @@ enum ToolAction {
     ToggleEdit,
     StartSelect,
     ToggleThumbnails,
+    ToggleSubfolders,
     CancelSelect,
     DeleteSelected,
 }
@@ -259,9 +260,11 @@ impl Navigator {
         self.next_id
     }
 
-    /// Changes are allowed here (inside a share of a writable server).
+    /// Changes are allowed here (inside a share of a writable server, and
+    /// not while the list also shows subfolders' videos).
     fn editing(&self) -> bool {
-        matches!(&self.location, Location::Folder { server, .. } if server.writable)
+        !self.prefs.subfolders
+            && matches!(&self.location, Location::Folder { server, .. } if server.writable)
     }
 
     fn crumbs(&self) -> Vec<String> {
@@ -508,6 +511,26 @@ impl Navigator {
         self.request_thumbnails();
     }
 
+    /// The header button: videos in subfolders on or off, saved like the
+    /// thumbnails switch. The folder is listed again.
+    fn toggle_subfolders(&mut self) {
+        let on = !self.prefs.subfolders;
+        match config::update_preferences(|p| p.subfolders = on) {
+            Ok(prefs) => self.prefs = prefs,
+            Err(e) => {
+                // Still applies until Just Video quits.
+                self.prefs.subfolders = on;
+                self.dialog("Couldn't save the setting", vec![format!("{e:#}")]);
+            }
+        }
+        self.prefs_changed = true;
+        self.edit_mode = false;
+        if matches!(self.location, Location::Folder { .. }) {
+            self.refresh();
+            self.view.scroll = 0.0;
+        }
+    }
+
     /// The preferences, once after the Settings screen changed them.
     pub fn take_preferences(&mut self) -> Option<config::Preferences> {
         std::mem::take(&mut self.prefs_changed).then_some(self.prefs)
@@ -548,6 +571,7 @@ impl Navigator {
                     server,
                     share,
                     path,
+                    recursive: self.prefs.subfolders,
                 });
             }
         }
@@ -619,7 +643,8 @@ impl Navigator {
                         },
                         right: format_size(*size),
                         thumbnail: self.thumbs.get(name).cloned(),
-                        ..Row::new(Icon::Video(None), name)
+                        // In a list with subfolders: "folder / video.mp4".
+                        ..Row::new(Icon::Video(None), name.replace('/', " / "))
                     },
                     Item::File { name, size } => Row {
                         right: format_size(*size),
@@ -665,6 +690,15 @@ impl Navigator {
         if self.selecting.is_none() && self.in_video_folder() {
             let thumbnails = Tool::icon(ToolIcon::Thumbnails, self.prefs.thumbnails);
             tools.insert(0, (thumbnails, ToolAction::ToggleThumbnails));
+        }
+        // Videos in subfolders: where there are subfolders (or it is on).
+        let has_dirs = self.items.iter().any(|i| matches!(i, Item::Dir(_)));
+        if self.selecting.is_none()
+            && matches!(self.location, Location::Folder { .. })
+            && (has_dirs || self.prefs.subfolders)
+        {
+            let subfolders = Tool::icon(ToolIcon::Subfolders, self.prefs.subfolders);
+            tools.push((subfolders, ToolAction::ToggleSubfolders));
         }
         (self.view.tools, self.tool_actions) = tools.into_iter().unzip();
         self.view.clamp_scroll();
@@ -733,9 +767,13 @@ impl Navigator {
                                 t.listed_ms = t.requested.elapsed().as_secs_f64() * 1e3;
                                 t.videos = videos.len();
                             }
+                            // With subfolders only the videos are shown: the
+                            // folders' contents are in the list already.
+                            let subfolders = self.prefs.subfolders;
                             self.items = entries
                                 .into_iter()
                                 .filter(|e| !e.name.starts_with('.'))
+                                .filter(|e| !subfolders || (!e.is_dir && is_video(&e.name)))
                                 .map(|e| {
                                     if e.is_dir {
                                         Item::Dir(e.name)
@@ -772,10 +810,10 @@ impl Navigator {
                                     videos,
                                 });
                             }
-                            self.view.status = if self.items.is_empty() {
-                                Some("This folder is empty.".into())
-                            } else {
-                                None
+                            self.view.status = match (self.items.is_empty(), subfolders) {
+                                (false, _) => None,
+                                (true, false) => Some("This folder is empty.".into()),
+                                (true, true) => Some("No videos here or in the subfolders.".into()),
                             };
                             self.restore_scroll();
                             self.rebuild_rows();
@@ -965,6 +1003,7 @@ impl Navigator {
             Some(ToolAction::ToggleEdit) => self.edit_mode = !self.edit_mode,
             Some(ToolAction::StartSelect) => self.selecting = Some(HashSet::new()),
             Some(ToolAction::ToggleThumbnails) => self.toggle_thumbnails(),
+            Some(ToolAction::ToggleSubfolders) => self.toggle_subfolders(),
             Some(ToolAction::CancelSelect) => self.selecting = None,
             Some(ToolAction::DeleteSelected) => {
                 let mut indices: Vec<usize> = self.selecting.iter().flatten().copied().collect();
@@ -1024,10 +1063,12 @@ impl Navigator {
             return;
         }
         if !self.editing() {
-            self.view.notice = Some(
+            self.view.notice = Some(if self.prefs.subfolders {
+                "To change files, switch off the subfolders button at the top.".into()
+            } else {
                 "To change files, allow it in this server's settings (Edit on the server list)."
-                    .into(),
-            );
+                    .into()
+            });
             self.dirty = true;
             return;
         }
@@ -1092,7 +1133,7 @@ impl Navigator {
                 ..
             }) = self.items.get_mut(i)
         {
-            let file: Path = path.iter().chain([&*name]).cloned().collect();
+            let file: Path = join(path, name);
             if let Ok(Some(saved)) = config::layout_override(&file_key(server, share, &file)) {
                 saved.apply(layout);
             }
@@ -1202,7 +1243,7 @@ impl Navigator {
                         .collect();
                     self.dialog(a.title.clone(), body);
                 } else {
-                    path.push(name.clone());
+                    path = join(&path, name);
                     self.playing = Some(index);
                     self.view.notice = Some(format!("Opening {name}…"));
                     self.dirty = true;
@@ -1685,7 +1726,13 @@ mod tests {
             nav.view().rows.iter().all(|r| r.actions.is_empty()),
             "read only"
         );
-        assert!(nav.view().tools.is_empty());
+        assert!(
+            nav.view()
+                .tools
+                .iter()
+                .all(|t| t.icon == Some(ToolIcon::Subfolders)),
+            "nothing to change files with"
+        );
 
         nav.long_press(1);
         assert!(nav.view().notice.is_some(), "says where to allow changes");
@@ -1700,14 +1747,14 @@ mod tests {
             nav.view().rows[0].actions.is_empty(),
             "rename/delete wait for edit mode"
         );
-        assert_eq!(nav.view().tools.len(), 1, "edit");
+        assert_eq!(nav.view().tools.len(), 2, "edit, subfolders");
 
         nav.click(Hit::Tool(0));
         assert_eq!(
             nav.view().rows[0].actions,
             vec![Action::Rename, Action::Delete]
         );
-        assert_eq!(nav.view().tools.len(), 2, "select + edit");
+        assert_eq!(nav.view().tools.len(), 3, "select + edit, subfolders");
 
         nav.click(Hit::Tool(0));
         assert!(nav.view().rows.iter().all(|r| r.checked == Some(false)));
@@ -1777,7 +1824,8 @@ mod tests {
         config::save_server(pc.clone(), "a").unwrap();
         config::save_server(nas.clone(), "b").unwrap();
         let mut nav = Navigator::new(Library::start(None));
-        nav.click(Hit::RowAction(0, Action::Edit));
+        // Row 0 is the headset's own storage.
+        nav.click(Hit::RowAction(1, Action::Edit));
         let form = nav.view.form.as_mut().expect("edit form");
         form.fields[0].value = "nas".into();
         form.fields[1].value = "bob".into();
@@ -1944,6 +1992,54 @@ mod tests {
         nav.selecting = Some(HashSet::new());
         nav.rebuild_rows();
         assert!(!tool(&nav), "not while selecting");
+    }
+
+    #[test]
+    fn the_subfolders_tool_lists_every_video_below() {
+        let dir = config::temp_config("nav-subfolders");
+        let (library, responses) = Library::detached();
+        let mut nav = Navigator::new(library);
+        video_folder(&mut nav, &["top.mp4"]);
+        let k = nav
+            .view()
+            .tools
+            .iter()
+            .position(|t| t.icon == Some(ToolIcon::Subfolders))
+            .expect("subfolders tool");
+        nav.click(Hit::Tool(k));
+        assert!(
+            nav.prefs.subfolders && config::preferences().subfolders,
+            "saved"
+        );
+        let id = nav.pending.expect("listed again");
+        let entry = |name: &str| crate::smb::Entry {
+            name: name.into(),
+            is_dir: false,
+            size: 1,
+            modified: 2,
+        };
+        responses
+            .send(Response::List {
+                id,
+                result: Ok(vec![
+                    entry("Scene/a_180_LR.mp4"),
+                    entry("Scene/info.nfo"),
+                    entry("top.mp4"),
+                ]),
+            })
+            .unwrap();
+        nav.poll();
+        let labels: Vec<&str> = nav.view().rows.iter().map(|r| r.label.as_str()).collect();
+        assert_eq!(labels, ["Scene / a_180_LR.mp4", "top.mp4"], "videos only");
+        assert!(!nav.editing(), "no renaming in this view");
+        assert!(
+            nav.view()
+                .tools
+                .iter()
+                .any(|t| t.icon == Some(ToolIcon::Subfolders) && t.active),
+            "the way back"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

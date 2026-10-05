@@ -36,6 +36,8 @@ pub enum Request {
         server: Server,
         share: String,
         path: Path,
+        /// Also the files in subfolders (see [`list_recursive`]).
+        recursive: bool,
     },
     /// Marks a folder's videos: from the probe cache at once, the others by
     /// reading their headers, a few at a time, top row first.
@@ -437,6 +439,8 @@ const PROBE_WORKERS: usize = 3;
 /// One video to probe (see [`Request::ProbeFolder`]).
 struct ProbeJob {
     generation: u64,
+    /// As in the listing (see [`join`]); answers are matched by it.
+    name: String,
     server: Server,
     share: String,
     path: Path,
@@ -459,6 +463,63 @@ enum Purpose {
 /// workers wait for one connect instead of each making their own, while
 /// browsing never waits on a probe connection.
 type Sessions = Arc<Mutex<HashMap<(String, Purpose), Arc<Mutex<Option<Arc<SmbSession>>>>>>>;
+
+/// The path of `name` in `folder`. A name from a listing with subfolders
+/// (see [`list_recursive`]) holds several steps, joined with `/`.
+pub fn join(folder: &[String], name: &str) -> Path {
+    folder
+        .iter()
+        .cloned()
+        .chain(name.split('/').map(str::to_string))
+        .collect()
+}
+
+/// How deep a listing with subfolders goes, and how many files it keeps.
+const SUBFOLDER_DEPTH: usize = 4;
+const SUBFOLDER_FILES: usize = 5000;
+
+/// The files in `path` and in the folders below it (up to
+/// [`SUBFOLDER_DEPTH`] levels), each named by its path from `path` with the
+/// steps joined by `/` (a character no file name can contain), sorted by
+/// that name. Folders themselves aren't listed, nor hidden entries. A
+/// subfolder that can't be read is left out; `path` itself must be.
+fn list_recursive(
+    path: &[String],
+    mut list: impl FnMut(&[String]) -> anyhow::Result<Vec<Entry>>,
+) -> anyhow::Result<Vec<Entry>> {
+    let mut files = Vec::new();
+    let mut folders = std::collections::VecDeque::from([(Vec::<String>::new(), 0)]);
+    while let Some((sub, depth)) = folders.pop_front() {
+        let full: Path = path.iter().chain(&sub).cloned().collect();
+        let entries = match list(full.as_slice()) {
+            Ok(entries) => entries,
+            Err(e) if sub.is_empty() || connection_lost(&format!("{e:#}")) => return Err(e),
+            Err(e) => {
+                eprintln!("Library: skipping a subfolder: {e:#}");
+                continue;
+            }
+        };
+        for entry in entries {
+            if entry.name.starts_with('.') {
+                continue;
+            }
+            let mut steps = sub.clone();
+            steps.push(entry.name.clone());
+            if entry.is_dir {
+                if depth < SUBFOLDER_DEPTH {
+                    folders.push_back((steps, depth + 1));
+                }
+            } else if files.len() < SUBFOLDER_FILES {
+                files.push(Entry {
+                    name: steps.join("/"),
+                    ..entry
+                });
+            }
+        }
+    }
+    files.sort_by_cached_key(|e: &Entry| e.name.to_lowercase());
+    Ok(files)
+}
 
 /// Key of a file's saved layout override.
 pub fn file_key(server: &Server, share: &str, path: &Path) -> String {
@@ -711,10 +772,21 @@ fn run_local(
             result: Ok(local::shares()),
         },
         Request::List {
-            id, share, path, ..
+            id,
+            share,
+            path,
+            recursive,
+            ..
         } => Response::List {
             id,
-            result: local::list(&share, &path).map_err(err),
+            result: {
+                let listed = if recursive {
+                    list_recursive(&path, |p| local::list(&share, p))
+                } else {
+                    local::list(&share, &path)
+                };
+                listed.map_err(err)
+            },
         },
         Request::ProbeFolder { .. }
         | Request::Warm { .. }
@@ -814,10 +886,17 @@ fn run(
             server,
             share,
             path,
+            recursive,
         } => Response::List {
             id,
-            result: session(sessions, &server, Purpose::Browse)
-                .and_then(|s| s.list_in(&share, &smb_path(&path)).map_err(err)),
+            result: session(sessions, &server, Purpose::Browse).and_then(|s| {
+                let listed = if recursive {
+                    list_recursive(&path, |p| s.list_in(&share, &smb_path(p)))
+                } else {
+                    s.list_in(&share, &smb_path(&path))
+                };
+                listed.map_err(err)
+            }),
         },
         Request::ProbeFolder { .. }
         | Request::Warm { .. }
@@ -962,8 +1041,7 @@ fn dispatch_probes(
     };
     let overrides = config::layout_overrides().unwrap_or_default();
     for video in videos {
-        let mut path = folder.clone();
-        path.push(video.name.clone());
+        let path = join(&folder, &video.name);
         let key = file_key(&server, &share, &path);
         let hit = cache
             .lock()
@@ -983,6 +1061,7 @@ fn dispatch_probes(
                 queued.fetch_add(1, Ordering::SeqCst);
                 let _ = jobs.send(ProbeJob {
                     generation,
+                    name: video.name.clone(),
                     server: server.clone(),
                     share: share.clone(),
                     path,
@@ -1192,8 +1271,7 @@ fn make_thumbnail(
         return Ok(None);
     };
     let generation = queue.generation;
-    let mut path = folder.clone();
-    path.push(video.name.clone());
+    let path = join(folder, &video.name);
     if local::is_local(server) {
         let stop = || video_busy(opening) || current.load(Ordering::Relaxed) != generation;
         let result = local::open(share, &path)
@@ -1301,8 +1379,7 @@ fn thumbnail_worker(
             let (Some(server), Some((_, share, folder))) = (&queue.server, &queue.folder) else {
                 return String::new();
             };
-            let mut path = folder.clone();
-            path.push(video.name.clone());
+            let path = join(folder, &video.name);
             thumb_cache::key(
                 &file_key(server, share, &path),
                 video.size,
@@ -1479,7 +1556,7 @@ impl Library {
                                 let _ = requeue.send(job);
                                 continue;
                             };
-                            let name = job.path.last().cloned().unwrap_or_default();
+                            let name = job.name.clone();
                             let key = file_key(&job.server, &job.share, &job.path);
                             if let Ok(video) = &result {
                                 cache.lock().expect("probe cache").insert(
@@ -1779,6 +1856,41 @@ mod tests {
         a.layout.swap_eyes = true;
         queue.apply(thumb_folder(1, vec![a], 0), 1);
         assert_eq!(queue.pending.len(), 3);
+    }
+
+    #[test]
+    fn listing_with_subfolders_names_files_by_their_path() {
+        let entry = |name: &str, is_dir| Entry {
+            name: name.into(),
+            is_dir,
+            size: 1,
+            modified: 2,
+        };
+        let tree = |path: &[String]| -> anyhow::Result<Vec<Entry>> {
+            Ok(match path.join("/").as_str() {
+                "vr" => vec![
+                    entry("b.mp4", false),
+                    entry("Scene 1", true),
+                    entry(".hidden", true),
+                ],
+                "vr/Scene 1" => vec![entry("a_180_LR.mp4", false), entry("deep", true)],
+                "vr/Scene 1/deep" => vec![entry("c.mkv", false)],
+                other => anyhow::bail!("no folder {other}"),
+            })
+        };
+        let files = list_recursive(&["vr".to_string()], tree).unwrap();
+        let names: Vec<&str> = files.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["b.mp4", "Scene 1/a_180_LR.mp4", "Scene 1/deep/c.mkv"]
+        );
+        assert!(files.iter().all(|e| !e.is_dir));
+        assert_eq!(
+            join(&["vr".to_string()], "Scene 1/a_180_LR.mp4"),
+            ["vr", "Scene 1", "a_180_LR.mp4"]
+        );
+        // The folder itself must be readable.
+        assert!(list_recursive(&["gone".to_string()], tree).is_err());
     }
 
     #[test]

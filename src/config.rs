@@ -332,6 +332,9 @@ pub struct Preferences {
     pub resume: bool,
     /// Thumbnails in video lists.
     pub thumbnails: bool,
+    /// Video lists also show the videos in subfolders (folders themselves
+    /// are then left out).
+    pub subfolders: bool,
 }
 
 impl Default for Preferences {
@@ -342,6 +345,7 @@ impl Default for Preferences {
             volume_step: 10,
             resume: true,
             thumbnails: false,
+            subfolders: false,
         }
     }
 }

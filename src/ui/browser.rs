@@ -178,6 +178,8 @@ pub enum ToolIcon {
     Select,
     /// Thumbnails in the video list.
     Thumbnails,
+    /// The videos in subfolders in the list too.
+    Subfolders,
 }
 
 impl Tool {
@@ -879,6 +881,20 @@ pub fn render(
                             0.0,
                             TEXT,
                         );
+                    }
+                }
+                Some(ToolIcon::Subfolders) => {
+                    // Two folders, one in front of the other.
+                    let ink = if tool.active {
+                        fill
+                    } else {
+                        [0x2a, 0x2f, 0x38]
+                    };
+                    for (dx, dy) in [(-6.0, -6.0), (6.0, 6.0)] {
+                        let (fx, fy) = (cx + dx, cy + dy);
+                        canvas.rect(fx - 16.0, fy - 14.0, 13.0, 7.0, 2.0, TEXT);
+                        canvas.rect(fx - 16.0, fy - 10.0, 32.0, 22.0, 4.0, TEXT);
+                        canvas.rect(fx - 13.0, fy - 7.0, 26.0, 16.0, 2.0, ink);
                     }
                 }
                 Some(ToolIcon::Select) => {

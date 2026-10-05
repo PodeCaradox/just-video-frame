@@ -127,7 +127,9 @@ fn filetime(meta: &fs::Metadata) -> u64 {
     meta.modified()
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or(0, |d| UNIX_TO_1601 + d.as_secs() * 10_000_000 + u64::from(d.subsec_nanos() / 100))
+        .map_or(0, |d| {
+            UNIX_TO_1601 + d.as_secs() * 10_000_000 + u64::from(d.subsec_nanos() / 100)
+        })
 }
 
 pub fn open(share: &str, path: &[String]) -> anyhow::Result<BufReader<fs::File>> {
