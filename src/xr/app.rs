@@ -138,6 +138,20 @@ const BROWSER_PANEL: Panel = Panel {
 /// Preferred distance of the control bar; it looks as big as 1.2 m wide at 1 m.
 const CONTROLS_DISTANCE: f32 = 1.8;
 
+/// How far the control bar may be in VR180/360. Stereo pictures often put
+/// things nearer than the default distance; an opaque bar behind them looks
+/// half there, so it comes close.
+const VR_CONTROLS_DISTANCE: f32 = 0.9;
+
+/// The farthest the control bar may be: in front of a flat screen; near in VR180/360.
+fn controls_limit(projection: Projection, screen_distance: f32) -> f32 {
+    if projection == Projection::Flat {
+        screen_distance - 0.4
+    } else {
+        VR_CONTROLS_DISTANCE
+    }
+}
+
 /// The control bar ahead of the head, below eye level, tilted towards it:
 /// [`CONTROLS_DISTANCE`] away, but never beyond `max_distance` (in front of
 /// the screen), and scaled with its distance so it always looks the same size.
@@ -1040,12 +1054,10 @@ pub fn run(
                                     Some(_) => None,
                                     None => {
                                         // In front of a flat screen; VR180/360 surround us.
-                                        let limit =
-                                            if playback.layout.projection == Projection::Flat {
-                                                placement.distance - 0.4
-                                            } else {
-                                                f32::INFINITY
-                                            };
+                                        let limit = controls_limit(
+                                            playback.layout.projection,
+                                            placement.distance,
+                                        );
                                         views.first().map(|v| controls_panel(&v.pose, limit))
                                     }
                                 };
@@ -1594,5 +1606,34 @@ mod tests {
                 "{rotated:?} vs {normal:?}"
             );
         }
+    }
+
+    #[test]
+    fn control_bar_is_near_in_vr_and_before_a_flat_screen() {
+        let head = xr::Posef {
+            orientation: xr::Quaternionf {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+                w: 1.0,
+            },
+            position: xr::Vector3f {
+                x: 0.0,
+                y: 1.5,
+                z: 0.0,
+            },
+        };
+        let distance = |limit: f32| {
+            let c = controls_panel(&head, limit).center;
+            (c[0] * c[0] + c[2] * c[2]).sqrt()
+        };
+        for vr in [
+            Projection::Equirect180,
+            Projection::Equirect360,
+            Projection::Fisheye180,
+        ] {
+            assert!((distance(controls_limit(vr, 5.0)) - VR_CONTROLS_DISTANCE).abs() < 1e-4);
+        }
+        assert!((distance(controls_limit(Projection::Flat, 2.0)) - 1.6).abs() < 1e-4);
     }
 }
