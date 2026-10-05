@@ -1,0 +1,7 @@
+# Shell and Python scripts run on Linux (Docker, the headset): keep LF.
+*.sh text eol=lf
+*.py text eol=lf
+Dockerfile text eol=lf
+# PowerShell scripts run on Windows.
+*.ps1 text eol=crlf
+*.png binary
