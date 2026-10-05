@@ -2,9 +2,12 @@
 //! XR frame loop: requests go to worker threads and results come back on a
 //! channel. Navigation and opening use one worker; playability probes have
 //! their own (a dispatcher answering from the probe cache, and a few workers
-//! reading headers), so a slow probe never delays browsing.
+//! reading headers), so a slow probe never delays browsing. Requests for the
+//! headset's own storage ([`local`]) take the same paths, served from the
+//! filesystem.
 
 use crate::config::{self, LayoutOverride, Server};
+use crate::local;
 use crate::media::{Media, VideoDecoder, VideoInfo};
 use crate::playability::{self, Assessment, Platform};
 use crate::probe_cache::ProbeCache;
@@ -138,14 +141,43 @@ pub struct ExternalSubtitles {
     pub cues: Vec<crate::subtitles::Cue>,
 }
 
-/// Loads the .srt files next to `path`. Missing or unreadable ones are
-/// skipped: subtitles must never stop a video from playing.
+/// Loads the .srt files next to `path` on an SMB share.
 fn load_sidecars(session: &SmbSession, share: &str, path: &Path) -> Vec<ExternalSubtitles> {
     use std::io::Read;
+    let folder = &path[..path.len().saturating_sub(1)];
+    let small = ReadAhead {
+        block_size: 256 * 1024,
+        blocks_ahead: 4,
+    };
+    sidecars(path, session.list_in(share, &smb_path(folder)), |file| {
+        let mut bytes = Vec::new();
+        session
+            .open_in(share, &smb_path(file), small)?
+            .read_to_end(&mut bytes)?;
+        Ok(bytes)
+    })
+}
+
+/// Loads the .srt files next to `path` on the headset's own storage.
+fn load_local_sidecars(share: &str, path: &Path) -> Vec<ExternalSubtitles> {
+    let folder = &path[..path.len().saturating_sub(1)];
+    sidecars(path, local::list(share, folder), |file| {
+        Ok(std::fs::read(local::resolve(share, file)?)?)
+    })
+}
+
+/// Loads the .srt files next to `path`, given its folder's `entries` and a way
+/// to read a file. Missing or unreadable ones are skipped: subtitles must never
+/// stop a video from playing.
+fn sidecars(
+    path: &Path,
+    entries: anyhow::Result<Vec<Entry>>,
+    read: impl Fn(&[String]) -> anyhow::Result<Vec<u8>>,
+) -> Vec<ExternalSubtitles> {
     let Some((video, folder)) = path.split_last() else {
         return Vec::new();
     };
-    let entries = match session.list_in(share, &smb_path(&folder.to_vec())) {
+    let entries = match entries {
         Ok(entries) => entries,
         Err(e) => {
             eprintln!("Subtitles: can't list the folder: {e:#}");
@@ -159,23 +191,18 @@ fn load_sidecars(session: &SmbSession, share: &str, path: &Path) -> Vec<External
         .collect();
     // `movie.srt` first, then language variants.
     names.sort_by_key(|n| (n.len(), n.clone()));
-    let small = ReadAhead {
-        block_size: 256 * 1024,
-        blocks_ahead: 4,
-    };
     names
         .into_iter()
         .filter_map(|name| {
             let mut file = folder.to_vec();
             file.push(name.clone());
-            let mut bytes = Vec::new();
-            let read = session
-                .open_in(share, &smb_path(&file), small)
-                .and_then(|mut r| Ok(r.read_to_end(&mut bytes)?));
-            if let Err(e) = read {
-                eprintln!("Subtitles: can't read {name}: {e:#}");
-                return None;
-            }
+            let bytes = match read(file.as_slice()) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    eprintln!("Subtitles: can't read {name}: {e:#}");
+                    return None;
+                }
+            };
             let cues = crate::subtitles::parse_srt(&crate::subtitles::decode_text(&bytes));
             eprintln!("Subtitles: {name}: {} cues", cues.len());
             (!cues.is_empty()).then_some(ExternalSubtitles { name, cues })
@@ -279,7 +306,39 @@ pub fn open_video(
         timing.note(format!("sidecars {ms:.0} alongside"));
         (found, media)
     });
-    let media = media?;
+    finish_open(name, media?, external_subtitles, key, hw, timing)
+}
+
+/// Opens a video on the headset's own storage (see [`open_video`]).
+fn open_local_video(
+    share: &str,
+    path: &Path,
+    key: String,
+    hw: Option<&str>,
+    timing: &mut OpenTiming,
+) -> Result<Box<Opened>, String> {
+    let err = |e: anyhow::Error| format!("{e:#}");
+    let name = path.last().cloned().unwrap_or_default();
+    let external_subtitles = load_local_sidecars(share, path);
+    timing.lap("sidecars");
+    let reader = local::open(share, path).map_err(err)?;
+    timing.lap("open file");
+    let media = Media::open(&name, reader).map_err(err);
+    timing.lap("probe");
+    finish_open(name, media?, external_subtitles, key, hw, timing)
+}
+
+/// The rest of opening a video once its streams are known: layout, saved
+/// settings, then the decoder.
+fn finish_open(
+    name: String,
+    media: Media,
+    external_subtitles: Vec<ExternalSubtitles>,
+    key: String,
+    hw: Option<&str>,
+    timing: &mut OpenTiming,
+) -> Result<Box<Opened>, String> {
+    let err = |e: anyhow::Error| format!("{e:#}");
     timing.note(format!("probe read {}", media.io()));
     let video = media.info().video.clone();
     let assessment = playability::assess(Platform::current(), video.as_ref());
@@ -558,7 +617,7 @@ fn evict(sessions: &Sessions, server: &Server, purpose: Purpose, failed: Option<
     }
 }
 
-fn smb_path(path: &Path) -> String {
+fn smb_path(path: &[String]) -> String {
     path.join("\\")
 }
 
@@ -584,7 +643,12 @@ fn handle(
             unreachable!("thumbnails have their own worker")
         }
     };
-    let response = run(request, requested, sessions, cache, standby, hw);
+    let on_headset = local::is_local(&server);
+    let response = if on_headset {
+        run_local(request, requested, cache, hw)
+    } else {
+        run(request, requested, sessions, cache, standby, hw)
+    };
     let failure = match &response {
         Response::Shares { result: Err(e), .. }
         | Response::List { result: Err(e), .. }
@@ -598,7 +662,7 @@ fn handle(
             "Library: {what} failed after {:.1}s: {e}",
             started.elapsed().as_secs_f64()
         );
-        if connection_lost(&e) {
+        if !on_headset && connection_lost(&e) {
             match what {
                 // A video has its own connection, which closes with it.
                 "open" | "add server" => {}
@@ -631,6 +695,103 @@ fn connection_lost(error: &str) -> bool {
     ]
     .iter()
     .any(|marker| error.contains(marker))
+}
+
+/// [`run`] for the headset's own storage: the same requests, on local files.
+fn run_local(
+    request: Request,
+    requested: std::time::Instant,
+    cache: &Mutex<ProbeCache>,
+    hw: Option<&str>,
+) -> Response {
+    let err = |e: anyhow::Error| format!("{e:#}");
+    match request {
+        Request::Shares { id, .. } => Response::Shares {
+            id,
+            result: Ok(local::shares()),
+        },
+        Request::List {
+            id, share, path, ..
+        } => Response::List {
+            id,
+            result: local::list(&share, &path).map_err(err),
+        },
+        Request::ProbeFolder { .. }
+        | Request::Warm { .. }
+        | Request::ThumbnailFolder { .. }
+        | Request::ThumbnailFocus { .. } => {
+            unreachable!("probes, warming and thumbnails have their own workers")
+        }
+        Request::Open {
+            id,
+            server,
+            share,
+            path,
+        } => {
+            let mut timing = OpenTiming::new(requested);
+            let key = file_key(&server, &share, &path);
+            let result = open_local_video(&share, &path, key, hw, &mut timing);
+            Response::Opened { id, result }
+        }
+        Request::Rename {
+            id,
+            server,
+            share,
+            path,
+            new_name,
+        } => {
+            let result = local::rename(&share, &path, &new_name)
+                .map(|()| keep_saved_state(&server, &share, &path, &new_name, cache))
+                .map_err(err);
+            Response::Changed { id, result }
+        }
+        Request::Delete {
+            id,
+            server,
+            share,
+            path,
+        } => {
+            let result = local::delete(&share, &path)
+                .map(|()| forget_saved_state(&server, &share, &path, cache))
+                .map_err(err);
+            Response::Changed { id, result }
+        }
+        Request::AddServer { id, .. } => Response::ServerAdded {
+            id,
+            result: Err("The headset's storage is built in and can't be added".into()),
+        },
+    }
+}
+
+/// Keeps a renamed file's saved VR layout, resume point and probe with it.
+fn keep_saved_state(
+    server: &Server,
+    share: &str,
+    path: &Path,
+    new_name: &str,
+    cache: &Mutex<ProbeCache>,
+) {
+    let mut renamed = path.clone();
+    if let Some(last) = renamed.last_mut() {
+        *last = new_name.to_string();
+    }
+    let (from, to) = (
+        file_key(server, share, path),
+        file_key(server, share, &renamed),
+    );
+    let _ = config::move_layout_override(&from, &to);
+    let _ = config::move_resume_position(&from, &to);
+    cache.lock().expect("probe cache").rename(&from, &to);
+    ProbeCache::save(cache);
+}
+
+/// Forgets a deleted file's saved VR layout, resume point and probe.
+fn forget_saved_state(server: &Server, share: &str, path: &Path, cache: &Mutex<ProbeCache>) {
+    let key = file_key(server, share, path);
+    let _ = config::save_layout_override(&key, None);
+    let _ = config::save_resume_position(&key, None);
+    cache.lock().expect("probe cache").remove(&key);
+    ProbeCache::save(cache);
 }
 
 fn run(
@@ -715,19 +876,7 @@ fn run(
             let result = session(sessions, &server, Purpose::Browse).and_then(|s| {
                 s.rename_in(&share, &smb_path(&path), &new_name)
                     .map_err(err)?;
-                // Keep a saved VR layout with the file.
-                let mut renamed = path.clone();
-                if let Some(last) = renamed.last_mut() {
-                    *last = new_name.clone();
-                }
-                let (from, to) = (
-                    file_key(&server, &share, &path),
-                    file_key(&server, &share, &renamed),
-                );
-                let _ = config::move_layout_override(&from, &to);
-                let _ = config::move_resume_position(&from, &to);
-                cache.lock().expect("probe cache").rename(&from, &to);
-                ProbeCache::save(cache);
+                keep_saved_state(&server, &share, &path, &new_name, cache);
                 Ok(())
             });
             Response::Changed { id, result }
@@ -740,11 +889,7 @@ fn run(
         } => {
             let result = session(sessions, &server, Purpose::Browse).and_then(|s| {
                 s.delete_in(&share, &smb_path(&path)).map_err(err)?;
-                let key = file_key(&server, &share, &path);
-                let _ = config::save_layout_override(&key, None);
-                let _ = config::save_resume_position(&key, None);
-                cache.lock().expect("probe cache").remove(&key);
-                ProbeCache::save(cache);
+                forget_saved_state(&server, &share, &path, cache);
                 Ok(())
             });
             Response::Changed { id, result }
@@ -864,6 +1009,18 @@ fn probe(
         blocks_ahead: 4,
     };
     let name = job.path.last().cloned().unwrap_or_default();
+    if local::is_local(&job.server) {
+        let result = local::open(&job.share, &job.path)
+            .and_then(|reader| Media::open(&name, reader))
+            .map(|media| media.info().video.clone())
+            .map_err(err);
+        // A video started or the folder was left meanwhile: queued again (and
+        // dropped if stale), as over SMB.
+        if video_busy(opening) || current.load(Ordering::Relaxed) != job.generation {
+            return None;
+        }
+        return Some(result);
+    }
     let session = match session(sessions, &job.server, Purpose::Probe) {
         Ok(s) => s,
         Err(e) => return Some(Err(e)),
@@ -1037,6 +1194,27 @@ fn make_thumbnail(
     let generation = queue.generation;
     let mut path = folder.clone();
     path.push(video.name.clone());
+    if local::is_local(server) {
+        let stop = || video_busy(opening) || current.load(Ordering::Relaxed) != generation;
+        let result = local::open(share, &path)
+            .and_then(|reader| {
+                crate::media::thumbnail_unless(
+                    &video.name,
+                    reader,
+                    THUMB_AT,
+                    &video.layout,
+                    THUMB_W,
+                    THUMB_H,
+                    &stop,
+                )
+            })
+            .map_err(|e| format!("{e:#}"));
+        // Stopped for a video (or the folder was left): not a failure.
+        if result.is_err() && stop() {
+            return Ok(None);
+        }
+        return result;
+    }
     let session = session(sessions, server, Purpose::Thumbnail)?;
     let paused = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stop = || video_busy(opening) || current.load(Ordering::Relaxed) != generation;
@@ -1221,7 +1399,10 @@ impl Library {
                 .name("standby".into())
                 .spawn(move || {
                     for (request, _) in rx {
-                        if let Request::Warm { server, share } = request {
+                        // The headset's own storage has no connections to warm.
+                        if let Request::Warm { server, share } = request
+                            && !local::is_local(&server)
+                        {
                             warm(&standby, &server, &share);
                         }
                     }

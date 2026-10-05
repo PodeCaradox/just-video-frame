@@ -1,4 +1,5 @@
-//! Just Video: standalone Steam Frame VR player reading directly from SMB shares.
+//! Just Video: standalone Steam Frame VR player reading directly from SMB shares
+//! or the headset's own storage.
 
 #[cfg(feature = "decode")]
 pub mod audio;
@@ -10,6 +11,7 @@ pub mod decode;
 pub mod inventory;
 #[cfg(feature = "decode")]
 pub mod library;
+pub mod local;
 #[cfg(feature = "decode")]
 pub mod media;
 #[cfg(feature = "decode")]

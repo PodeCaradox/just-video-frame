@@ -36,3 +36,6 @@ bash scripts/build-frame.sh
 
 Start **Just Video** from the Steam library on the Frame, choose **Add server**
 and enter your SMB server's address and login.
+
+Videos stored on the Frame itself are under **This headset**: Videos, Downloads,
+the home folder, and any SD card or USB drive.

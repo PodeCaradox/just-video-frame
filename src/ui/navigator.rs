@@ -15,6 +15,7 @@ use crate::config::{self, Server};
 use crate::library::{
     Library, Opened, Path, ProbeVideo, Probed, Request, Response, ThumbVideo, file_key,
 };
+use crate::local;
 use crate::media::Thumb;
 use crate::playability::{Assessment, Verdict};
 use crate::smb::SmbUrl;
@@ -343,7 +344,10 @@ impl Navigator {
             eprintln!("Can't read saved servers: {e:#}");
             Vec::new()
         });
-        self.items = servers.into_iter().map(Item::Server).collect();
+        self.items = std::iter::once(local::server())
+            .chain(servers)
+            .map(Item::Server)
+            .collect();
         self.items.push(Item::AddServer);
         self.items.push(Item::Settings);
         self.restore_scroll();
@@ -565,6 +569,12 @@ impl Navigator {
             .enumerate()
             .map(|(i, item)| {
                 let mut row = match item {
+                    // The headset itself: built in, so it can't be edited
+                    // or removed.
+                    Item::Server(s) if local::is_local(s) => Row {
+                        detail: "Videos, Downloads, home folder, SD card and USB drives".into(),
+                        ..Row::new(Icon::Server, &s.name)
+                    },
                     Item::Server(s) => Row {
                         detail: s.url.clone(),
                         // Always offered: nothing on the server changes, and
@@ -1262,7 +1272,10 @@ impl Navigator {
     }
 
     fn start_edit_server(&mut self, index: usize) {
-        if let Some(Item::Server(s)) = self.items.get(index) {
+        // The headset's own storage is built in: nothing to edit.
+        if let Some(Item::Server(s)) = self.items.get(index)
+            && !local::is_local(s)
+        {
             let s = s.clone();
             self.start_server_form(Some(s));
         }
@@ -1291,6 +1304,9 @@ impl Navigator {
         let Some(Item::Server(s)) = self.items.get(index) else {
             return;
         };
+        if local::is_local(s) {
+            return;
+        }
         self.view.dialog = Some(Dialog {
             title: format!("Remove {}?", s.name),
             body: vec!["Removes this server and its saved password from Just Video. Nothing on the server changes.".into()],
@@ -1644,6 +1660,16 @@ mod tests {
         assert_eq!(nav.view().crumbs, ["Just Video"]);
         assert!(nav.view().rows[gear].outlined, "the way back in");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn server_list_starts_with_the_headset() {
+        let nav = Navigator::new(Library::start(None));
+        assert_eq!(nav.view().rows[0].label, "This headset");
+        assert!(
+            nav.view().rows[0].actions.is_empty(),
+            "the headset can't be edited or removed"
+        );
     }
 
     #[test]
