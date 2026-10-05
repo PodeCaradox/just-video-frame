@@ -47,17 +47,93 @@ Supported containers: `mp4`, `m4v`, `mkv`, `mov`, `webm`, `avi`, `ts`, `m2ts`.
 
 Jump lengths, volume step and resuming are on the **Settings** screen.
 
-## Install a release (no PC needed)
+## Install
+
+Two ways, both install the same app:
+
+- **A. On the headset:** download the release zip in the Frame's browser.
+  No PC and no Developer Mode needed.
+- **B. From a PC over SSH:** with Developer Mode on. Handy for updates and
+  for your own builds.
+
+### A. On the headset
 
 1. In the Frame's browser, download `just-video-frame-…-steamframe-arm64.zip`
    from this repository's **Releases** page.
 2. In the Linux desktop: Dolphin → Downloads, right-click the zip → **Extract →
    Extract archive to…** → your home folder.
 3. Open the `JustVideo` folder, press **F4** (a terminal opens in that folder)
-   and run `bash install-on-frame.sh`. The first install restarts Steam once.
+   and run:
+
+   ```sh
+   bash install-on-frame.sh
+   ```
+
+   The first install restarts Steam once: the entry must be marked as a VR
+   app, and Steam only reads that flag at startup.
 4. **Library → Non-Steam → Just Video**.
 
-Updating works the same way.
+### B. From a PC over SSH
+
+**1. Turn on Developer Mode** (on the Frame)
+
+1. Steam button → **Settings → System** → turn on **Enable Developer Mode**.
+2. A **Developer** section appears in Settings. Open it and choose
+   **Set User Password**. This is the SSH password; the user name is `steamos`.
+
+Developer Mode opens SSH and other services on your network: use it on
+networks you trust. Just Video doesn't need it once installed, so you can turn
+it off again afterwards.
+
+**2. Find the Frame and test the connection** (on the PC)
+
+The Frame's address is usually `frame.local`. If that isn't found, use its IP
+address (Settings → Internet → the connected Wi-Fi). Test it in PowerShell
+(Windows) or a terminal (Linux, macOS):
+
+```sh
+ssh steamos@frame.local
+```
+
+Answer `yes` to the fingerprint question, enter the password, then `exit`.
+
+**3. Install**
+
+| | Release zip | Own build (this repository) |
+| --- | --- | --- |
+| Windows | Unpack the zip (right-click → Extract All), then in the `JustVideo` folder right-click `deploy.ps1` → **Run with PowerShell** | `powershell -ExecutionPolicy Bypass -File windows\deploy.ps1` |
+| Linux, macOS | `bash JustVideo/deploy.sh` | `bash scripts/install-frame.sh` (needs the SSH key below) |
+
+Add the IP address if `frame.local` isn't found:
+`deploy.ps1 -Frame 192.168.1.50`, `deploy.sh 192.168.1.50`,
+`FRAME_HOST=192.168.1.50 bash scripts/install-frame.sh`.
+Without an SSH key you are asked for the password twice (copy, install). The
+first install restarts Steam on the headset once.
+
+**4. Optional: an SSH key instead of the password**
+
+Windows (PowerShell):
+
+```powershell
+ssh-keygen -t ed25519
+type $env:USERPROFILE\.ssh\id_ed25519.pub | ssh steamos@frame.local "mkdir -p ~/.ssh && cat >> ~/.ssh/authorized_keys"
+```
+
+Linux, macOS (this key is the one `scripts/install-frame.sh` uses):
+
+```sh
+ssh-keygen -t ed25519 -f ~/.ssh/steam_frame_ed25519
+ssh-copy-id -i ~/.ssh/steam_frame_ed25519 steamos@frame.local
+```
+
+**If SSH doesn't connect**
+
+- *Could not resolve hostname frame.local*: use the IP address instead.
+- *Connection refused* or *timed out*: is Developer Mode on, the headset awake
+  and on the same network as the PC?
+- *Permission denied*: set the password under **Developer** (see step 1).
+- *Remote host identification has changed* (after resetting the headset):
+  `ssh-keygen -R frame.local`, then connect again.
 
 ## Build
 
@@ -85,26 +161,8 @@ bash scripts/build-frame-media.sh   # once: FFmpeg + dav1d for the Frame
 bash scripts/build-frame.sh
 ```
 
-## Install your own build
-
-1. On the Frame: **Settings → System → Developer Mode** on, then set a
-   **user password** under **Developer**.
-2. From Windows:
-
-   ```powershell
-   powershell -ExecutionPolicy Bypass -File windows\deploy.ps1
-   # or, if frame.local isn't found:
-   powershell -ExecutionPolicy Bypass -File windows\deploy.ps1 -Frame <frame-ip>
-   ```
-
-   From Linux: set up an SSH key for `steamos@frame.local` and run
-   `bash scripts/install-frame.sh`.
-3. On the Frame: **Library → Non-Steam → Just Video**.
-
-The first install restarts Steam on the headset once: the entry must be marked
-as a VR app, and Steam only reads that flag at startup. You can also copy
-`out/JustVideo` to the headset yourself and run `bash install-on-frame.sh` in
-Konsole there.
+After building, install it with way **B** (or copy `out/JustVideo` to the
+headset and run step 3 of way **A** there).
 
 ## Stream videos from a PC
 

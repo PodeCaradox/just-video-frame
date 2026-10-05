@@ -53,6 +53,9 @@ main() {
     mkdir -p "$pkg"
     cp target/aarch64-unknown-linux-gnu/release/just-video "$pkg/" || fail package
     cp scripts/steam-shortcut.py frame/install-on-frame.sh "$pkg/" || fail package
+    # Installing from a PC over SSH: Windows and Linux/macOS.
+    cp windows/deploy.ps1 frame/deploy.sh "$pkg/" || fail package
+    chmod +x "$pkg/deploy.sh" "$pkg/install-on-frame.sh"
     cp -r assets/steam "$pkg/art" || fail package
     cp LICENSE THIRD_PARTY_NOTICES.md frame/INSTALL.txt "$pkg/" || fail package
     cp -r licenses "$pkg/licenses" || fail package

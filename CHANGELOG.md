@@ -15,7 +15,9 @@ First release of this fork, built from upstream `kumorig/just-video` (main of
 New in this fork:
 
 - All videos of a folder and its subfolders in one list (folders button).
-- Windows build with Docker Desktop (`windows/build.ps1`), install over SSH
-  (`windows/deploy.ps1`) or on the headset (`install-on-frame.sh`), release
-  zip with license files.
+- Windows build with Docker Desktop (`windows/build.ps1`).
+- Two ways to install: on the headset from the release zip
+  (`install-on-frame.sh`, no PC or Developer Mode needed), or from a PC over
+  SSH with Developer Mode (`deploy.ps1` for Windows and `deploy.sh` for Linux
+  and macOS, both in the zip). The release zip carries the license files.
 - README in English and German.
