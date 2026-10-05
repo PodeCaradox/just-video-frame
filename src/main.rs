@@ -441,7 +441,8 @@ fn run_app(quit: std::sync::Arc<std::sync::atomic::AtomicBool>) -> anyhow::Resul
         just_video::ui::browser::BUILD
     );
     let library = just_video::library::Library::start(just_video::media::default_hw_backend());
-    let navigator = just_video::ui::navigator::Navigator::new(library);
+    let mut navigator = just_video::ui::navigator::Navigator::new(library);
+    navigator.set_preferences(just_video::config::preferences());
     just_video::xr::app::run(
         Some(navigator),
         None,
@@ -1072,6 +1073,59 @@ fn main() -> anyhow::Result<()> {
             just_video::ui::save_png(
                 &render(&videos, &mut fonts, Some((700.0, 310.0)), true),
                 &dir.join("videos.png"),
+            )?;
+            // The same folder with thumbnails (synthetic pictures), and the
+            // toggle in both states.
+            let picture = |hue: f32| {
+                let (w, h) = (220u32, 124u32);
+                let mut rgba = Vec::new();
+                for y in 0..h {
+                    for x in 0..w {
+                        let t = x as f32 / w as f32;
+                        let bright = 1.0 - y as f32 / h as f32 * 0.7;
+                        let c = |o: f32| {
+                            (((hue + o + t * 0.4).sin() * 0.5 + 0.5) * 255.0 * bright) as u8
+                        };
+                        rgba.extend_from_slice(&[c(0.0), c(2.1), c(4.2), 255]);
+                    }
+                }
+                std::sync::Arc::new(just_video::media::Thumb {
+                    width: w,
+                    height: h,
+                    rgba,
+                })
+            };
+            let mut thumbs = videos.clone();
+            thumbs.thumbnails = true;
+            for (i, row) in thumbs.rows.iter_mut().enumerate().take(8) {
+                if i != 2 && i != 5 {
+                    row.thumbnail = Some(picture(i as f32));
+                }
+            }
+            thumbs.rows[1].outlined = true;
+            thumbs.tools = vec![Tool::icon(ToolIcon::Thumbnails, true)];
+            just_video::ui::save_png(
+                &render(&thumbs, &mut fonts, Some((700.0, 310.0)), true),
+                &dir.join("thumbnails.png"),
+            )?;
+            let mut selecting = thumbs.clone();
+            selecting.tools = vec![Tool::text("Cancel", false)];
+            for (i, row) in selecting.rows.iter_mut().enumerate() {
+                row.checked = Some(i % 2 == 0);
+            }
+            selecting.scroll = 2.0;
+            just_video::ui::save_png(
+                &render(&selecting, &mut fonts, None, false),
+                &dir.join("thumbnails-select.png"),
+            )?;
+            let mut off = videos.clone();
+            off.tools = vec![
+                Tool::icon(ToolIcon::Thumbnails, false),
+                Tool::icon(ToolIcon::Edit, false),
+            ];
+            just_video::ui::save_png(
+                &render(&off, &mut fonts, None, false),
+                &dir.join("thumbnails-off.png"),
             )?;
             let servers = View {
                 crumbs: crumbs(&["Just Video"]),

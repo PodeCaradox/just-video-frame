@@ -109,6 +109,53 @@ impl Canvas {
         );
     }
 
+    /// Draws an opaque RGBA image at (x, y) with rounded corners: rows are
+    /// copied straight, and only the corner pixels are blended (anti-aliased).
+    pub fn image(&mut self, x: i32, y: i32, image: &crate::media::Thumb, radius: f32) {
+        let (w, h) = (image.width as i32, image.height as i32);
+        let r = radius.min(w as f32 / 2.0).min(h as f32 / 2.0).max(0.0);
+        let band = r.ceil() as i32;
+        let (cw, ch) = (self.width as i32, self.height as i32);
+        for sy in 0..h {
+            let py = y + sy;
+            if py < 0 || py >= ch {
+                continue;
+            }
+            let corner = sy < band || sy >= h - band;
+            let (from, to) = if corner { (band, w - band) } else { (0, w) };
+            let (from, to) = (from.max(-x), to.min(cw - x));
+            let src = &image.rgba[(sy * w * 4) as usize..((sy + 1) * w * 4) as usize];
+            if from < to {
+                let dst = ((py * cw + x + from) * 4) as usize;
+                let n = ((to - from) * 4) as usize;
+                self.pixels[dst..dst + n].copy_from_slice(&src[(from * 4) as usize..][..n]);
+            }
+            if !corner {
+                continue;
+            }
+            // Distance from the corner circle's centre decides the coverage.
+            let dy = if sy < band {
+                r - (sy as f32 + 0.5)
+            } else {
+                sy as f32 + 0.5 - (h as f32 - r)
+            };
+            for sx in (0..band).chain(w - band..w) {
+                let dx = if sx < band {
+                    r - (sx as f32 + 0.5)
+                } else {
+                    sx as f32 + 0.5 - (w as f32 - r)
+                };
+                let a =
+                    (r + 0.5 - (dx.max(0.0).powi(2) + dy.max(0.0).powi(2)).sqrt()).clamp(0.0, 1.0);
+                let px = x + sx;
+                if a > 0.0 && px >= 0 && px < cw {
+                    let i = (sx * 4) as usize;
+                    self.blend(px, py, [src[i], src[i + 1], src[i + 2]], a);
+                }
+            }
+        }
+    }
+
     /// Copies another canvas to (x, y) (no scaling).
     pub fn blit(&mut self, src: &Canvas, x: i32, y: i32) {
         for sy in 0..src.height as i32 {

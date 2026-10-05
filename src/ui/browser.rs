@@ -3,14 +3,22 @@
 
 use super::canvas::{Canvas, Fonts, Rgb};
 use super::form::{self, Form};
+use crate::media::Thumb;
 use crate::playability::Verdict;
 use crate::vr::{Layout, Projection, Stereo};
+use std::sync::Arc;
 
 pub const WIDTH: u32 = 1600;
 pub const HEIGHT: u32 = 1000;
 const HEADER: f32 = 120.0;
 const BOTTOM: f32 = 24.0;
+/// Row heights: plain, and with a thumbnail slot.
 const ROW: f32 = 88.0;
+const ROW_THUMB: f32 = 140.0;
+/// The thumbnail slot at the left of a tall row, and its corner radius.
+const SLOT_W: f32 = crate::thumb_cache::THUMB_W as f32;
+const SLOT_H: f32 = crate::thumb_cache::THUMB_H as f32;
+const SLOT_R: f32 = 10.0;
 const PAD: f32 = 32.0;
 const CRUMB_SIZE: f32 = 40.0;
 const CRUMB_SEP: &str = "  ›  ";
@@ -29,6 +37,8 @@ pub const BUILD: &str = env!("JUST_VIDEO_BUILD");
 
 const BG: Rgb = [0x15, 0x17, 0x1c];
 const ROW_BG: Rgb = [0x1d, 0x21, 0x28];
+/// Behind the icon on a thumbnail, and in the slot until one arrives.
+const SLOT_BG: Rgb = [0x11, 0x13, 0x17];
 const HOVER: Rgb = [0x2c, 0x33, 0x40];
 const TEXT: Rgb = [0xe8, 0xea, 0xed];
 const SUBTLE: Rgb = [0x9a, 0xa0, 0xa6];
@@ -121,6 +131,8 @@ pub struct Row {
     pub dimmed: bool,
     /// Outlined: the entry just come back out of.
     pub outlined: bool,
+    /// A video's picture (for views with [`View::thumbnails`]).
+    pub thumbnail: Option<Arc<Thumb>>,
 }
 
 impl Row {
@@ -134,7 +146,16 @@ impl Row {
             checked: None,
             dimmed: false,
             outlined: false,
+            thumbnail: None,
         }
+    }
+
+    /// A video (or one that can't be read): what gets a thumbnail.
+    fn is_video(&self) -> bool {
+        matches!(
+            self.icon,
+            Icon::Video(_) | Icon::Video3d(_) | Icon::VideoVr(_) | Icon::Broken
+        )
     }
 }
 
@@ -155,6 +176,8 @@ pub enum ToolIcon {
     Edit,
     /// Select several entries to delete.
     Select,
+    /// Thumbnails in the video list.
+    Thumbnails,
 }
 
 impl Tool {
@@ -209,6 +232,8 @@ pub struct View {
     pub tools: Vec<Tool>,
     /// First visible row (fractional while scrolling).
     pub scroll: f32,
+    /// Tall rows with a thumbnail slot (a folder of videos, thumbnails on).
+    pub thumbnails: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -229,13 +254,19 @@ pub fn list_top() -> f32 {
     HEADER
 }
 
-pub fn visible_rows() -> f32 {
-    (HEIGHT as f32 - HEADER - BOTTOM) / ROW
-}
-
 impl View {
+    /// Height of one row, in canvas pixels.
+    pub fn row_h(&self) -> f32 {
+        if self.thumbnails { ROW_THUMB } else { ROW }
+    }
+
+    /// How many rows fit in the list (fractional).
+    pub fn visible_rows(&self) -> f32 {
+        (HEIGHT as f32 - HEADER - BOTTOM) / self.row_h()
+    }
+
     pub fn max_scroll(&self) -> f32 {
-        (self.rows.len() as f32 - visible_rows()).max(0.0)
+        (self.rows.len() as f32 - self.visible_rows()).max(0.0)
     }
 
     pub fn clamp_scroll(&mut self) {
@@ -277,7 +308,7 @@ fn scroll_track() -> (f32, f32) {
 }
 
 fn thumb_height(view: &View) -> f32 {
-    (visible_rows() / view.rows.len().max(1) as f32 * scroll_track().1).max(60.0)
+    (view.visible_rows() / view.rows.len().max(1) as f32 * scroll_track().1).max(60.0)
 }
 
 /// The scroll position that puts the scrollbar's thumb under canvas `y`.
@@ -289,8 +320,8 @@ pub fn scroll_at(view: &View, y: f32) -> f32 {
 }
 
 /// Rows moved by a vertical drag of `dy` canvas pixels.
-pub fn rows_for_drag(dy: f32) -> f32 {
-    dy / ROW
+pub fn rows_for_drag(view: &View, dy: f32) -> f32 {
+    dy / view.row_h()
 }
 
 /// Horizontal extent of each breadcrumb, as drawn.
@@ -316,8 +347,14 @@ fn crumb_limit(view: &View, fonts: &mut Fonts) -> f32 {
 }
 
 fn row_rect(view: &View, i: usize) -> Rect {
-    let y = HEADER + (i as f32 - view.scroll) * ROW;
-    (PAD, y + 4.0, WIDTH as f32 - 2.0 * PAD - SCROLL_W, ROW - 8.0)
+    let row_h = view.row_h();
+    let y = HEADER + (i as f32 - view.scroll) * row_h;
+    (
+        PAD,
+        y + 4.0,
+        WIDTH as f32 - 2.0 * PAD - SCROLL_W,
+        row_h - 8.0,
+    )
 }
 
 /// The `k`th action button of row `i`.
@@ -411,7 +448,7 @@ pub fn hit(view: &View, fonts: &mut Fonts, x: f32, y: f32) -> Hit {
             Hit::Nothing
         };
     }
-    let index = ((y - HEADER) / ROW + view.scroll).floor();
+    let index = ((y - HEADER) / view.row_h() + view.scroll).floor();
     if index < 0.0 || index as usize >= view.rows.len() {
         return Hit::Nothing;
     }
@@ -427,12 +464,23 @@ pub fn hit(view: &View, fonts: &mut Fonts, x: f32, y: f32) -> Hit {
 
 /// `bg` is the row behind the icon, for cut-outs.
 fn draw_icon(canvas: &mut Canvas, icon: &Icon, cx: f32, cy: f32, bg: Rgb) {
+    draw_icon_scaled(canvas, icon, cx, cy, 1.0, bg);
+}
+
+/// [`draw_icon`] at `scale` times its size.
+fn draw_icon_scaled(canvas: &mut Canvas, icon: &Icon, cx: f32, cy: f32, scale: f32, bg: Rgb) {
+    let mut pen = Pen {
+        canvas,
+        cx,
+        cy,
+        scale,
+    };
     match icon {
         Icon::Server => {
-            canvas.rect(cx - 22.0, cy - 20.0, 44.0, 16.0, 4.0, ACCENT);
-            canvas.rect(cx - 22.0, cy + 2.0, 44.0, 16.0, 4.0, ACCENT);
-            canvas.circle(cx + 13.0, cy - 12.0, 3.0, BG);
-            canvas.circle(cx + 13.0, cy + 10.0, 3.0, BG);
+            pen.rect(-22.0, -20.0, 44.0, 16.0, 4.0, ACCENT);
+            pen.rect(-22.0, 2.0, 44.0, 16.0, 4.0, ACCENT);
+            pen.circle(13.0, -12.0, 3.0, BG);
+            pen.circle(13.0, 10.0, 3.0, BG);
         }
         Icon::Share | Icon::Folder => {
             let color = if *icon == Icon::Share {
@@ -440,58 +488,80 @@ fn draw_icon(canvas: &mut Canvas, icon: &Icon, cx: f32, cy: f32, bg: Rgb) {
             } else {
                 [0x8a, 0xb4, 0xf8]
             };
-            canvas.rect(cx - 24.0, cy - 18.0, 20.0, 10.0, 3.0, color);
-            canvas.rect(cx - 24.0, cy - 12.0, 48.0, 32.0, 4.0, color);
+            pen.rect(-24.0, -18.0, 20.0, 10.0, 3.0, color);
+            pen.rect(-24.0, -12.0, 48.0, 32.0, 4.0, color);
         }
-        Icon::Video(verdict) => canvas.circle(cx, cy, 16.0, verdict_color(*verdict)),
+        Icon::Video(verdict) => pen.circle(0.0, 0.0, 16.0, verdict_color(*verdict)),
         Icon::Video3d(verdict) => {
             // Glasses: two lenses on a bar, with short arms.
             let color = verdict_color(*verdict);
-            canvas.rect(cx - 26.0, cy - 10.0, 52.0, 5.0, 2.0, color);
-            canvas.rect(cx - 24.0, cy - 10.0, 21.0, 19.0, 6.0, color);
-            canvas.rect(cx + 3.0, cy - 10.0, 21.0, 19.0, 6.0, color);
+            pen.rect(-26.0, -10.0, 52.0, 5.0, 2.0, color);
+            pen.rect(-24.0, -10.0, 21.0, 19.0, 6.0, color);
+            pen.rect(3.0, -10.0, 21.0, 19.0, 6.0, color);
         }
         Icon::VideoVr(verdict) => {
             // A headset from the front: visor with two lenses and a nose gap,
             // and the strap at the sides.
             let color = verdict_color(*verdict);
-            canvas.rect(cx - 29.0, cy - 6.0, 58.0, 8.0, 3.0, color);
-            canvas.rect(cx - 24.0, cy - 17.0, 48.0, 33.0, 10.0, color);
-            canvas.circle(cx - 11.0, cy - 2.0, 7.0, bg);
-            canvas.circle(cx + 11.0, cy - 2.0, 7.0, bg);
-            canvas.circle(cx, cy + 17.0, 7.0, bg);
+            pen.rect(-29.0, -6.0, 58.0, 8.0, 3.0, color);
+            pen.rect(-24.0, -17.0, 48.0, 33.0, 10.0, color);
+            pen.circle(-11.0, -2.0, 7.0, bg);
+            pen.circle(11.0, -2.0, 7.0, bg);
+            pen.circle(0.0, 17.0, 7.0, bg);
         }
         Icon::Broken => {
-            canvas.circle(cx, cy, 16.0, RED);
-            canvas.rect(cx - 9.0, cy - 3.0, 18.0, 6.0, 2.0, BG);
+            pen.circle(0.0, 0.0, 16.0, RED);
+            pen.rect(-9.0, -3.0, 18.0, 6.0, 2.0, BG);
         }
         Icon::File => {
             // A page with a folded top-right corner.
-            canvas.rect(cx - 16.0, cy - 20.0, 32.0, 40.0, 4.0, FAINT);
-            canvas.rect(cx - 12.0, cy - 16.0, 24.0, 32.0, 2.0, ROW_BG);
-            canvas.rect(cx + 2.0, cy - 21.0, 15.0, 15.0, 0.0, ROW_BG);
-            canvas.rect(cx + 2.0, cy - 20.0, 4.0, 14.0, 1.0, FAINT);
-            canvas.rect(cx + 2.0, cy - 10.0, 14.0, 4.0, 1.0, FAINT);
+            pen.rect(-16.0, -20.0, 32.0, 40.0, 4.0, FAINT);
+            pen.rect(-12.0, -16.0, 24.0, 32.0, 2.0, ROW_BG);
+            pen.rect(2.0, -21.0, 15.0, 15.0, 0.0, ROW_BG);
+            pen.rect(2.0, -20.0, 4.0, 14.0, 1.0, FAINT);
+            pen.rect(2.0, -10.0, 14.0, 4.0, 1.0, FAINT);
         }
         Icon::Add => {
-            canvas.rect(cx - 3.0, cy - 18.0, 6.0, 36.0, 3.0, ACCENT);
-            canvas.rect(cx - 18.0, cy - 3.0, 36.0, 6.0, 3.0, ACCENT);
+            pen.rect(-3.0, -18.0, 6.0, 36.0, 3.0, ACCENT);
+            pen.rect(-18.0, -3.0, 36.0, 6.0, 3.0, ACCENT);
         }
         Icon::Settings => {
             // Eight teeth around a wheel with a hole.
             for k in 0..8 {
                 let a = k as f32 * std::f32::consts::FRAC_PI_4;
-                let (x, y) = (cx + 16.0 * a.cos(), cy + 16.0 * a.sin());
-                canvas.rect(x - 5.0, y - 5.0, 10.0, 10.0, 2.0, SUBTLE);
+                let (x, y) = (16.0 * a.cos(), 16.0 * a.sin());
+                pen.rect(x - 5.0, y - 5.0, 10.0, 10.0, 2.0, SUBTLE);
             }
-            canvas.circle(cx, cy, 15.0, SUBTLE);
-            canvas.circle(cx, cy, 6.0, bg);
+            pen.circle(0.0, 0.0, 15.0, SUBTLE);
+            pen.circle(0.0, 0.0, 6.0, bg);
         }
         Icon::Slider => {
-            canvas.rect(cx - 20.0, cy - 2.0, 40.0, 4.0, 2.0, FAINT);
-            canvas.rect(cx - 20.0, cy - 2.0, 22.0, 4.0, 2.0, ACCENT);
-            canvas.circle(cx + 2.0, cy, 8.0, ACCENT);
+            pen.rect(-20.0, -2.0, 40.0, 4.0, 2.0, FAINT);
+            pen.rect(-20.0, -2.0, 22.0, 4.0, 2.0, ACCENT);
+            pen.circle(2.0, 0.0, 8.0, ACCENT);
         }
+    }
+}
+
+/// Draws relative to a centre, at a scale.
+struct Pen<'a> {
+    canvas: &'a mut Canvas,
+    cx: f32,
+    cy: f32,
+    scale: f32,
+}
+
+impl Pen<'_> {
+    fn rect(&mut self, x: f32, y: f32, w: f32, h: f32, radius: f32, color: Rgb) {
+        let s = self.scale;
+        let (x, y) = (self.cx + x * s, self.cy + y * s);
+        self.canvas.rect(x, y, w * s, h * s, radius * s, color);
+    }
+
+    fn circle(&mut self, x: f32, y: f32, radius: f32, color: Rgb) {
+        let s = self.scale;
+        let (x, y) = (self.cx + x * s, self.cy + y * s);
+        self.canvas.circle(x, y, radius * s, color);
     }
 }
 
@@ -552,6 +622,47 @@ pub(super) fn draw_checkbox(
     }
 }
 
+/// The left slot of a tall row: a video's thumbnail (or a dark placeholder)
+/// with its mark as a badge in the bottom-left corner, or another entry's
+/// icon centred. `slot` is its top-left, `cy` the row's vertical centre.
+fn draw_slot(canvas: &mut Canvas, row: &Row, slot: (f32, f32), cy: f32, bg: Rgb) {
+    let (sx, sy) = slot;
+    let cx = sx + SLOT_W / 2.0;
+    if !row.is_video() {
+        match row.checked {
+            Some(checked) => draw_checkbox(canvas, cx, cy, checked, RED, bg),
+            None => draw_icon(canvas, &row.icon, cx, cy, bg),
+        }
+        return;
+    }
+    match &row.thumbnail {
+        Some(thumb) => {
+            // Centred, should it ever differ from the slot's size.
+            let x = sx + (SLOT_W - thumb.width as f32) / 2.0;
+            let y = sy + (SLOT_H - thumb.height as f32) / 2.0;
+            canvas.image(x.round() as i32, y.round() as i32, thumb, SLOT_R);
+            // The mark on a dark backing, so it reads over any picture.
+            let (bw, bh) = (62.0, 40.0);
+            let (bx, by) = (sx + 6.0, sy + SLOT_H - 6.0 - bh);
+            canvas.rect(bx, by, bw, bh, 10.0, SLOT_BG);
+            let (ix, iy) = (bx + bw / 2.0, by + bh / 2.0);
+            draw_icon_scaled(canvas, &row.icon, ix, iy, 0.8, SLOT_BG);
+            if let Some(checked) = row.checked {
+                // Top-left, on its own backing.
+                canvas.rect(sx + 6.0, sy + 6.0, 48.0, 48.0, 10.0, SLOT_BG);
+                draw_checkbox(canvas, sx + 30.0, sy + 30.0, checked, RED, SLOT_BG);
+            }
+        }
+        None => {
+            canvas.rect(sx, sy, SLOT_W, SLOT_H, SLOT_R, SLOT_BG);
+            match row.checked {
+                Some(checked) => draw_checkbox(canvas, cx, cy, checked, RED, SLOT_BG),
+                None => draw_icon(canvas, &row.icon, cx, cy, SLOT_BG),
+            }
+        }
+    }
+}
+
 /// Renders the panel; `pointer` highlights what it hovers and, with
 /// `draw_cursor`, marks its position (previews; the headset has a cursor layer).
 pub fn render(
@@ -604,11 +715,19 @@ pub fn render(
             }
             let bg = if hovered { HOVER } else { ROW_BG };
             canvas.rect(rx, ry, rw, rh, 14.0, bg);
-            let (icon_x, icon_y) = (PAD + 48.0, ry - 4.0 + ROW / 2.0);
-            match row.checked {
-                Some(checked) => draw_checkbox(&mut canvas, icon_x, icon_y, checked, RED, ROW_BG),
-                None => draw_icon(&mut canvas, &row.icon, icon_x, icon_y, bg),
-            }
+            let cy = ry + rh / 2.0;
+            let text_x = if view.thumbnails {
+                let slot = (rx + 4.0, ry + (rh - SLOT_H) / 2.0);
+                draw_slot(&mut canvas, row, slot, cy, bg);
+                slot.0 + SLOT_W + 24.0
+            } else {
+                let icon_x = PAD + 48.0;
+                match row.checked {
+                    Some(checked) => draw_checkbox(&mut canvas, icon_x, cy, checked, RED, ROW_BG),
+                    None => draw_icon(&mut canvas, &row.icon, icon_x, cy, bg),
+                }
+                PAD + 96.0
+            };
             let mut right_edge = rx + rw - 24.0;
             for (k, action) in row.actions.iter().enumerate() {
                 let (ax, ay, aw, ah) = action_rect(view, i, k);
@@ -649,13 +768,13 @@ pub fn render(
             } else {
                 fonts.measure(&row.right, 28.0) + 24.0
             };
-            let text_w = right_edge - right_w - (PAD + 96.0);
+            let text_w = right_edge - right_w - text_x;
             if row.detail.is_empty() {
                 fonts.draw(
                     &mut canvas,
                     &row.label,
-                    PAD + 96.0,
-                    ry + 52.0,
+                    text_x,
+                    cy + 12.0,
                     36.0,
                     label_color,
                     text_w,
@@ -664,8 +783,8 @@ pub fn render(
                 fonts.draw(
                     &mut canvas,
                     &row.label,
-                    PAD + 96.0,
-                    ry + 38.0,
+                    text_x,
+                    cy - 2.0,
                     34.0,
                     label_color,
                     text_w,
@@ -673,8 +792,8 @@ pub fn render(
                 fonts.draw(
                     &mut canvas,
                     &row.detail,
-                    PAD + 96.0,
-                    ry + 70.0,
+                    text_x,
+                    cy + 30.0,
                     24.0,
                     detail_color,
                     text_w,
@@ -685,7 +804,7 @@ pub fn render(
                     &mut canvas,
                     &row.right,
                     right_edge - right_w + 12.0,
-                    ry + 52.0,
+                    cy + 12.0,
                     28.0,
                     detail_color,
                     right_w,
@@ -729,6 +848,39 @@ pub fn render(
             let (cx, cy) = (x + tw / 2.0, y + th / 2.0);
             match tool.icon {
                 Some(ToolIcon::Edit) => draw_pencil(&mut canvas, cx, cy, TEXT),
+                Some(ToolIcon::Thumbnails) => {
+                    // A picture: frame, sun and a mountain.
+                    let ink = if tool.active {
+                        fill
+                    } else {
+                        [0x2a, 0x2f, 0x38]
+                    };
+                    canvas.rect(cx - 22.0, cy - 17.0, 44.0, 34.0, 6.0, TEXT);
+                    canvas.rect(cx - 18.0, cy - 13.0, 36.0, 26.0, 3.0, ink);
+                    canvas.circle(cx + 8.0, cy - 5.0, 4.0, TEXT);
+                    for i in 0..12 {
+                        let t = i as f32;
+                        canvas.rect(
+                            cx - 17.0 + t * 1.2,
+                            cy + 13.0 - 3.0 - t,
+                            2.4,
+                            3.0 + t,
+                            0.0,
+                            TEXT,
+                        );
+                    }
+                    for i in 0..8 {
+                        let t = i as f32;
+                        canvas.rect(
+                            cx - 3.0 + t * 1.5,
+                            cy + 13.0 - 3.0 - t * 0.9,
+                            1.6,
+                            3.0 + t * 0.9,
+                            0.0,
+                            TEXT,
+                        );
+                    }
+                }
                 Some(ToolIcon::Select) => {
                     // A ticked box beside two list lines.
                     draw_checkbox(&mut canvas, cx - 12.0, cy, true, RED, fill);
@@ -897,7 +1049,7 @@ mod tests {
         assert_eq!(hit(&view, &mut fonts, 400.0, HEADER + 10.0), Hit::Row(0));
         view.scroll = 5.0;
         assert_eq!(
-            hit(&view, &mut fonts, 400.0, HEADER + ROW + 10.0),
+            hit(&view, &mut fonts, 400.0, HEADER + view.row_h() + 10.0),
             Hit::Row(6)
         );
         assert_eq!(hit(&view, &mut fonts, 100.0, 70.0), Hit::Crumb(0));
@@ -929,7 +1081,7 @@ mod tests {
         };
         let mut fonts = Fonts::load().expect("fonts");
         let (_, ry, _, _) = row_rect(&view, 0);
-        let (cx, cy) = (PAD + 48.0, ry - 4.0 + ROW / 2.0);
+        let (cx, cy) = (PAD + 48.0, ry + ROW / 2.0 - 4.0);
         let centre = |canvas: &Canvas| {
             let i = ((cy as u32 * canvas.width + cx as u32) * 4) as usize;
             [canvas.pixels[i], canvas.pixels[i + 1], canvas.pixels[i + 2]]
@@ -969,7 +1121,12 @@ mod tests {
         }
         let (ax, ay, aw, ah) = action_rect(&view, 2, 0);
         assert_eq!(
-            hit(&view, &mut fonts, ax + aw / 2.0, ay + ah / 2.0 + ROW),
+            hit(
+                &view,
+                &mut fonts,
+                ax + aw / 2.0,
+                ay + ah / 2.0 + view.row_h()
+            ),
             Hit::Row(3),
             "no actions on row 3"
         );
@@ -993,5 +1150,160 @@ mod tests {
     fn sizes_are_readable() {
         assert_eq!(format_size(512), "512 B");
         assert_eq!(format_size(5_097_390_883), "5.1 GB");
+    }
+
+    fn tall() -> View {
+        View {
+            thumbnails: true,
+            ..view()
+        }
+    }
+
+    fn pattern() -> Arc<Thumb> {
+        let (w, h) = (SLOT_W as u32, SLOT_H as u32);
+        let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                rgba.extend_from_slice(&[200, (x % 256) as u8, (y * 2) as u8, 255]);
+            }
+        }
+        Arc::new(Thumb {
+            width: w,
+            height: h,
+            rgba,
+        })
+    }
+
+    fn pixel(canvas: &Canvas, x: f32, y: f32) -> Rgb {
+        let i = ((y as u32 * canvas.width + x as u32) * 4) as usize;
+        [canvas.pixels[i], canvas.pixels[i + 1], canvas.pixels[i + 2]]
+    }
+
+    #[test]
+    fn row_geometry_follows_the_row_height() {
+        let (plain, tall) = (view(), tall());
+        assert_eq!((plain.row_h(), tall.row_h()), (ROW, ROW_THUMB));
+        assert!((plain.visible_rows() - 856.0 / 88.0).abs() < 1e-3);
+        assert!((tall.visible_rows() - 856.0 / 140.0).abs() < 1e-3);
+        assert!((tall.max_scroll() - (30.0 - tall.visible_rows())).abs() < 1e-3);
+        assert_eq!(rows_for_drag(&plain, 176.0), 2.0);
+        assert_eq!(rows_for_drag(&tall, 280.0), 2.0);
+        let mut fonts = Fonts::load().expect("fonts");
+        for mut v in [plain, tall] {
+            v.scroll = 4.5;
+            let h = v.row_h();
+            // Row 4 shows its lower half at the top; row 5 follows it.
+            assert_eq!(hit(&v, &mut fonts, 400.0, HEADER + 1.0), Hit::Row(4));
+            assert_eq!(
+                hit(&v, &mut fonts, 400.0, HEADER + h / 2.0 + 1.0),
+                Hit::Row(5)
+            );
+            let (_, y, _, rh) = row_rect(&v, 6);
+            assert_eq!(y, HEADER + 1.5 * h + 4.0);
+            assert_eq!(rh, h - 8.0);
+            assert_eq!(hit(&v, &mut fonts, 400.0, y + rh / 2.0), Hit::Row(6));
+            let thumb = thumb_height(&v);
+            assert!(thumb >= 60.0 && thumb < scroll_track().1);
+            assert_eq!(scroll_at(&v, HEIGHT as f32), v.max_scroll());
+        }
+    }
+
+    #[test]
+    fn a_thumbnail_fills_the_slot_with_the_mark_in_the_corner() {
+        let mut fonts = Fonts::load().expect("fonts");
+        let mut view = View {
+            rows: vec![
+                Row {
+                    thumbnail: Some(pattern()),
+                    ..Row::new(Icon::Video(Some(Verdict::Hardware)), "a.mp4")
+                },
+                Row::new(Icon::Video(Some(Verdict::Hardware)), "b.mp4"),
+                Row::new(Icon::Folder, "dir"),
+            ],
+            ..tall()
+        };
+        let canvas = render(&view, &mut fonts, None, false);
+        let (rx, ry, _, rh) = row_rect(&view, 0);
+        let (sx, sy) = (rx + 4.0, ry + (rh - SLOT_H) / 2.0);
+        // Interior: the thumbnail's own pixels, copied straight.
+        assert_eq!(pixel(&canvas, sx + 150.0, sy + 20.0), [200, 150, 40]);
+        // Rounded: the corner pixel shows the row behind, the next one in does not.
+        assert_eq!(pixel(&canvas, sx, sy), ROW_BG);
+        assert_eq!(pixel(&canvas, sx + 20.0, sy), [200, 20, 0]);
+        // The badge: dark backing with the green mark, bottom left.
+        let (bx, by) = (sx + 6.0 + 31.0, sy + SLOT_H - 6.0 - 20.0);
+        assert_eq!(pixel(&canvas, bx, by), GREEN);
+        assert_eq!(pixel(&canvas, sx + 8.0, by), SLOT_BG);
+        // No picture yet: a placeholder with the mark centred; a folder has none.
+        let (_, ry1, _, rh1) = row_rect(&view, 1);
+        let (cx, cy) = (sx + SLOT_W / 2.0, ry1 + rh1 / 2.0);
+        assert_eq!(pixel(&canvas, cx, cy), GREEN);
+        assert_eq!(pixel(&canvas, sx + 12.0, ry1 + 20.0), SLOT_BG);
+        let (_, ry2, _, rh2) = row_rect(&view, 2);
+        assert_eq!(pixel(&canvas, sx + 12.0, ry2 + 12.0), ROW_BG, "no slot");
+        assert_ne!(pixel(&canvas, cx, ry2 + rh2 / 2.0), ROW_BG, "its icon");
+        // Plain rows are untouched by any of this.
+        view.thumbnails = false;
+        let plain = render(&view, &mut fonts, None, false);
+        let (_, py, _, ph) = row_rect(&view, 0);
+        assert_eq!(pixel(&plain, PAD + 48.0, py + ph / 2.0), GREEN);
+    }
+
+    #[test]
+    fn full_screens_of_thumbnails_redraw_quickly() {
+        let mut fonts = Fonts::load().expect("fonts");
+        let rows = |thumb: bool| -> Vec<Row> {
+            (0..30)
+                .map(|i| Row {
+                    detail: "VR180 3D  ·  Plays with hardware decoding".into(),
+                    right: "3.3 GB".into(),
+                    thumbnail: thumb.then(pattern),
+                    ..Row::new(
+                        Icon::VideoVr(Some(Verdict::Hardware)),
+                        format!("clip {i}.mp4"),
+                    )
+                })
+                .collect()
+        };
+        let time = |view: &View, fonts: &mut Fonts| {
+            render(view, fonts, None, false);
+            let start = std::time::Instant::now();
+            for _ in 0..3 {
+                std::hint::black_box(render(view, fonts, None, false));
+            }
+            start.elapsed().as_secs_f64() * 1e3 / 3.0
+        };
+        let plain = View {
+            rows: rows(false),
+            ..Default::default()
+        };
+        let empty = View {
+            rows: rows(false),
+            thumbnails: true,
+            ..Default::default()
+        };
+        let full = View {
+            rows: rows(true),
+            thumbnails: true,
+            ..Default::default()
+        };
+        let (a, b, c) = (
+            time(&plain, &mut fonts),
+            time(&empty, &mut fonts),
+            time(&full, &mut fonts),
+        );
+        let mut canvas = Canvas::new(WIDTH, HEIGHT);
+        let image = pattern();
+        let start = std::time::Instant::now();
+        for _ in 0..200 {
+            canvas.image(36, 130, &image, SLOT_R);
+        }
+        let blit = start.elapsed().as_secs_f64() * 1e3 / 200.0;
+        eprintln!(
+            "redraw: {a:.1} ms plain, {b:.1} ms tall with placeholders, {c:.1} ms with 7 thumbnails; one thumbnail blit {blit:.3} ms"
+        );
+        // Only a sanity bound (debug builds, shared machines): blitting is cheap.
+        assert!(blit < 1.0, "{blit} ms per thumbnail");
+        assert!(c < a * 3.0 + 20.0, "{c} ms vs {a} ms");
     }
 }

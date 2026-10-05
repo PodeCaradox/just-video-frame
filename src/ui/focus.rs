@@ -256,7 +256,7 @@ pub fn point_of(view: &View, fonts: &mut Fonts, focus: &Focus) -> Option<(f32, f
 /// The scroll that brings a focused row fully into view (None: already is).
 pub fn scroll_to_show(view: &View, focus: &Focus) -> Option<f32> {
     let i = row_of(focus.hit)? as f32;
-    let visible = browser::visible_rows().floor().max(1.0);
+    let visible = view.visible_rows().floor().max(1.0);
     if i < view.scroll {
         Some(i)
     } else if i + 1.0 > view.scroll + visible {

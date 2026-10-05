@@ -330,6 +330,8 @@ pub struct Preferences {
     pub volume_step: u32,
     /// Continue videos where they were left.
     pub resume: bool,
+    /// Thumbnails in video lists.
+    pub thumbnails: bool,
 }
 
 impl Default for Preferences {
@@ -339,6 +341,7 @@ impl Default for Preferences {
             long_jump: 60,
             volume_step: 10,
             resume: true,
+            thumbnails: false,
         }
     }
 }
@@ -450,6 +453,9 @@ mod tests {
         assert_eq!(p.volume_step, 5);
         assert_eq!(p.short_jump, 5);
         assert!(p.resume);
+        assert!(!p.thumbnails);
+        let s: Settings = serde_json::from_str(r#"{"player":{"thumbnails":true}}"#).unwrap();
+        assert!(s.player.unwrap().thumbnails);
     }
 
     #[test]

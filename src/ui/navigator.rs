@@ -12,11 +12,15 @@ use super::browser::{Action, Dialog, Hit, Icon, Row, Tool, ToolIcon, View, forma
 use super::form::{self, Field, Form, Key};
 use super::settings::{self, Setting};
 use crate::config::{self, Server};
-use crate::library::{Library, Opened, Path, ProbeVideo, Probed, Request, Response, file_key};
+use crate::library::{
+    Library, Opened, Path, ProbeVideo, Probed, Request, Response, ThumbVideo, file_key,
+};
+use crate::media::Thumb;
 use crate::playability::{Assessment, Verdict};
 use crate::smb::SmbUrl;
 use crate::vr::Layout;
 use std::collections::HashSet;
+use std::sync::Arc;
 
 const VIDEO_EXTENSIONS: &[&str] = &["mp4", "m4v", "mkv", "mov", "webm", "avi", "ts", "m2ts"];
 
@@ -67,6 +71,8 @@ enum Item {
     Video {
         name: String,
         size: u64,
+        /// Last write time from the listing (keys the thumbnail cache).
+        modified: u64,
         assessment: Option<Assessment>,
         /// How it will be shown (once probed).
         layout: Option<Layout>,
@@ -109,6 +115,7 @@ impl Item {
 enum ToolAction {
     ToggleEdit,
     StartSelect,
+    ToggleThumbnails,
     CancelSelect,
     DeleteSelected,
 }
@@ -159,6 +166,15 @@ pub struct Navigator {
     prefs: config::Preferences,
     /// A setting changed since [`Navigator::take_preferences`].
     prefs_changed: bool,
+    /// Which folder's thumbnails the worker is making (see
+    /// [`Library::set_thumbnail_generation`]); bumped on leaving and toggling off.
+    thumb_generation: u64,
+    /// Ready thumbnails of this folder, by video name.
+    thumbs: std::collections::HashMap<String, Arc<Thumb>>,
+    /// Videos already handed to the worker (it is told as probes land).
+    thumbs_sent: HashSet<String>,
+    /// The first visible video last told to the worker.
+    thumb_focus: usize,
 }
 
 /// How long a folder took to list and to mark its videos.
@@ -194,6 +210,10 @@ impl Navigator {
             dirty: true,
             prefs: config::Preferences::default(),
             prefs_changed: false,
+            thumb_generation: 0,
+            thumbs: Default::default(),
+            thumbs_sent: HashSet::new(),
+            thumb_focus: 0,
         };
         nav.show_servers();
         nav
@@ -225,6 +245,7 @@ impl Navigator {
         self.view.clamp_scroll();
         if self.view.scroll != before {
             self.dirty = true;
+            self.focus_thumbnails();
         }
     }
 
@@ -299,12 +320,14 @@ impl Navigator {
     /// Once a list has loaded: back to its old scroll, with the entry we
     /// came out of in view.
     fn restore_scroll(&mut self) {
+        // The row height decides what fits.
+        self.view.thumbnails = self.thumbnails_on();
         if let Some(scroll) = self.return_scroll.take() {
             self.view.scroll = scroll;
         }
         let Some(name) = &self.came_from else { return };
         if let Some(i) = self.items.iter().position(|it| it.trail_name() == name) {
-            let (i, visible) = (i as f32, super::browser::visible_rows());
+            let (i, visible) = (i as f32, self.view.visible_rows());
             if i < self.view.scroll || i + 1.0 > self.view.scroll + visible {
                 self.view.scroll = i - (visible / 2.0).floor();
             }
@@ -351,6 +374,136 @@ impl Navigator {
         self.rebuild_rows();
     }
 
+    /// The saved preferences, as read at startup.
+    pub fn set_preferences(&mut self, prefs: config::Preferences) {
+        self.prefs = prefs;
+    }
+
+    /// Thumbnails are shown: switched on, in a folder with videos.
+    fn thumbnails_on(&self) -> bool {
+        self.prefs.thumbnails && self.in_video_folder()
+    }
+
+    fn in_video_folder(&self) -> bool {
+        matches!(self.location, Location::Folder { .. })
+            && self.items.iter().any(|i| matches!(i, Item::Video { .. }))
+    }
+
+    /// Starts a new thumbnail generation: work for the old one stops, and
+    /// its pictures go.
+    fn reset_thumbnails(&mut self) {
+        self.thumb_generation += 1;
+        self.library.set_thumbnail_generation(self.thumb_generation);
+        self.thumbs.clear();
+        self.thumbs_sent.clear();
+        self.thumb_focus = 0;
+    }
+
+    /// The video at the top of the list, as an index among the folder's videos.
+    fn first_visible_video(&self) -> usize {
+        let first = self.view.scroll.floor() as usize;
+        self.items
+            .iter()
+            .take(first)
+            .filter(|i| matches!(i, Item::Video { .. }))
+            .count()
+    }
+
+    /// Hands the worker the videos whose layout is now known (as probed, with
+    /// the user's override), nearest the top first by index.
+    fn request_thumbnails(&mut self) {
+        let Location::Folder {
+            server,
+            share,
+            path,
+        } = &self.location
+        else {
+            return;
+        };
+        if !self.prefs.thumbnails {
+            return;
+        }
+        let mut videos = Vec::new();
+        let mut index = 0;
+        for item in &self.items {
+            let Item::Video {
+                name,
+                size,
+                modified,
+                layout,
+                broken: None,
+                ..
+            } = item
+            else {
+                if matches!(item, Item::Video { .. }) {
+                    index += 1;
+                }
+                continue;
+            };
+            if let Some(layout) = layout
+                && !self.thumbs_sent.contains(name)
+            {
+                videos.push(ThumbVideo {
+                    index,
+                    name: name.clone(),
+                    size: *size,
+                    modified: *modified,
+                    layout: *layout,
+                });
+            }
+            index += 1;
+        }
+        if videos.is_empty() {
+            return;
+        }
+        self.thumbs_sent
+            .extend(videos.iter().map(|v| v.name.clone()));
+        self.thumb_focus = self.first_visible_video();
+        self.library.send(Request::ThumbnailFolder {
+            generation: self.thumb_generation,
+            server: server.clone(),
+            share: share.clone(),
+            folder: path.clone(),
+            videos,
+            first_visible: self.thumb_focus,
+        });
+    }
+
+    /// The list scrolled: the worker reorders around the new top video.
+    fn focus_thumbnails(&mut self) {
+        if !self.thumbnails_on() || self.thumbs_sent.is_empty() {
+            return;
+        }
+        let first_visible = self.first_visible_video();
+        if first_visible != self.thumb_focus {
+            self.thumb_focus = first_visible;
+            self.library.send(Request::ThumbnailFocus {
+                generation: self.thumb_generation,
+                first_visible,
+            });
+        }
+    }
+
+    /// The header button: thumbnails on or off, saved like the Settings screen's.
+    fn toggle_thumbnails(&mut self) {
+        let on = !self.prefs.thumbnails;
+        match config::update_preferences(|p| p.thumbnails = on) {
+            Ok(prefs) => self.prefs = prefs,
+            Err(e) => {
+                // Still applies until Just Video quits.
+                self.prefs.thumbnails = on;
+                self.dialog("Couldn't save the setting", vec![format!("{e:#}")]);
+            }
+        }
+        self.prefs_changed = true;
+        // Off: pending work stops and the pictures go. On: start afresh.
+        self.reset_thumbnails();
+        // Rows change height; the entry the scroll was at stays on top.
+        self.view.thumbnails = self.thumbnails_on();
+        self.view.clamp_scroll();
+        self.request_thumbnails();
+    }
+
     /// The preferences, once after the Settings screen changed them.
     pub fn take_preferences(&mut self) -> Option<config::Preferences> {
         std::mem::take(&mut self.prefs_changed).then_some(self.prefs)
@@ -362,6 +515,7 @@ impl Navigator {
         self.items.clear();
         self.generation += 1;
         self.library.set_probe_generation(self.generation);
+        self.reset_thumbnails();
         self.reset_view();
         let id = self.id();
         self.pending = Some(id);
@@ -435,6 +589,7 @@ impl Navigator {
                         assessment,
                         layout,
                         broken,
+                        ..
                     } => Row {
                         icon: match (assessment, broken) {
                             (_, Some(_)) => Icon::Broken,
@@ -453,6 +608,7 @@ impl Navigator {
                             (None, None) => "Checking…".into(),
                         },
                         right: format_size(*size),
+                        thumbnail: self.thumbs.get(name).cloned(),
                         ..Row::new(Icon::Video(None), name)
                     },
                     Item::File { name, size } => Row {
@@ -474,6 +630,7 @@ impl Navigator {
                 row
             })
             .collect();
+        self.view.thumbnails = self.thumbnails_on();
         let has_entries = self.items.iter().any(Item::is_entry);
         let tools: Vec<(Tool, ToolAction)> = match &self.selecting {
             Some(selected) => {
@@ -493,6 +650,12 @@ impl Navigator {
             }
             None => Vec::new(),
         };
+        let mut tools = tools;
+        // Only where there are videos, and not while picking what to delete.
+        if self.selecting.is_none() && self.in_video_folder() {
+            let thumbnails = Tool::icon(ToolIcon::Thumbnails, self.prefs.thumbnails);
+            tools.insert(0, (thumbnails, ToolAction::ToggleThumbnails));
+        }
         (self.view.tools, self.tool_actions) = tools.into_iter().unzip();
         self.view.clamp_scroll();
         self.dirty = true;
@@ -514,6 +677,8 @@ impl Navigator {
         // Marks arriving together (a cached folder's come all at once) are
         // applied, and the rows rebuilt, once.
         let mut marks = std::collections::HashMap::new();
+        // Thumbnails likewise: all that arrived, then one rebuild.
+        let mut thumbnails = false;
         while let Some(response) = self.library.try_recv() {
             match response {
                 Response::Shares { id, result } if Some(id) == self.pending => {
@@ -573,6 +738,7 @@ impl Navigator {
                                         Item::Video {
                                             name: e.name,
                                             size: e.size,
+                                            modified: e.modified,
                                             assessment: None,
                                             layout: None,
                                             broken: None,
@@ -623,6 +789,14 @@ impl Navigator {
                         }
                     }
                     marks.insert(name, result);
+                }
+                Response::Thumbnail {
+                    generation,
+                    name,
+                    image,
+                } if generation == self.thumb_generation && self.prefs.thumbnails => {
+                    self.thumbs.insert(name, image);
+                    thumbnails = true;
                 }
                 Response::Opened { id, result } if Some(id) == self.pending => {
                     self.pending = None;
@@ -682,6 +856,9 @@ impl Navigator {
             }
         }
         self.apply_marks(marks);
+        if thumbnails {
+            self.rebuild_rows();
+        }
         None
     }
 
@@ -713,6 +890,7 @@ impl Navigator {
             }
         }
         self.rebuild_rows();
+        self.request_thumbnails();
     }
 
     /// Logs the folder just listed and marked: `Timing: folder …`.
@@ -776,6 +954,7 @@ impl Navigator {
         match self.tool_actions.get(k) {
             Some(ToolAction::ToggleEdit) => self.edit_mode = !self.edit_mode,
             Some(ToolAction::StartSelect) => self.selecting = Some(HashSet::new()),
+            Some(ToolAction::ToggleThumbnails) => self.toggle_thumbnails(),
             Some(ToolAction::CancelSelect) => self.selecting = None,
             Some(ToolAction::DeleteSelected) => {
                 let mut indices: Vec<usize> = self.selecting.iter().flatten().copied().collect();
@@ -1395,6 +1574,7 @@ mod tests {
             .map(|n| Item::Video {
                 name: n.clone(),
                 size: 1,
+                modified: 0,
                 assessment: None,
                 layout: None,
                 broken: None,
@@ -1599,6 +1779,7 @@ mod tests {
             .map(|name| Item::Video {
                 name: name.into(),
                 size: 1,
+                modified: 0,
                 assessment: Some(a.clone()),
                 layout: Some(crate::vr::detect(name, None)),
                 broken: None,
@@ -1659,6 +1840,7 @@ mod tests {
         let video = |name: &str, broken: bool| Item::Video {
             name: name.into(),
             size: 1,
+            modified: 0,
             assessment: None,
             layout: None,
             broken: broken.then(|| "bad".to_string()),
@@ -1681,5 +1863,120 @@ mod tests {
         nav.playback_ended();
         assert!(nav.view().rows[4].outlined, "the video just played");
         assert_eq!(nav.view().rows.iter().filter(|r| r.outlined).count(), 1);
+    }
+
+    fn video_folder(nav: &mut Navigator, names: &[&str]) {
+        let server = Server {
+            name: "nas".into(),
+            url: "smb://me@nas".into(),
+            writable: false,
+        };
+        nav.show_entries_for_test(server, &["sub"]);
+        let a = crate::playability::assess(crate::playability::Platform::SteamFrame, None);
+        nav.items.extend(names.iter().map(|name| Item::Video {
+            name: name.to_string(),
+            size: 1,
+            modified: 7,
+            assessment: Some(a.clone()),
+            layout: Some(crate::vr::detect(name, None)),
+            broken: None,
+        }));
+        nav.rebuild_rows();
+    }
+
+    fn thumb() -> Arc<Thumb> {
+        Arc::new(Thumb {
+            width: 220,
+            height: 124,
+            rgba: vec![255; 220 * 124 * 4],
+        })
+    }
+
+    #[test]
+    fn the_thumbnails_tool_is_only_in_folders_with_videos() {
+        let (library, _responses) = Library::detached();
+        let mut nav = Navigator::new(library);
+        let tool = |nav: &Navigator| {
+            nav.view()
+                .tools
+                .iter()
+                .any(|t| t.icon == Some(ToolIcon::Thumbnails))
+        };
+        assert!(!tool(&nav), "server list");
+        nav.show_entries_for_test(
+            Server {
+                name: "nas".into(),
+                url: "smb://me@nas".into(),
+                writable: false,
+            },
+            &["a", "b"],
+        );
+        assert!(!tool(&nav), "only folders");
+        video_folder(&mut nav, &["x.mp4"]);
+        assert!(tool(&nav));
+        assert!(!nav.view().thumbnails, "off by default");
+        nav.selecting = Some(HashSet::new());
+        nav.rebuild_rows();
+        assert!(!tool(&nav), "not while selecting");
+    }
+
+    #[test]
+    fn toggling_thumbnails_changes_rows_and_drops_pictures() {
+        let dir = config::temp_config("nav-thumb-toggle");
+        let (library, responses) = Library::detached();
+        let mut nav = Navigator::new(library);
+        let names: Vec<String> = (0..20).map(|i| format!("clip {i}.mp4")).collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        video_folder(&mut nav, &names);
+        nav.view.scroll = 5.0;
+        nav.click(Hit::Tool(0));
+        assert!(nav.view().thumbnails);
+        assert!(
+            nav.prefs.thumbnails && config::preferences().thumbnails,
+            "saved"
+        );
+        assert_eq!(nav.take_preferences().map(|p| p.thumbnails), Some(true));
+        assert_eq!(nav.view().scroll, 5.0, "top row stays");
+        assert_eq!(nav.thumbs_sent.len(), 20, "all handed to the worker");
+
+        // Pictures arriving together make one rebuild; stale ones are ignored.
+        let g = nav.thumb_generation;
+        for (generation, name) in [(g, "clip 3.mp4"), (g, "clip 4.mp4"), (g - 1, "clip 5.mp4")] {
+            responses
+                .send(Response::Thumbnail {
+                    generation,
+                    name: name.into(),
+                    image: thumb(),
+                })
+                .unwrap();
+        }
+        nav.take_dirty();
+        nav.poll();
+        assert!(nav.take_dirty());
+        let shown: Vec<bool> = nav
+            .view()
+            .rows
+            .iter()
+            .map(|r| r.thumbnail.is_some())
+            .collect();
+        assert_eq!(shown.iter().filter(|s| **s).count(), 2);
+        assert!(shown[1 + 3] && shown[1 + 4], "after the folder row");
+
+        nav.click(Hit::Tool(0));
+        assert!(!nav.view().thumbnails);
+        assert!(nav.thumbs.is_empty() && nav.thumbs_sent.is_empty());
+        assert_eq!(nav.thumb_generation, g + 1, "pending work is dropped");
+        assert!(nav.view().rows.iter().all(|r| r.thumbnail.is_none()));
+        // A straggler from the old generation is ignored.
+        responses
+            .send(Response::Thumbnail {
+                generation: g,
+                name: "clip 3.mp4".into(),
+                image: thumb(),
+            })
+            .unwrap();
+        nav.poll();
+        assert!(nav.thumbs.is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
