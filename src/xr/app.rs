@@ -342,19 +342,14 @@ const CLICK_NS: i64 = 400_000_000;
 /// Where `ray` meets the video (flat or curved screen, or a point 5 m out
 /// for spherical video), for showing the cursor on it.
 /// Flat screen size (metres) for a `width`-wide screen showing a video of
-/// `video` pixels in `stereo` layout.
+/// `video` pixels in `layout`.
 fn screen_size(
     video: (u32, u32),
-    stereo: crate::vr::Stereo,
+    layout: &crate::vr::Layout,
     width: f32,
     quarter_turns: u8,
 ) -> [f32; 2] {
-    let (w, h) = video;
-    let mut aspect = match stereo {
-        crate::vr::Stereo::SideBySide => w as f32 / 2.0 / h.max(1) as f32,
-        crate::vr::Stereo::TopBottom => w as f32 / (h as f32 / 2.0).max(1.0),
-        crate::vr::Stereo::Mono => w as f32 / h.max(1) as f32,
-    };
+    let mut aspect = crate::vr::eye_aspect(video.0, video.1, layout);
     if quarter_turns % 2 == 1 {
         aspect = 1.0 / aspect.max(0.01);
     }
@@ -1429,7 +1424,7 @@ pub fn run(
                         // Menu open: also show where the ray meets the video.
                         let screen = screen_size(
                             renderer.video_size(),
-                            playback.layout.stereo,
+                            &playback.layout,
                             options.view.screen_width * placement.zoom,
                             playback.image.rotation,
                         );
@@ -1461,7 +1456,7 @@ pub fn run(
                 }
                 let screen = screen_size(
                     renderer.video_size(),
-                    playback.layout.stereo,
+                    &playback.layout,
                     options.view.screen_width * placement.zoom,
                     playback.image.rotation,
                 );

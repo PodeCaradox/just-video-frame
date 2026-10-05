@@ -2329,11 +2329,7 @@ pub fn eye_params(
     let (w, h) = (tex.0 as f32, tex.1 as f32);
     // Flat screen aspect from one eye's part of the frame (turned on its side
     // when the picture is rotated a quarter).
-    let mut aspect = match layout.stereo {
-        Stereo::SideBySide => w / 2.0 / h,
-        Stereo::TopBottom => w / (h / 2.0),
-        Stereo::Mono => w / h,
-    };
+    let mut aspect = crate::vr::eye_aspect(tex.0, tex.1, layout);
     if quarter_turns % 2 == 1 {
         aspect = 1.0 / aspect.max(0.01);
     }

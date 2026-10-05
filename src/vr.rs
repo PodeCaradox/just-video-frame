@@ -43,6 +43,26 @@ pub struct Layout {
     pub stereo_from: Evidence,
 }
 
+/// Width / height of the picture one eye sees on a flat screen.
+///
+/// 3D films usually come half-packed: both eyes squeezed into one ordinary
+/// frame (1920×1080 half-SBS holds two 960×1080 eyes), each meant to be
+/// stretched back to the frame's shape. Full packing doubles the frame
+/// instead (3840×1080). Containers don't record which, so guess from the
+/// shape: a full-packed eye narrower than 1.25:1 or wider than 3:1 is
+/// implausible for a film, so treat such frames as half-packed.
+pub fn eye_aspect(width: u32, height: u32, layout: &Layout) -> f32 {
+    let (w, h) = (width as f32, height.max(1) as f32);
+    let flat = layout.projection == Projection::Flat;
+    match layout.stereo {
+        Stereo::SideBySide if flat && w / 2.0 / h < 1.25 => w / h,
+        Stereo::SideBySide => w / 2.0 / h,
+        Stereo::TopBottom if flat && w / (h / 2.0) > 3.0 => w / h,
+        Stereo::TopBottom => w / (h / 2.0),
+        Stereo::Mono => w / h,
+    }
+}
+
 fn tokens(name: &str) -> Vec<String> {
     let stem = name.rsplit(['/', '\\']).next().unwrap_or(name);
     let stem = stem.rsplit_once('.').map_or(stem, |(s, _)| s);
@@ -268,6 +288,40 @@ mod tests {
         );
         // Any real tag wins over the shape guess.
         assert_eq!(detect("clip_360.mp4", Some(&v)).stereo, Stereo::Mono);
+    }
+
+    #[test]
+    fn half_packed_3d_is_stretched_back() {
+        let flat = |stereo| Layout {
+            projection: Projection::Flat,
+            stereo,
+            swap_eyes: false,
+            projection_from: Evidence::Filename,
+            stereo_from: Evidence::Filename,
+        };
+        let sbs = flat(Stereo::SideBySide);
+        let tb = flat(Stereo::TopBottom);
+        let close = |a: f32, b: f32| (a - b).abs() < 0.01;
+        // Half: 16:9 frame, and cropped 2.39:1 scope.
+        assert!(close(eye_aspect(1920, 1080, &sbs), 16.0 / 9.0));
+        assert!(close(eye_aspect(1920, 804, &sbs), 1920.0 / 804.0));
+        assert!(close(eye_aspect(1920, 1080, &tb), 16.0 / 9.0));
+        assert!(close(eye_aspect(1920, 804, &tb), 1920.0 / 804.0));
+        // Full: doubled frames keep each eye's own shape, 4:3 included.
+        assert!(close(eye_aspect(3840, 1080, &sbs), 16.0 / 9.0));
+        assert!(close(eye_aspect(2880, 1080, &sbs), 4.0 / 3.0));
+        assert!(close(eye_aspect(1920, 2160, &tb), 16.0 / 9.0));
+        assert!(close(eye_aspect(1920, 1606, &tb), 1920.0 / 803.0));
+        // Spherical video is never stretched (VR180 SBS has square eyes).
+        let vr180 = Layout {
+            projection: Projection::Equirect180,
+            ..sbs
+        };
+        assert!(close(eye_aspect(5760, 2880, &vr180), 1.0));
+        assert!(close(
+            eye_aspect(1920, 1080, &flat(Stereo::Mono)),
+            16.0 / 9.0
+        ));
     }
 
     #[test]
