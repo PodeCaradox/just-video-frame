@@ -1038,6 +1038,8 @@ const THUMB_READ_AHEAD: ReadAhead = ReadAhead {
     block_size: 1024 * 1024,
     blocks_ahead: 4,
 };
+/// Thumbnail reads on the wire at once.
+const THUMB_IN_FLIGHT: usize = 3;
 /// How far into the video the picture is taken.
 const THUMB_AT: f64 = 0.10;
 
@@ -1048,7 +1050,7 @@ fn make_thumbnail(
     queue: &ThumbQueue,
     sessions: &Sessions,
     opening: &Arc<AtomicU64>,
-    current: &AtomicU64,
+    current: &Arc<AtomicU64>,
 ) -> Result<Option<crate::media::Thumb>, String> {
     let (Some(server), Some((_, share, folder))) = (&queue.server, &queue.folder) else {
         return Ok(None);
@@ -1059,15 +1061,25 @@ fn make_thumbnail(
     let session = session(sessions, server, Purpose::Thumbnail)?;
     let paused = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stop = || video_busy(opening) || current.load(Ordering::Relaxed) != generation;
+    // The reads give up the moment a video starts or the folder is left, also
+    // while waiting for data: a thumbnail never holds up playback.
+    let cancel: crate::readahead::Cancel = {
+        let (opening, current, paused) = (opening.clone(), current.clone(), paused.clone());
+        Arc::new(move || {
+            if video_busy(&opening) {
+                paused.store(true, Ordering::SeqCst);
+                return true;
+            }
+            current.load(Ordering::Relaxed) != generation
+        })
+    };
     let result = session
         .open_in(share, &smb_path(&path), THUMB_READ_AHEAD)
         .map_err(|e| format!("{e:#}"))
         .and_then(|reader| {
-            let reader = Yielding {
-                inner: reader,
-                opening: opening.clone(),
-                paused: paused.clone(),
-            };
+            let reader = reader
+                .with_cancel(cancel.clone())
+                .with_max_in_flight(THUMB_IN_FLIGHT);
             crate::media::thumbnail_unless(
                 &video.name,
                 reader,
@@ -1079,7 +1091,8 @@ fn make_thumbnail(
             )
             .map_err(|e| format!("{e:#}"))
         });
-    if paused.load(Ordering::SeqCst) {
+    // Stopped by `cancel` (FFmpeg only sees a read error): not a failure.
+    if paused.load(Ordering::SeqCst) || result.is_err() && stop() {
         return Ok(None);
     }
     if let Err(e) = &result
