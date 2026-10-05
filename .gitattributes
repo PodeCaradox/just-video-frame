@@ -5,3 +5,4 @@ Dockerfile text eol=lf
 # PowerShell scripts run on Windows.
 *.ps1 text eol=crlf
 *.png binary
+*.txt text eol=lf

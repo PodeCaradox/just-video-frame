@@ -54,9 +54,18 @@ main() {
     cp target/aarch64-unknown-linux-gnu/release/just-video "$pkg/" || fail package
     cp scripts/steam-shortcut.py frame/install-on-frame.sh "$pkg/" || fail package
     cp -r assets/steam "$pkg/art" || fail package
+    cp LICENSE THIRD_PARTY_NOTICES.md frame/INSTALL.txt "$pkg/" || fail package
+    cp -r licenses "$pkg/licenses" || fail package
     git log -1 --format='%h %cs' > "$pkg/VERSION" 2>/dev/null || true
+
+    # The same folder as a zip for a GitHub release (file modes kept).
+    local version zip
+    version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+    zip=$out/just-video-frame-v$version-steamframe-arm64.zip
+    rm -f "$out"/just-video-frame-*-steamframe-arm64.zip
+    python3 windows/make-zip.py "$pkg" "$zip" || fail zip
     echo "OK $(date -u +%FT%TZ) $(cat "$pkg/VERSION" 2>/dev/null)" > "$out/STATUS"
-    echo "== Done: out/JustVideo"
+    echo "== Done: out/JustVideo and $(basename "$zip")"
 }
 
 main 2>&1 | tee "$out/build.log"

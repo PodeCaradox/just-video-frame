@@ -1,0 +1,33 @@
+Just Video for Steam Frame
+==========================
+
+Install on the headset (no PC needed)
+-------------------------------------
+1. Download the release zip in the Frame's browser.
+2. In the Linux desktop, open Dolphin > Downloads, right-click the zip >
+   Extract > Extract archive to... and choose your home folder.
+3. Open the JustVideo folder, press F4 (or Show Panels > Terminal) and run:
+       bash install-on-frame.sh
+   The first install restarts Steam once (it marks Just Video as a VR app).
+4. Steam > Library > Non-Steam > Just Video.
+
+Updating works the same way. Videos on the headset are under "This headset";
+"Add server" plays from a Windows PC or NAS share.
+
+Installation auf dem Headset (ohne PC)
+--------------------------------------
+1. Die Release-Zip im Browser des Frames herunterladen.
+2. Auf dem Linux-Desktop: Dolphin > Downloads, Rechtsklick auf die Zip >
+   Entpacken > Archiv entpacken nach ... und den Home-Ordner wählen.
+3. Den Ordner JustVideo öffnen, F4 drücken (oder Panels anzeigen > Terminal)
+   und eingeben:
+       bash install-on-frame.sh
+   Beim ersten Mal startet Steam einmal neu (Just Video wird als VR-App
+   markiert).
+4. Steam > Bibliothek > Nicht-Steam > Just Video.
+
+Aktualisieren geht genauso. Videos auf dem Headset stehen unter
+"This headset"; "Add server" spielt von einer Freigabe am PC oder NAS.
+
+License: MIT (LICENSE). Third-party licenses: THIRD_PARTY_NOTICES.md, licenses/.
+The source code is in the GitHub repository this release comes from.

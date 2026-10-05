@@ -50,6 +50,19 @@ Dateitypen: `mp4`, `m4v`, `mkv`, `mov`, `webm`, `avi`, `ts`, `m2ts`.
 Sprunglängen, Lautstärkeschritte und Weiterschauen stellst du unter
 **Settings** ein.
 
+## Release installieren (ohne PC)
+
+1. Im Browser des Frames `just-video-frame-…-steamframe-arm64.zip` von der
+   Seite **Releases** dieses Repos herunterladen.
+2. Auf dem Linux-Desktop: Dolphin → Downloads, Rechtsklick auf die Zip →
+   **Entpacken → Archiv entpacken nach …** → Home-Ordner.
+3. Den Ordner `JustVideo` öffnen, **F4** drücken (ein Terminal öffnet sich in
+   dem Ordner) und `bash install-on-frame.sh` eingeben. Beim ersten Mal startet
+   Steam einmal neu.
+4. **Bibliothek → Nicht-Steam → Just Video**.
+
+Aktualisieren geht genauso.
+
 ## Bauen
 
 ### Windows mit Docker Desktop
@@ -62,7 +75,8 @@ powershell -ExecutionPolicy Bypass -File windows\build.ps1
 
 Der erste Build baut FFmpeg und dav1d einmal fürs Frame (bleibt in
 Docker-Volumes gespeichert), danach dauert es nur noch wenige Minuten.
-Ergebnis: `out\JustVideo`, Protokoll: `out\build.log`.
+Ergebnis: `out\JustVideo` und dasselbe als Release-Zip
+(`out\just-video-frame-v…-steamframe-arm64.zip`), Protokoll: `out\build.log`.
 
 ### Linux
 
@@ -75,7 +89,7 @@ bash scripts/build-frame-media.sh   # einmal: FFmpeg + dav1d fürs Frame
 bash scripts/build-frame.sh
 ```
 
-## Aufs Frame installieren
+## Selbst gebaute Version installieren
 
 1. Auf dem Frame: **Einstellungen → System → Entwicklermodus** einschalten,
    dann unter **Entwickler** ein **Benutzerpasswort** setzen.
