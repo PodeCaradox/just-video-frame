@@ -144,46 +144,17 @@ impl Output {
 }
 
 /// Software volume. The simple API has no stream volume, so samples are
-/// scaled here. Up to full level it is a plain multiply; above it (a boost
-/// for quiet videos) a limiter keeps peaks below clipping.
-pub struct Gain {
-    /// Limiter gain now (1 = not limiting); carried across writes so it
-    /// recovers smoothly instead of clicking at chunk edges.
-    limit: f32,
-}
-
-/// Peak level the limiter holds boosted audio to.
-const CEILING: f32 = 0.98;
-/// Per-frame recovery towards no limiting (~0.2 s time constant at 48 kHz).
-const RELEASE: f32 = 1.0 / (0.2 * RATE as f32);
-
-impl Default for Gain {
-    fn default() -> Self {
-        Self { limit: 1.0 }
-    }
-}
+/// scaled here (the player plays as decoded; the headset's volume sets
+/// loudness).
+pub struct Gain;
 
 impl Gain {
-    /// `samples` (interleaved, [`CHANNELS`]) at `level` (1 = full, up to 1.5).
-    /// The curve is perceptual: equal level steps sound evenly spaced.
-    pub fn apply(&mut self, samples: &[f32], level: f32) -> Vec<f32> {
+    /// `samples` (interleaved, [`CHANNELS`]) at `level` (0..=1, 1 = as
+    /// decoded). The curve is perceptual: equal level steps sound evenly
+    /// spaced.
+    pub fn apply(&self, samples: &[f32], level: f32) -> Vec<f32> {
         let gain = level * level;
-        if level <= 1.0 {
-            self.limit = 1.0;
-            return samples.iter().map(|s| s * gain).collect();
-        }
-        let mut out = Vec::with_capacity(samples.len());
-        for frame in samples.chunks(CHANNELS as usize) {
-            let peak = frame.iter().fold(0.0f32, |m, s| m.max((s * gain).abs()));
-            let target = if peak > CEILING { CEILING / peak } else { 1.0 };
-            self.limit = if target < self.limit {
-                target // instant attack: never over the ceiling
-            } else {
-                self.limit + (target - self.limit) * RELEASE
-            };
-            out.extend(frame.iter().map(|s| s * gain * self.limit));
-        }
-        out
+        samples.iter().map(|s| s * gain).collect()
     }
 }
 
@@ -199,28 +170,9 @@ mod tests {
 
     #[test]
     fn full_level_and_below_is_a_plain_multiply() {
-        let mut g = Gain::default();
+        let g = Gain;
         let samples = [0.5, -0.25, 1.2, -1.0];
         assert_eq!(g.apply(&samples, 1.0), samples.to_vec());
         assert_eq!(g.apply(&samples, 0.5), vec![0.125, -0.0625, 0.3, -0.25]);
-    }
-
-    #[test]
-    fn boost_never_clips_and_recovers_smoothly() {
-        let mut g = Gain::default();
-        // Full-scale square wave at the highest boost.
-        let loud: Vec<f32> = (0..4800)
-            .map(|i| if i % 4 < 2 { 1.0 } else { -1.0 })
-            .collect();
-        let out = g.apply(&loud, 1.5);
-        assert!(out.iter().all(|s| s.abs() <= CEILING + 1e-6));
-        // Quiet audio next: the limiter lets go gradually, across writes.
-        let quiet = vec![0.1f32; 960];
-        let first = g.apply(&quiet, 1.5);
-        let second = g.apply(&quiet, 1.5);
-        assert!(first[0] < first[959] && first[959] < second[959]);
-        assert!(second[959] < 0.1 * 2.25, "still recovering");
-        let much_later: Vec<f32> = (0..200).flat_map(|_| g.apply(&quiet, 1.5)).collect();
-        assert!((much_later.last().unwrap() - 0.225).abs() < 0.01);
     }
 }
