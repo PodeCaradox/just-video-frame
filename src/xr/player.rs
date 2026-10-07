@@ -572,6 +572,8 @@ fn spawn_audio(
             // Slices written since the generation started.
             let mut fresh_slices = 0;
             let gain = crate::audio::Gain;
+            // After the volume: turned down, a loud surround mix may fit as it is.
+            let mut limiter = crate::audio::Limiter::new(crate::audio::RATE);
             let mut watch = AudioWatch::new();
             while !stop.load(Ordering::Relaxed) {
                 watch.maybe_log();
@@ -595,6 +597,7 @@ fn spawn_audio(
                 }
                 if chunk.generation != played_generation {
                     out.flush();
+                    limiter.reset();
                     played_generation = chunk.generation;
                     fresh_slices = 0;
                     // Queued meanwhile, its sound starts with the picture.
@@ -623,7 +626,8 @@ fn spawn_audio(
                     watch.wrote(out.latency(), fresh_slices < 3);
                     fresh_slices += 1;
                     let level = f32::from_bits(shared.volume.load(Ordering::Relaxed));
-                    let scaled = gain.apply(&chunk.samples[offset..end], level);
+                    let mut scaled = gain.apply(&chunk.samples[offset..end], level);
+                    limiter.apply(&mut scaled, channels);
                     if let Err(e) = out.write(&scaled) {
                         eprintln!("{e:#}");
                         return;

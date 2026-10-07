@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Surround sound (5.1 and 7.1, such as the DTS and AC3 tracks of 3D Blu-ray
+  copies) no longer crackles in loud scenes: mixed down to stereo it could add
+  up to more than full scale, and a limiter now keeps it within.
+- 3D films tagged `HOU`, `FOU`, `HalfSBS`, `FullSBS`, `HalfOU` or `FullOU`
+  are recognized as 3D.
+
 ## v0.1.0 (2026-10-06)
 
 First release of this fork, built from upstream `kumorig/just-video` (main of

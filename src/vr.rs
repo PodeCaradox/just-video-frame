@@ -109,9 +109,12 @@ fn stereo_from_name(tokens: &[String]) -> Option<(Stereo, bool)> {
             .or_else(|| t.strip_prefix("360"))
             .unwrap_or(t);
         match t {
-            "lr" | "sbs" | "3dh" | "hsbs" | "fsbs" => return Some((Stereo::SideBySide, false)),
+            "lr" | "sbs" | "3dh" | "hsbs" | "fsbs" | "halfsbs" | "fullsbs" => {
+                return Some((Stereo::SideBySide, false));
+            }
             "rl" => return Some((Stereo::SideBySide, true)),
-            "tb" | "ou" | "3dv" | "htab" | "tab" | "overunder" => {
+            "tb" | "ou" | "3dv" | "htab" | "tab" | "overunder" | "hou" | "fou" | "halfou"
+            | "fullou" => {
                 return Some((Stereo::TopBottom, false));
             }
             "bt" => return Some((Stereo::TopBottom, true)),
@@ -322,6 +325,57 @@ mod tests {
             eye_aspect(1920, 1080, &flat(Stereo::Mono)),
             16.0 / 9.0
         ));
+    }
+
+    #[test]
+    fn ripped_3d_films() {
+        use Stereo::*;
+        // Names and frame shapes of 3D Blu-ray rips. "VR" in names like these
+        // only says the copy is meant for a headset: the film is flat.
+        let film = |name: &str, width: u32, height: u32| {
+            let v = VideoInfo {
+                width,
+                height,
+                bit_depth: 8,
+                fps: 24000.0 / 1001.0,
+                ..video(None, None, None)
+            };
+            let l = detect(name, Some(&v));
+            assert_eq!(
+                (l.projection, l.stereo, l.swap_eyes),
+                (Projection::Flat, SideBySide, false),
+                "{name}"
+            );
+            eye_aspect(width, height, &l)
+        };
+        let close = |a: f32, b: f32| (a - b).abs() < 0.01;
+        // Full SBS cropped to the film: two 2.4:1 eyes.
+        assert!(close(
+            film("VR-SBS_3840x_A_Film_4k_hevc.mkv", 3840, 800),
+            2.4
+        ));
+        // Full SBS with the film letterboxed in two 16:9 eyes.
+        assert!(close(
+            film("VR-SBS_3840x_A_Film_4k_hevc.mkv", 3840, 1080),
+            16.0 / 9.0
+        ));
+        // Half SBS: squeezed 960x1080 eyes, stretched back to 16:9.
+        assert!(close(
+            film(
+                "A.Film.2014.3D.BluRay.Half-SBS.x.DTS-HD.MA.7.1_1080p_hevc.mkv",
+                1920,
+                1080
+            ),
+            16.0 / 9.0
+        ));
+        // Other spellings of the packing.
+        let stereo = |name| detect(name, None).stereo;
+        assert_eq!(stereo("A.Film.3D.HalfSBS.mkv"), SideBySide);
+        assert_eq!(stereo("A.Film.3D.FullSBS.mkv"), SideBySide);
+        assert_eq!(stereo("A.Film.3D.HOU.mkv"), TopBottom);
+        assert_eq!(stereo("A.Film.3D.H-OU.mkv"), TopBottom);
+        assert_eq!(stereo("A.Film.3D.FOU.mkv"), TopBottom);
+        assert_eq!(stereo("A.Film.3D.HalfOU.mkv"), TopBottom);
     }
 
     #[test]

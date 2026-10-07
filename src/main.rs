@@ -1236,13 +1236,14 @@ fn main() -> anyhow::Result<()> {
             volume,
             switch_to,
         } => {
-            use just_video::audio::{CHANNELS, Output, RATE};
+            use just_video::audio::{CHANNELS, Limiter, Output, RATE};
             let (source, _session) = open_input(&input, ReadAhead::default())?;
             let media = Media::open(file_name(&input), source)?;
             let mut decoder =
                 media.into_decoder(just_video::media::default_hw_backend(), true, "")?;
             anyhow::ensure!(decoder.enable_audio(RATE, CHANNELS), "No audio track");
             let mut output = Output::open("audio-test")?;
+            let mut limiter = Limiter::new(RATE);
             let (mut frames, mut written, mut expected, mut gaps) = (0u64, 0u64, None::<f64>, 0);
             // Zero crossings per second of the left channel, before and after a switch
             // (a pure tone reads as twice its frequency).
@@ -1260,6 +1261,7 @@ fn main() -> anyhow::Result<()> {
                         "Can't switch to audio track {track}"
                     );
                     decoder.seek(at)?;
+                    limiter.reset();
                     expected = None;
                     eprintln!("switched to track {track} at {at:.2}s");
                 }
@@ -1284,7 +1286,9 @@ fn main() -> anyhow::Result<()> {
                         last = frame[0];
                         counted[half] += 1;
                     }
-                    let scaled: Vec<f32> = samples.iter().map(|s| s * volume * volume).collect();
+                    let mut scaled: Vec<f32> =
+                        samples.iter().map(|s| s * volume * volume).collect();
+                    limiter.apply(&mut scaled, CHANNELS as usize);
                     output.write(&scaled)?;
                     written += n;
                 }
